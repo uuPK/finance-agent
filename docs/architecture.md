@@ -48,3 +48,7 @@ User Question
 - `backend/app/evaluation`: 离线评测流程。
 - `backend/app/db`: PostgreSQL 连接与会话。
 - `frontend/src`: 问数工作台、过程展示、元数据、评测中心。
+
+## QueryPlan 标准
+
+QueryPlan 是自然语言问题和 SQL 之间的中间协议。当前标准见 `docs/query_plan_standard.md`。

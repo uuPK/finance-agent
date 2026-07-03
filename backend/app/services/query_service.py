@@ -8,10 +8,12 @@ class QueryService:
         started_at = perf_counter()
 
         query_plan = QueryPlan(
-            intent="customer_marketing_query",
-            subject="客户",
-            grain="客户级",
-            limit=100,
+            plan_status="draft",
+            intent="customer_segmentation",
+            question=request.question,
+            subject={"name": "客户", "entity_type": "customer"},
+            grain={"level": "customer", "keys": ["customer_id"], "description": "客户级"},
+            output={"limit": 100},
         )
         sql = "select 1 as placeholder limit 100"
         elapsed_ms = int((perf_counter() - started_at) * 1000)

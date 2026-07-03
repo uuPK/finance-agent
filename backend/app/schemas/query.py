@@ -3,34 +3,23 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+from app.schemas.query_plan import QueryFilter, QueryMetric, QueryPlan
+
+__all__ = [
+    "AgentStep",
+    "GuardrailCheck",
+    "QueryFilter",
+    "QueryMetric",
+    "QueryPlan",
+    "QueryRequest",
+    "QueryResponse",
+]
+
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     user_id: str | None = None
     include_debug: bool = True
-
-
-class QueryFilter(BaseModel):
-    term: str
-    operator: str
-    value: Any
-
-
-class QueryMetric(BaseModel):
-    name: str
-    definition_id: str | None = None
-    aggregation: str | None = None
-
-
-class QueryPlan(BaseModel):
-    intent: str = "unknown"
-    subject: str | None = None
-    metrics: list[QueryMetric] = Field(default_factory=list)
-    dimensions: list[str] = Field(default_factory=list)
-    filters: list[QueryFilter] = Field(default_factory=list)
-    tables: list[str] = Field(default_factory=list)
-    grain: str | None = None
-    limit: int | None = 100
 
 
 class GuardrailCheck(BaseModel):
