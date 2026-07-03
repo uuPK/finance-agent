@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: finance-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: finance_agent
+      POSTGRES_USER: finance_agent
+      POSTGRES_PASSWORD: finance_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance_agent -d finance_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
