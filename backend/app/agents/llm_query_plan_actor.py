@@ -8,6 +8,7 @@ from app.llm.json_parser import extract_json_object
 from app.llm.protocols import SupportsLLMComplete
 from app.llm.schemas import LLMMessage
 from app.schemas.query_plan import QueryPlan
+from app.schemas.review import ReviewDecision
 
 
 ActorSource = Literal["llm", "rule_fallback"]
@@ -17,6 +18,7 @@ ActorSource = Literal["llm", "rule_fallback"]
 class QueryPlanBuildResult:
     plan: QueryPlan
     source: ActorSource
+    repair_attempt: int = 0
     llm_error: str | None = None
     llm_raw_response: str | None = None
     llm_model: str | None = None
@@ -35,19 +37,25 @@ class LLMQueryPlanActor:
         self.fallback_actor = fallback_actor or RuleBasedQueryPlanActor()
 
     async def build(
-        self, question: str, fallback_plan: QueryPlan | None = None
+        self,
+        question: str,
+        fallback_plan: QueryPlan | None = None,
+        previous_plan: QueryPlan | None = None,
+        critic_feedback: list[ReviewDecision] | None = None,
+        repair_attempt: int = 0,
     ) -> QueryPlanBuildResult:
-        rule_plan = fallback_plan or self.fallback_actor.build(question)
+        fallback = fallback_plan or previous_plan or self.fallback_actor.build(question)
         if self.llm_service is None:
             return QueryPlanBuildResult(
-                plan=rule_plan,
+                plan=fallback,
                 source="rule_fallback",
+                repair_attempt=repair_attempt,
                 llm_error="LLM service is not available or API key is not configured.",
             )
 
         try:
             response = await self.llm_service.complete(
-                messages=self._build_messages(question, rule_plan),
+                messages=self._build_messages(question, previous_plan, critic_feedback),
                 temperature=0.0,
                 max_tokens=3000,
                 response_format={"type": "json_object"},
@@ -59,31 +67,59 @@ class LLMQueryPlanActor:
             return QueryPlanBuildResult(
                 plan=plan,
                 source="llm",
+                repair_attempt=repair_attempt,
                 llm_raw_response=response.content,
                 llm_model=response.model,
                 llm_provider=response.provider,
             )
         except Exception as exc:
             return QueryPlanBuildResult(
-                plan=rule_plan,
+                plan=fallback,
                 source="rule_fallback",
+                repair_attempt=repair_attempt,
                 llm_error=f"{type(exc).__name__}: {exc}",
             )
 
-    def _build_messages(self, question: str, fallback_plan: QueryPlan) -> list[LLMMessage]:
+    def _build_messages(
+        self,
+        question: str,
+        previous_plan: QueryPlan | None,
+        critic_feedback: list[ReviewDecision] | None,
+    ) -> list[LLMMessage]:
         schema = json.dumps(QueryPlan.model_json_schema(), ensure_ascii=False)
-        fallback_json = json.dumps(
-            fallback_plan.model_dump(mode="json", exclude_none=True),
-            ensure_ascii=False,
-            indent=2,
-        )
+        repair_context = ""
+        if previous_plan is not None and critic_feedback:
+            previous_plan_json = json.dumps(
+                previous_plan.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                indent=2,
+            )
+            feedback_json = json.dumps(
+                [
+                    feedback.model_dump(mode="json", exclude_none=True)
+                    for feedback in critic_feedback
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            repair_context = dedent(
+                f"""
+
+                上一版 QueryPlan：
+                {previous_plan_json}
+
+                Critic 反馈：
+                {feedback_json}
+
+                请根据 critic 反馈修复上一版计划。只能修复与反馈相关的问题，并继续忠实保留用户明示条件。
+                """
+            )
+
         user_prompt = dedent(
             f"""
             用户问题：
             {question}
-
-            规则版 QueryPlan 草稿：
-            {fallback_json}
+            {repair_context}
 
             QueryPlan JSON Schema：
             {schema}

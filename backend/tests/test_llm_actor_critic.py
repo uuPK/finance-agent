@@ -12,6 +12,7 @@ from app.services.query_service import QueryService
 class QueueLLMService:
     def __init__(self, contents: list[str]) -> None:
         self.contents = list(contents)
+        self.calls: list[list[LLMMessage]] = []
 
     async def complete(
         self,
@@ -20,6 +21,7 @@ class QueueLLMService:
         max_tokens: int | None = None,
         response_format: dict | None = None,
     ) -> LLMResponse:
+        self.calls.append(messages)
         return LLMResponse(
             content=self.contents.pop(0),
             model="fake-model",
@@ -77,9 +79,42 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     assert llm_service.contents == []
 
 
+def test_query_service_repairs_plan_with_critic_feedback() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    llm_service = QueueLLMService(
+        [
+            _plan_with_limit_exceeding_safety_json(question),
+            _ready_plan_json(question, confidence=0.94),
+            _passing_critic_json(),
+        ]
+    )
+
+    response = asyncio.run(
+        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+    )
+
+    build_step = next(step for step in response.steps if step.name == "build_query_plan")
+    repair_step = next(step for step in response.steps if step.name == "repair_query_plan")
+
+    assert response.status == "planned"
+    assert response.retry_count == 1
+    assert response.query_plan is not None
+    assert response.query_plan.output.limit == 100
+    assert build_step.details["attempt_count"] == 2
+    assert build_step.details["repair_attempts"] == 1
+    assert repair_step.status == "passed"
+    assert "limit_exceeds_safety" in llm_service.calls[1][-1].content
+
+
 def _ready_plan_json(question: str, confidence: float) -> str:
     plan = RuleBasedQueryPlanActor().build(question)
     plan = plan.model_copy(update={"confidence": confidence})
+    return json.dumps(plan.model_dump(mode="json"), ensure_ascii=False)
+
+
+def _plan_with_limit_exceeding_safety_json(question: str) -> str:
+    plan = RuleBasedQueryPlanActor().build(question)
+    plan = plan.model_copy(update={"output": plan.output.model_copy(update={"limit": 1001})})
     return json.dumps(plan.model_dump(mode="json"), ensure_ascii=False)
 
 
