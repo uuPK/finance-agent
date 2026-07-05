@@ -6,7 +6,7 @@ from app.services.query_service import QueryService
 
 def test_query_service_builds_ready_plan_for_clear_customer_query() -> None:
     response = asyncio.run(
-        QueryService().run(
+        QueryService(enable_llm=False).run(
             QueryRequest(
                 question=(
                     "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
@@ -27,7 +27,9 @@ def test_query_service_builds_ready_plan_for_clear_customer_query() -> None:
 
 
 def test_query_service_returns_clarification_for_ambiguous_business_term() -> None:
-    response = asyncio.run(QueryService().run(QueryRequest(question="找出高净值客户")))
+    response = asyncio.run(
+        QueryService(enable_llm=False).run(QueryRequest(question="找出高净值客户"))
+    )
 
     assert response.status == "needs_clarification"
     assert response.sql is None
