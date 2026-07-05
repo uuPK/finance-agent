@@ -9,8 +9,13 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+psycopg://finance_agent:finance_agent@localhost:5432/finance_agent"
     )
+    llm_provider: str = "deepseek"
+    llm_model: str = "deepseek-chat"
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_timeout_seconds: int = 30
+    deepseek_api_key: str = ""
     openai_api_key: str = ""
-    model_name: str = "gpt-4.1-mini"
+    model_name: str = "deepseek-chat"
     max_retry: int = 2
     sql_timeout_seconds: int = 30
     max_result_rows: int = 1000
@@ -21,6 +26,12 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.backend_cors_origins.split(",") if origin.strip()]
+
+    @property
+    def active_llm_api_key(self) -> str:
+        if self.llm_provider.lower() == "deepseek":
+            return self.deepseek_api_key
+        return self.openai_api_key
 
 
 @lru_cache

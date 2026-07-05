@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.core.config import get_settings
 from app.schemas.query import QueryRequest, QueryResponse
+from app.services.llm_service import LLMService
 from app.services.query_service import QueryService
 
 router = APIRouter()
@@ -11,6 +12,11 @@ router = APIRouter()
 def health() -> dict[str, str]:
     settings = get_settings()
     return {"status": "ok", "app": settings.app_name, "environment": settings.environment}
+
+
+@router.get("/llm/status")
+def llm_status() -> dict[str, str | bool | int]:
+    return LLMService().status()
 
 
 @router.post("/chat/query", response_model=QueryResponse)

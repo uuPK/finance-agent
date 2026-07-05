@@ -111,3 +111,19 @@ public 仓库不得提交：
 - 本地数据库文件
 
 请使用 `data/sample/` 放置可公开的合成样例数据。
+
+## LLM 配置
+
+项目通过标准 LLM 接口调用 OpenAI-compatible 模型，默认 provider 为 DeepSeek。
+
+本地 `.env` 示例：
+
+```bash
+LLM_PROVIDER=deepseek
+LLM_MODEL=deepseek-chat
+LLM_BASE_URL=https://api.deepseek.com
+LLM_TIMEOUT_SECONDS=30
+DEEPSEEK_API_KEY=your_api_key_here
+```
+
+不要把真实 API key 提交到 GitHub。`.env` 已被 `.gitignore` 排除。
