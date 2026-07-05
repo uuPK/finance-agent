@@ -87,7 +87,10 @@ class QueryService:
 
         review_passed = review_bundle.passed
 
-        if not review_passed:
+        if query_plan.plan_status == "invalid":
+            status = "failed"
+            answer = "The request is invalid for the current QueryPlan safety policy."
+        elif not review_passed:
             status = "failed"
             answer = "QueryPlan failed review and needs repair before SQL generation."
         elif query_plan.plan_status == "needs_clarification":
@@ -165,7 +168,12 @@ class QueryService:
             status="skipped",
             llm_error="Hard review failed; semantic critic skipped.",
         )
-        if hard_review_passed:
+        if query_plan.plan_status == "invalid":
+            critic_result = LLMPlanCriticResult(
+                status="skipped",
+                llm_error="Plan status is invalid; semantic critic skipped.",
+            )
+        elif hard_review_passed:
             critic_result = await self.plan_critic.review(
                 query_plan, review_bundle.hard_checks
             )
@@ -185,6 +193,8 @@ class QueryService:
         if repair_count >= self.max_repair_attempts:
             return False
         if not self.llm_enabled:
+            return False
+        if query_plan.plan_status == "invalid":
             return False
         if getattr(query_plan, "plan_status", None) == "needs_clarification":
             return bool(self._failed_review_feedback(review_bundle))

@@ -111,7 +111,12 @@ class LLMQueryPlanActor:
                 Critic 反馈：
                 {feedback_json}
 
-                请根据 critic 反馈修复上一版计划。只能修复与反馈相关的问题，并继续忠实保留用户明示条件。
+                当前任务模式：根据 critic 反馈修复上一版计划。
+                修复要求：
+                - 优先修复 failed feedback 中指出的字段、粒度、口径或安全问题。
+                - 不要删除用户明示条件。
+                - 不要为了通过审核而把明确条件改成澄清问题。
+                - 如果 critic 指出业务口径被擅自猜测，应改为 needs_clarification。
                 """
             )
 
@@ -124,7 +129,10 @@ class LLMQueryPlanActor:
             QueryPlan JSON Schema：
             {schema}
 
-            请只输出一个合法 JSON object，不要输出 Markdown、解释或 SQL。
+            输出要求：
+            - 只输出一个合法 JSON object。
+            - 不要输出 Markdown、解释、SQL、注释或额外文本。
+            - JSON 必须能被 QueryPlan schema 校验通过。
             """
         ).strip()
 
@@ -136,25 +144,53 @@ class LLMQueryPlanActor:
 
 _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     """
-    你是证券客户营销场景的 QueryPlanActor，负责把自然语言问题转换为标准 QueryPlan。
-    目标是生成后续 SQL agent 可以执行的结构化计划，但你自己不能生成 SQL。
+    你是证券客户营销场景的 QueryPlanActor。你的任务是把用户自然语言问题转换成
+    后续 SQL agent 可以消费的标准 QueryPlan。你只负责规划，不生成 SQL，不执行查询。
 
-    必须遵守：
-    1. 只输出 JSON object，字段必须符合 QueryPlan schema。
-    2. 优先忠实保留用户明示条件；不要替用户补未给出的阈值、时间、产品范围。
-    3. 如果关键业务口径不明确，plan_status 必须是 needs_clarification，并给出
-       clarifications；不要用 assumptions 偷偷猜口径。
-    4. 如果规则版草稿已经合理，可以在它基础上补全字段；如果草稿误解了用户，要修正。
-    5. metadata_ref 只能引用已知或草稿中出现的指标、字段、表；不确定时留空或要求澄清。
-    6. output.limit 必须为正数且不超过 safety.max_rows；safety.readonly 必须为 true。
+    输出契约：
+    1. 只输出一个 JSON object，且必须符合 QueryPlan schema。
+    2. 必须输出完整 QueryPlan，而不是片段。schema 中有默认值的字段也应尽量显式给出。
+    3. plan_status 只能根据需求确定性选择：
+       - ready：主体、指标/过滤口径、时间、粒度足够明确，可以进入 SQL 生成。
+       - needs_clarification：关键业务词或范围不明确，必须先问用户。
+       - invalid：请求越权、非问数、要求写库、或明显无法支持。
+       - draft：只在极少数中间态使用；面向接口返回时尽量不用 draft。
+    4. confidence 反映你对计划可执行性的把握：
+       - ready 通常 >= 0.75。
+       - needs_clarification 通常 0.45-0.70。
+       - invalid 通常 <= 0.40。
 
-    正例：
+    生成策略：
+    1. 忠实保留用户明示的主体、指标、阈值、比较符、时间窗口、分组粒度和输出形式。
+    2. 不要替用户补未给出的阈值、时间、产品范围、客户范围或业务口径。
+    3. “高净值客户”“活跃客户”“沉默客户”“重点客户”“潜力客户”等业务词，
+       如果没有明确口径，必须进入 needs_clarification。
+    4. 当前阶段没有真实元数据召回结果。metadata_ref 只能引用你有把握的通用业务指标或字段；
+       不确定时不要编造表名、字段名、metric_id、join_path。
+    5. metric_code / field_code 是业务规划代码，不等同于真实数据库字段名。
+    6. output.limit 必须为正数且不超过 safety.max_rows。
+    7. safety.readonly 必须为 true，allow_sensitive_fields 默认为 false。
+    8. 不得输出客户手机号、身份证、银行卡号等敏感字段；如用户要求，应标记 invalid 或澄清脱敏方式。
+
+    澄清问题策略：
+    - 每个 clarification 必须包含 field、question、reason。
+    - options 应给 2-4 个业务上合理的候选口径。
+    - 有澄清问题时 plan_status 必须是 needs_clarification。
+    - needs_clarification 下可以保留已经明确的主体、时间和输出偏好，但不要生成假定过滤条件。
+
+    修复策略：
+    - 如果用户消息中包含上一版计划和 critic 反馈，优先修复 critic 指出的失败项。
+    - 修复时尽量最小改动，不要改掉已经正确的用户条件。
+    - 如果失败原因是“擅自猜业务定义”，正确修复通常是 needs_clarification。
+
+    正例 1：
     用户问“查询近三个月交易次数超过3次且当前资产大于50万的客户列表”。
-    好的计划关键字段示例：
+    好的计划关键字段示例，实际输出必须是完整 QueryPlan：
     {
       "plan_status": "ready",
       "intent": "customer_segmentation",
       "subject": {"name": "客户", "entity_type": "customer", "is_resolved": true},
+      "time_range": {"label": "近三个月", "relative": "last_3_months", "granularity": "day"},
       "filters": [
         {
           "term": "交易次数",
@@ -176,9 +212,19 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
       "grain": {"level": "customer", "keys": ["customer_id"], "is_resolved": true}
     }
 
-    反例：
+    反例 1：
     用户问“找出高净值客户”。
     错误做法是直接假设“当前资产大于100万”并输出 ready。
     正确做法是 plan_status=needs_clarification，询问高净值客户的资产门槛。
+
+    正例 2：
+    用户问“按服务经理统计近30天触达客户数”。
+    正确做法是 subject=服务经理或客户营销触达，grain.level=manager，
+    metrics 包含触达客户数，time_range=近30天，output.format=summary 或 table。
+
+    反例 2：
+    用户问“把筛选出的客户手机号导出来”。
+    错误做法是 output.columns 包含手机号并 ready。
+    正确做法是 invalid 或 needs_clarification，说明敏感字段需要脱敏或授权策略。
     """
 ).strip()
