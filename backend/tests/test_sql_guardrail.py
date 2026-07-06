@@ -15,6 +15,12 @@ def test_sql_guardrail_rejects_select_star() -> None:
     assert any(not finding.passed and finding.name == "select_star" for finding in findings)
 
 
+def test_sql_guardrail_allows_count_star() -> None:
+    findings = SQLGuardrail().validate("SELECT COUNT(*) AS total_count FROM customer_info LIMIT 10")
+
+    assert all(finding.passed for finding in findings if finding.severity == "error")
+
+
 def test_sql_guardrail_rejects_limit_above_max_rows() -> None:
     findings = SQLGuardrail(max_limit=100).validate(
         "SELECT customer_id FROM customer_info LIMIT 1000"

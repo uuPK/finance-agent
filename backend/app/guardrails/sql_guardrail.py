@@ -111,7 +111,14 @@ class SQLGuardrail:
         )
 
     def _check_no_select_star(self, expression: exp.Expression) -> GuardrailFinding:
-        found_star = any(isinstance(node, exp.Star) for node in expression.walk())
+        found_star = any(
+            isinstance(projection, exp.Star)
+            or (
+                isinstance(projection, exp.Column)
+                and isinstance(projection.this, exp.Star)
+            )
+            for projection in expression.expressions
+        )
         return GuardrailFinding(
             name="select_star",
             passed=not found_star,

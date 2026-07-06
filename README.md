@@ -64,20 +64,24 @@ docker compose up -d postgres
 
 ```bash
 cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn app.main:app --reload
+uv sync
+uv run uvicorn app.main:app --reload
 ```
 
 Windows PowerShell 可使用：
 
 ```powershell
 cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-uvicorn app.main:app --reload
+uv sync
+uv run uvicorn app.main:app --reload
+```
+
+如果本机 `uv` 缓存目录权限异常，可以临时指定缓存目录：
+
+```powershell
+$env:UV_CACHE_DIR = "$env:TEMP\finance-agent-uv-cache"
+uv sync
+uv run uvicorn app.main:app --reload
 ```
 
 4. 启动前端：
@@ -90,14 +94,19 @@ npm run dev
 
 ## 当前阶段
 
-当前仓库处于项目初始化阶段，重点包括：
+当前仓库已经实现核心问数主循环的前两段：
 
-- 协作目录和工程骨架
-- PostgreSQL 开发环境
-- FastAPI 基础服务
-- LangGraph Actor-Critic 工作流占位
-- 前端工作台基础结构
-- 文档与 GitHub 协作模板
+- QueryPlan Actor-Critic 生成、审核和修复循环。
+- SQL Actor-Critic 生成、Guardrail 审核和修复循环。
+- DeepSeek OpenAI-compatible 接口接入。
+- SQL 目前只生成和审核，不执行数据库查询。
+- 元数据召回、真实表结构适配、SQL 执行、结果审核将在后续阶段接入。
+
+后端启动后可访问：
+
+- `GET http://127.0.0.1:8000/api/health`
+- `GET http://127.0.0.1:8000/api/llm/status`
+- `POST http://127.0.0.1:8000/api/chat/query`
 
 ## 安全说明
 
