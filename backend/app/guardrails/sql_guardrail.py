@@ -18,16 +18,22 @@ class SQLGuardrail:
         allowed_tables: set[str] | None = None,
         sensitive_columns: set[str] | None = None,
         require_limit: bool = True,
+        max_limit: int = 1000,
     ) -> None:
         self.allowed_tables = allowed_tables or set()
         self.sensitive_columns = sensitive_columns or set()
         self.require_limit = require_limit
+        self.max_limit = max_limit
 
     def validate(self, sql: str) -> list[GuardrailFinding]:
         findings: list[GuardrailFinding] = []
 
         try:
-            expression = sqlglot.parse_one(sql, read="postgres")
+            statements = [
+                statement
+                for statement in sqlglot.parse(sql, read="postgres")
+                if statement
+            ]
         except sqlglot.errors.ParseError as exc:
             return [
                 GuardrailFinding(
@@ -38,8 +44,27 @@ class SQLGuardrail:
                 )
             ]
 
+        if len(statements) != 1:
+            return [
+                GuardrailFinding(
+                    name="single_statement",
+                    passed=False,
+                    message="SQL must contain exactly one statement.",
+                    severity="error",
+                )
+            ]
+
+        expression = statements[0]
+        findings.append(
+            GuardrailFinding(
+                name="single_statement",
+                passed=True,
+                message="SQL contains exactly one statement.",
+            )
+        )
         findings.append(self._check_select_only(expression))
         findings.append(self._check_forbidden_expressions(expression))
+        findings.append(self._check_no_select_star(expression))
         findings.extend(self._check_allowed_tables(expression))
         findings.extend(self._check_sensitive_columns(expression))
 
@@ -58,7 +83,15 @@ class SQLGuardrail:
         )
 
     def _check_forbidden_expressions(self, expression: exp.Expression) -> GuardrailFinding:
-        forbidden_type_names = ("Delete", "Drop", "Insert", "Update", "Create", "Alter", "TruncateTable")
+        forbidden_type_names = (
+            "Delete",
+            "Drop",
+            "Insert",
+            "Update",
+            "Create",
+            "Alter",
+            "TruncateTable",
+        )
         forbidden_types = tuple(
             expression_type
             for type_name in forbidden_type_names
@@ -75,6 +108,19 @@ class SQLGuardrail:
                 else f"Forbidden SQL operations found: {', '.join(found)}"
             ),
             severity="error" if not passed else "info",
+        )
+
+    def _check_no_select_star(self, expression: exp.Expression) -> GuardrailFinding:
+        found_star = any(isinstance(node, exp.Star) for node in expression.walk())
+        return GuardrailFinding(
+            name="select_star",
+            passed=not found_star,
+            message=(
+                "SQL does not use SELECT *."
+                if not found_star
+                else "SQL must not use SELECT *; select explicit columns or expressions."
+            ),
+            severity="error" if found_star else "info",
         )
 
     def _check_allowed_tables(self, expression: exp.Expression) -> list[GuardrailFinding]:
@@ -140,10 +186,48 @@ class SQLGuardrail:
         return findings
 
     def _check_limit(self, expression: exp.Expression) -> GuardrailFinding:
-        passed = expression.args.get("limit") is not None
+        limit = expression.args.get("limit")
+        if limit is None:
+            return GuardrailFinding(
+                name="limit_required",
+                passed=False,
+                message="SQL must include LIMIT for preview queries.",
+                severity="error",
+            )
+
+        limit_value = self._extract_limit_value(limit)
+        if limit_value is None:
+            return GuardrailFinding(
+                name="limit_value",
+                passed=False,
+                message="SQL LIMIT must be a positive integer literal.",
+                severity="error",
+            )
+
+        if limit_value <= 0:
+            return GuardrailFinding(
+                name="limit_value",
+                passed=False,
+                message="SQL LIMIT must be positive.",
+                severity="error",
+            )
+
+        if limit_value > self.max_limit:
+            return GuardrailFinding(
+                name="limit_max_rows",
+                passed=False,
+                message=f"SQL LIMIT {limit_value} exceeds max rows {self.max_limit}.",
+                severity="error",
+            )
+
         return GuardrailFinding(
             name="limit_required",
-            passed=passed,
-            message="SQL has LIMIT." if passed else "SQL must include LIMIT for preview queries.",
-            severity="error" if not passed else "info",
+            passed=True,
+            message=f"SQL has LIMIT {limit_value}.",
         )
+
+    def _extract_limit_value(self, limit: exp.Expression) -> int | None:
+        expression = limit.args.get("expression")
+        if isinstance(expression, exp.Literal) and expression.is_int:
+            return int(expression.this)
+        return None

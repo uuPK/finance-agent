@@ -4,7 +4,7 @@ from app.schemas.query import QueryRequest
 from app.services.query_service import QueryService
 
 
-def test_query_service_builds_ready_plan_for_clear_customer_query() -> None:
+def test_query_service_requires_llm_for_sql_generation_after_ready_plan() -> None:
     response = asyncio.run(
         QueryService(enable_llm=False).run(
             QueryRequest(
@@ -15,7 +15,7 @@ def test_query_service_builds_ready_plan_for_clear_customer_query() -> None:
         )
     )
 
-    assert response.status == "planned"
+    assert response.status == "failed"
     assert response.sql is None
     assert response.query_plan is not None
     assert response.query_plan.plan_status == "ready"
@@ -23,7 +23,7 @@ def test_query_service_builds_ready_plan_for_clear_customer_query() -> None:
     assert response.query_plan.grain is not None
     assert response.query_plan.grain.level == "customer"
     assert not response.query_plan.clarifications
-    assert all(check.passed for check in response.guardrail_checks)
+    assert any(check.name == "sql_actor_failed" for check in response.guardrail_checks)
 
 
 def test_query_service_returns_clarification_for_ambiguous_business_term() -> None:

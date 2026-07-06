@@ -119,6 +119,8 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
         [
             _ready_plan_json(question, confidence=0.93),
             _passing_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
         ]
     )
 
@@ -128,12 +130,17 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
 
     build_step = next(step for step in response.steps if step.name == "build_query_plan")
     critic_step = next(step for step in response.steps if step.name == "query_plan_llm_review")
+    sql_step = next(step for step in response.steps if step.name == "generate_sql")
+    sql_critic_step = next(step for step in response.steps if step.name == "sql_llm_review")
 
     assert response.status == "planned"
+    assert response.sql is not None
     assert response.query_plan is not None
     assert response.query_plan.confidence == 0.93
     assert build_step.details["actor_source"] == "llm"
     assert critic_step.status == "passed"
+    assert sql_step.status == "passed"
+    assert sql_critic_step.status == "passed"
     assert llm_service.contents == []
 
 
@@ -144,6 +151,8 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
             _plan_with_limit_exceeding_safety_json(question),
             _ready_plan_json(question, confidence=0.94),
             _passing_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
         ]
     )
 
@@ -155,6 +164,7 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
     repair_step = next(step for step in response.steps if step.name == "repair_query_plan")
 
     assert response.status == "planned"
+    assert response.sql is not None
     assert response.retry_count == 1
     assert response.query_plan is not None
     assert response.query_plan.output.limit == 100
@@ -162,6 +172,33 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
     assert build_step.details["repair_attempts"] == 1
     assert repair_step.status == "passed"
     assert "limit_exceeds_safety" in llm_service.calls[1][-1].content
+
+
+def test_query_service_repairs_sql_with_guardrail_feedback() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    llm_service = QueueLLMService(
+        [
+            _ready_plan_json(question, confidence=0.93),
+            _passing_critic_json(),
+            _sql_draft_json(include_limit=False),
+            _sql_draft_json(include_limit=True),
+            _passing_sql_critic_json(),
+        ]
+    )
+
+    response = asyncio.run(
+        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+    )
+
+    repair_sql_step = next(step for step in response.steps if step.name == "repair_sql")
+    sql_hard_step = next(step for step in response.steps if step.name == "sql_hard_review")
+
+    assert response.status == "planned"
+    assert response.sql is not None
+    assert response.retry_count == 1
+    assert repair_sql_step.status == "passed"
+    assert sql_hard_step.status == "passed"
+    assert "limit_required" in llm_service.calls[3][-1].content
 
 
 def test_query_service_returns_failed_for_invalid_plan_without_repair() -> None:
@@ -211,6 +248,38 @@ def _invalid_sensitive_plan_json(question: str) -> str:
     return json.dumps(plan.model_dump(mode="json"), ensure_ascii=False)
 
 
+def _sql_draft_json(include_limit: bool = True) -> str:
+    limit_clause = " LIMIT 100" if include_limit else ""
+    sql = (
+        "SELECT c.customer_id, a.current_total_asset, "
+        "COUNT(t.trade_id) AS trade_count_3m "
+        "FROM customer_info c "
+        "JOIN customer_asset a ON a.customer_id = c.customer_id "
+        "JOIN customer_trade t ON t.customer_id = c.customer_id "
+        "WHERE a.current_total_asset > 500000 "
+        "AND t.trade_date >= CURRENT_DATE - INTERVAL '3 months' "
+        "GROUP BY c.customer_id, a.current_total_asset "
+        "HAVING COUNT(t.trade_id) > 3"
+        f"{limit_clause}"
+    )
+    return json.dumps(
+        {
+            "sql": sql,
+            "dialect": "postgres",
+            "tables": ["customer_info", "customer_asset", "customer_trade"],
+            "columns": [
+                "customer_id",
+                "current_total_asset",
+                "trade_id",
+                "trade_date",
+            ],
+            "assumptions": ["表名和字段名待元数据层确认"],
+            "confidence": 0.82,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _passing_critic_json() -> str:
     return json.dumps(
         {
@@ -222,6 +291,22 @@ def _passing_critic_json() -> str:
             "repair_hint": None,
             "clarification_questions": [],
             "confidence": 0.9,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _passing_sql_critic_json() -> str:
+    return json.dumps(
+        {
+            "passed": True,
+            "score": 94,
+            "stage": "sql_review",
+            "reason": "SQL implements the QueryPlan filters, time window, and grain.",
+            "evidence": ["filters_covered", "time_window_covered", "grain_covered"],
+            "repair_hint": None,
+            "clarification_questions": [],
+            "confidence": 0.91,
         },
         ensure_ascii=False,
     )
