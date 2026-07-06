@@ -37,4 +37,4 @@ def list_metrics() -> dict[str, list[dict[str, str]]]:
 
 @router.post("/evaluation/run")
 def run_evaluation() -> dict[str, str]:
-    return {"status": "not_implemented"}
+    return {"status": "pending_implementation"}

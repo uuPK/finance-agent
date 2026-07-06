@@ -9,6 +9,7 @@ from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
 from app.llm.protocols import SupportsLLMComplete
+from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.query import AgentStep, GuardrailCheck, QueryRequest, QueryResponse
 from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
@@ -25,6 +26,7 @@ class SQLLoopResult:
     critic_result: LLMSQLCriticResult
     review_history: list[dict[str, object]]
     repair_count: int
+    metadata_context: dict[str, object]
     failure_reason: str | None = None
 
 
@@ -34,6 +36,7 @@ class QueryService:
         llm_service: SupportsLLMComplete | None = None,
         enable_llm: bool = True,
         max_repair_attempts: int = 2,
+        schema_context_provider: SchemaContextProvider | None = None,
     ) -> None:
         self.rule_based_actor = RuleBasedQueryPlanActor()
         self.plan_validator = QueryPlanHardValidator()
@@ -57,18 +60,17 @@ class QueryService:
         self.plan_critic = LLMPlanCritic(llm_service=resolved_llm_service)
         self.sql_actor = LLMSQLActor(llm_service=resolved_llm_service)
         self.sql_critic = LLMSQLCritic(llm_service=resolved_llm_service)
-        self.sql_guardrail = SQLGuardrail(
-            sensitive_columns={
-                "phone",
-                "mobile",
-                "mobile_phone",
-                "id_no",
-                "id_number",
-                "cert_no",
-                "bank_account",
-                "address",
-            }
-        )
+        self.schema_context_provider = schema_context_provider or SchemaContextProvider()
+        self.default_sensitive_columns = {
+            "phone",
+            "mobile",
+            "mobile_phone",
+            "id_no",
+            "id_number",
+            "cert_no",
+            "bank_account",
+            "address",
+        }
 
     async def run(self, request: QueryRequest) -> QueryResponse:
         started_at = perf_counter()
@@ -134,8 +136,8 @@ class QueryService:
             if sql_loop_result.passed:
                 status = "planned"
                 answer = (
-                    "QueryPlan and SQL are ready. SQL execution is paused until database "
-                    "execution is enabled."
+                    "QueryPlan and SQL are ready against the current database schema context. "
+                    "SQL execution is not enabled in the main query loop yet."
                 )
             else:
                 status = "failed"
@@ -266,7 +268,12 @@ class QueryService:
         ]
 
     async def _run_sql_loop(self, question: str, query_plan: QueryPlan) -> SQLLoopResult:
-        build_result = await self.sql_actor.build(question=question, query_plan=query_plan)
+        metadata_context = self.schema_context_provider.load(query_plan)
+        build_result = await self.sql_actor.build(
+            question=question,
+            query_plan=query_plan,
+            metadata_context=metadata_context,
+        )
         build_results = [build_result]
 
         if build_result.draft is None:
@@ -292,11 +299,12 @@ class QueryService:
                     )
                 ],
                 repair_count=0,
+                metadata_context=metadata_context,
                 failure_reason=build_result.llm_error or "SQL generation failed.",
             )
 
         review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-            query_plan, build_result.draft
+            query_plan, build_result.draft, metadata_context
         )
         review_history = [
             self._build_sql_review_details(
@@ -315,6 +323,7 @@ class QueryService:
             build_result = await self.sql_actor.build(
                 question=question,
                 query_plan=query_plan,
+                metadata_context=metadata_context,
                 previous_sql=previous_sql,
                 critic_feedback=repair_feedback,
                 repair_attempt=repair_count,
@@ -341,7 +350,7 @@ class QueryService:
                 break
 
             review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-                query_plan, build_result.draft
+                query_plan, build_result.draft, metadata_context
             )
             review_history.append(
                 self._build_sql_review_details(
@@ -365,13 +374,19 @@ class QueryService:
             critic_result=critic_result,
             review_history=review_history,
             repair_count=repair_count,
+            metadata_context=metadata_context,
             failure_reason=failure_reason,
         )
 
     async def _review_sql_draft(
-        self, query_plan: QueryPlan, sql_draft: SQLDraft
+        self,
+        query_plan: QueryPlan,
+        sql_draft: SQLDraft,
+        metadata_context: dict[str, object],
     ) -> tuple[ReviewBundle, bool, LLMSQLCriticResult]:
-        guardrail_findings = self.sql_guardrail.validate(sql_draft.sql)
+        guardrail_findings = self._build_sql_guardrail(metadata_context).validate(
+            sql_draft.sql
+        )
         hard_checks = [
             self._guardrail_finding_to_review_decision(finding)
             for finding in guardrail_findings
@@ -398,6 +413,34 @@ class QueryService:
                 )
 
         return review_bundle, hard_review_passed, critic_result
+
+    def _build_sql_guardrail(self, metadata_context: dict[str, object]) -> SQLGuardrail:
+        table_allowlist = set(self._string_list(metadata_context.get("table_allowlist")))
+        sensitive_columns = {
+            *self.default_sensitive_columns,
+            *self._string_list(metadata_context.get("sensitive_columns")),
+        }
+        allowed_columns_by_table = {
+            table_name: set(self._string_list(columns))
+            for table_name, columns in self._dict_value(
+                metadata_context.get("allowed_columns_by_table")
+            ).items()
+        }
+        return SQLGuardrail(
+            allowed_tables=table_allowlist,
+            allowed_columns_by_table=allowed_columns_by_table,
+            sensitive_columns=sensitive_columns,
+        )
+
+    def _string_list(self, value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str)]
+
+    def _dict_value(self, value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        return {key: item for key, item in value.items() if isinstance(key, str)}
 
     def _should_repair_sql(self, review_bundle: ReviewBundle, repair_count: int) -> bool:
         if review_bundle.passed:
@@ -468,6 +511,7 @@ class QueryService:
             "forbidden_operations": "Remove all write or DDL operations.",
             "select_star": "Replace SELECT * with explicit output columns and aliases.",
             "table_whitelist": "Use only metadata-approved tables.",
+            "column_whitelist": "Use only columns that exist in schema context.",
             "sensitive_columns": "Remove sensitive columns from SELECT and output.",
             "limit_required": "Add a LIMIT clause within the allowed max rows.",
             "limit_value": "Use a positive integer literal in LIMIT.",
@@ -479,6 +523,15 @@ class QueryService:
     def _build_sql_steps(self, result: SQLLoopResult) -> list[AgentStep]:
         latest_build = result.build_results[-1]
         return [
+            AgentStep(
+                name="load_schema_context",
+                status="passed"
+                if result.metadata_context.get("source") == "database"
+                and result.metadata_context.get("table_count", 0)
+                else "failed",
+                summary="Loaded database schema context for SQL generation.",
+                details=self._metadata_context_summary(result.metadata_context),
+            ),
             AgentStep(
                 name="generate_sql",
                 status="passed" if latest_build.draft is not None else "failed",
@@ -514,6 +567,7 @@ class QueryService:
             "tables": latest_build.draft.tables if latest_build.draft else [],
             "columns": latest_build.draft.columns if latest_build.draft else [],
             "confidence": latest_build.draft.confidence if latest_build.draft else None,
+            "metadata_context": self._metadata_context_summary(result.metadata_context),
             "attempts": [
                 {
                     "repair_attempt": item.repair_attempt,
@@ -525,6 +579,27 @@ class QueryService:
                 }
                 for item in result.build_results
             ],
+        }
+
+    def _metadata_context_summary(
+        self, metadata_context: dict[str, object]
+    ) -> dict[str, object]:
+        table_allowlist = self._string_list(metadata_context.get("table_allowlist"))
+        metrics = metadata_context.get("metrics")
+        metric_codes = []
+        if isinstance(metrics, list):
+            metric_codes = [
+                metric["metric_code"]
+                for metric in metrics
+                if isinstance(metric, dict) and isinstance(metric.get("metric_code"), str)
+            ]
+        return {
+            "source": metadata_context.get("source"),
+            "error": metadata_context.get("error"),
+            "table_count": metadata_context.get("table_count", 0),
+            "metric_count": metadata_context.get("metric_count", 0),
+            "tables": table_allowlist,
+            "metrics": metric_codes,
         }
 
     def _build_sql_repair_step(self, result: SQLLoopResult) -> AgentStep:

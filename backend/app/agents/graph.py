@@ -105,7 +105,7 @@ def critique_result(state: QueryState) -> QueryState:
 def finalize_answer(state: QueryState) -> QueryState:
     return {
         **state,
-        "final_answer": "初始化阶段：查询工作流已创建，真实 LLM 和 SQL 执行将在下一阶段接入。",
+        "final_answer": "查询工作流已创建；LLM 与 schema context 已接入，SQL 执行器将在下一阶段接入主循环。",
         "status": "completed",
     }
 

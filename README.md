@@ -107,8 +107,10 @@ npm run dev
 - QueryPlan Actor-Critic 生成、审核和修复循环。
 - SQL Actor-Critic 生成、Guardrail 审核和修复循环。
 - DeepSeek OpenAI-compatible 接口接入。
-- SQL 目前只生成和审核，不执行数据库查询。
-- 元数据召回、真实表结构适配、SQL 执行、结果审核将在后续阶段接入。
+- PostgreSQL 业务表、日志表、synthetic 测试数据和真实 schema context 接入。
+- SQL 生成前会读取当前数据库表、字段、指标、业务词和 join 路径作为上下文。
+- SQL 目前只生成和审核，主查询循环尚未执行数据库查询。
+- SQL 执行、结果硬校验和 ResultCritic 将在后续阶段接入。
 
 后端启动后可访问：
 

@@ -16,11 +16,13 @@ class SQLGuardrail:
     def __init__(
         self,
         allowed_tables: set[str] | None = None,
+        allowed_columns_by_table: dict[str, set[str]] | None = None,
         sensitive_columns: set[str] | None = None,
         require_limit: bool = True,
         max_limit: int = 1000,
     ) -> None:
         self.allowed_tables = allowed_tables or set()
+        self.allowed_columns_by_table = allowed_columns_by_table or {}
         self.sensitive_columns = sensitive_columns or set()
         self.require_limit = require_limit
         self.max_limit = max_limit
@@ -66,6 +68,7 @@ class SQLGuardrail:
         findings.append(self._check_forbidden_expressions(expression))
         findings.append(self._check_no_select_star(expression))
         findings.extend(self._check_allowed_tables(expression))
+        findings.extend(self._check_allowed_columns(expression))
         findings.extend(self._check_sensitive_columns(expression))
 
         if self.require_limit:
@@ -136,13 +139,18 @@ class SQLGuardrail:
                 GuardrailFinding(
                     name="table_whitelist",
                     passed=True,
-                    message="Table whitelist is not configured yet.",
+                    message="Table whitelist was not provided by schema context.",
                     severity="warning",
                 )
             ]
 
         findings: list[GuardrailFinding] = []
-        table_names = {table.name for table in expression.find_all(exp.Table)}
+        cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
+        table_names = {
+            table.name
+            for table in expression.find_all(exp.Table)
+            if table.name not in cte_names
+        }
         for table_name in sorted(table_names):
             passed = table_name in self.allowed_tables
             findings.append(
@@ -159,13 +167,76 @@ class SQLGuardrail:
             )
         return findings
 
+    def _check_allowed_columns(self, expression: exp.Expression) -> list[GuardrailFinding]:
+        if not self.allowed_columns_by_table:
+            return [
+                GuardrailFinding(
+                    name="column_whitelist",
+                    passed=True,
+                    message="Column whitelist was not provided by schema context.",
+                    severity="warning",
+                )
+            ]
+
+        table_aliases = self._table_aliases(expression)
+        findings: list[GuardrailFinding] = []
+        for column in expression.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+
+            table_qualifier = column.table
+            if not table_qualifier:
+                continue
+
+            table_name = table_aliases.get(table_qualifier, table_qualifier)
+            allowed_columns = self.allowed_columns_by_table.get(table_name)
+            if allowed_columns is None:
+                continue
+
+            column_name = column.name
+            if column_name not in allowed_columns:
+                findings.append(
+                    GuardrailFinding(
+                        name="column_whitelist",
+                        passed=False,
+                        message=(
+                            f"Column `{table_qualifier}.{column_name}` is not in schema "
+                            f"context for table `{table_name}`."
+                        ),
+                        severity="error",
+                    )
+                )
+
+        if not findings:
+            findings.append(
+                GuardrailFinding(
+                    name="column_whitelist",
+                    passed=True,
+                    message="Qualified columns exist in schema context.",
+                )
+            )
+        return findings
+
+    def _table_aliases(self, expression: exp.Expression) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
+        for table in expression.find_all(exp.Table):
+            table_name = table.name
+            if table_name in cte_names:
+                continue
+            aliases[table_name] = table_name
+            alias = table.alias
+            if alias:
+                aliases[alias] = table_name
+        return aliases
+
     def _check_sensitive_columns(self, expression: exp.Expression) -> list[GuardrailFinding]:
         if not self.sensitive_columns:
             return [
                 GuardrailFinding(
                     name="sensitive_columns",
                     passed=True,
-                    message="Sensitive column list is not configured yet.",
+                    message="Sensitive column list was not provided by schema context.",
                     severity="warning",
                 )
             ]

@@ -27,3 +27,21 @@ def test_sql_guardrail_rejects_limit_above_max_rows() -> None:
     )
 
     assert any(not finding.passed and finding.name == "limit_max_rows" for finding in findings)
+
+
+def test_sql_guardrail_rejects_unknown_qualified_column() -> None:
+    findings = SQLGuardrail(
+        allowed_tables={"customer_info"},
+        allowed_columns_by_table={"customer_info": {"customer_id", "customer_no"}},
+    ).validate("SELECT c.not_a_column FROM customer_info c LIMIT 10")
+
+    assert any(not finding.passed and finding.name == "column_whitelist" for finding in findings)
+
+
+def test_sql_guardrail_allows_known_qualified_columns() -> None:
+    findings = SQLGuardrail(
+        allowed_tables={"customer_info"},
+        allowed_columns_by_table={"customer_info": {"customer_id", "customer_no"}},
+    ).validate("SELECT c.customer_no FROM customer_info c LIMIT 10")
+
+    assert all(finding.passed for finding in findings if finding.severity == "error")

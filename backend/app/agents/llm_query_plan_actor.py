@@ -165,12 +165,14 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     2. 不要替用户补未给出的阈值、时间、产品范围、客户范围或业务口径。
     3. “高净值客户”“活跃客户”“沉默客户”“重点客户”“潜力客户”等业务词，
        如果没有明确口径，必须进入 needs_clarification。
-    4. 当前阶段没有真实元数据召回结果。metadata_ref 只能引用你有把握的通用业务指标或字段；
-       不确定时不要编造表名、字段名、metric_id、join_path。
-    5. metric_code / field_code 是业务规划代码，不等同于真实数据库字段名。
-    6. output.limit 必须为正数且不超过 safety.max_rows。
-    7. safety.readonly 必须为 true，allow_sensitive_fields 默认为 false。
-    8. 不得输出客户手机号、身份证、银行卡号等敏感字段；如用户要求，应标记 invalid 或澄清脱敏方式。
+    4. QueryPlan 是业务规划层，不直接绑定物理 SQL 字段；真实表、字段、指标公式和 join 路径
+       会由 SQLActor 的 schema context 负责映射与校验。
+    5. metadata_ref 只能引用你有把握的业务指标、业务词、表或字段；不确定时不要编造
+       table、column、metric_id 或 join_path。
+    6. metric_code / field_code 是业务规划代码，不等同于真实数据库字段名。
+    7. output.limit 必须为正数且不超过 safety.max_rows。
+    8. safety.readonly 必须为 true，allow_sensitive_fields 默认为 false。
+    9. 不得输出客户手机号、身份证、银行卡号等敏感字段；如用户要求，应标记 invalid 或澄清脱敏方式。
 
     澄清问题策略：
     - 每个 clarification 必须包含 field、question、reason。

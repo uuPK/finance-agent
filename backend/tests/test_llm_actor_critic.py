@@ -30,6 +30,37 @@ class QueueLLMService:
         )
 
 
+class StaticSchemaContextProvider:
+    def load(self, query_plan=None) -> dict:
+        return {
+            "version": "1.0",
+            "source": "database",
+            "table_count": 4,
+            "metric_count": 2,
+            "tables": [],
+            "metrics": [
+                {"metric_code": "current_total_asset"},
+                {"metric_code": "trade_count_90d"},
+            ],
+            "business_terms": [],
+            "join_relationships": [],
+            "question_examples": [],
+            "table_allowlist": [
+                "customer_info",
+                "customer_current_asset",
+                "customer_trade",
+                "customer_trade_90d",
+            ],
+            "sensitive_columns": ["customer_name_masked"],
+            "allowed_columns_by_table": {
+                "customer_info": ["customer_id", "customer_no", "customer_level"],
+                "customer_current_asset": ["customer_id", "total_asset"],
+                "customer_trade": ["customer_id", "trade_id", "trade_date"],
+                "customer_trade_90d": ["customer_id", "trade_count_90d"],
+            },
+        }
+
+
 def test_llm_query_plan_actor_uses_llm_response() -> None:
     question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
     plan_json = _ready_plan_json(question, confidence=0.91)
@@ -125,7 +156,10 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     )
 
     response = asyncio.run(
-        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+        ).run(QueryRequest(question=question))
     )
 
     build_step = next(step for step in response.steps if step.name == "build_query_plan")
@@ -141,6 +175,8 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     assert critic_step.status == "passed"
     assert sql_step.status == "passed"
     assert sql_critic_step.status == "passed"
+    assert "customer_current_asset" in llm_service.calls[2][-1].content
+    assert sql_step.details["metadata_context"]["source"] == "database"
     assert llm_service.contents == []
 
 
@@ -157,7 +193,10 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
     )
 
     response = asyncio.run(
-        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+        ).run(QueryRequest(question=question))
     )
 
     build_step = next(step for step in response.steps if step.name == "build_query_plan")
@@ -187,7 +226,10 @@ def test_query_service_repairs_sql_with_guardrail_feedback() -> None:
     )
 
     response = asyncio.run(
-        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+        ).run(QueryRequest(question=question))
     )
 
     repair_sql_step = next(step for step in response.steps if step.name == "repair_sql")
@@ -251,14 +293,14 @@ def _invalid_sensitive_plan_json(question: str) -> str:
 def _sql_draft_json(include_limit: bool = True) -> str:
     limit_clause = " LIMIT 100" if include_limit else ""
     sql = (
-        "SELECT c.customer_id, a.current_total_asset, "
+        "SELECT c.customer_no, a.total_asset, "
         "COUNT(t.trade_id) AS trade_count_3m "
-        "FROM customer_info c "
-        "JOIN customer_asset a ON a.customer_id = c.customer_id "
-        "JOIN customer_trade t ON t.customer_id = c.customer_id "
-        "WHERE a.current_total_asset > 500000 "
+        "FROM mart.customer_info c "
+        "JOIN mart.customer_current_asset a ON a.customer_id = c.customer_id "
+        "JOIN mart.customer_trade t ON t.customer_id = c.customer_id "
+        "WHERE a.total_asset > 500000 "
         "AND t.trade_date >= CURRENT_DATE - INTERVAL '3 months' "
-        "GROUP BY c.customer_id, a.current_total_asset "
+        "GROUP BY c.customer_no, a.total_asset "
         "HAVING COUNT(t.trade_id) > 3"
         f"{limit_clause}"
     )
@@ -266,14 +308,14 @@ def _sql_draft_json(include_limit: bool = True) -> str:
         {
             "sql": sql,
             "dialect": "postgres",
-            "tables": ["customer_info", "customer_asset", "customer_trade"],
+            "tables": ["customer_info", "customer_current_asset", "customer_trade"],
             "columns": [
-                "customer_id",
-                "current_total_asset",
+                "customer_no",
+                "total_asset",
                 "trade_id",
                 "trade_date",
             ],
-            "assumptions": ["表名和字段名待元数据层确认"],
+            "assumptions": [],
             "confidence": 0.82,
         },
         ensure_ascii=False,

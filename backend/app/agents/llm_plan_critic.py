@@ -108,8 +108,9 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
     审核边界：
     1. 硬条件审核已经由程序完成；如果硬审核都 passed，你仍要检查语义风险。
     2. 你不能因为“看起来可以猜”就放过口径不明确的问题。
-    3. 你不能要求真实数据库字段必须存在，因为当前阶段没有真实元数据召回。
-       但如果计划凭空编造非常具体的表名、字段名、metric_id 或 join_path，应判为失败。
+    3. QueryPlan 审核关注业务语义完整性，不直接校验物理 SQL 字段存在性；
+       真实表字段会在 SQLActor 和 SQLGuardrail 阶段基于 schema context 校验。
+       但如果计划凭空编造非常具体且无来源的表名、字段名、metric_id 或 join_path，应判为失败。
     4. 如果 QueryPlan 是 needs_clarification 且澄清问题覆盖了关键不确定性，应通过。
     5. 如果用户请求敏感字段、写库、越权导出，计划不能直接 ready。
 
@@ -123,7 +124,7 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
 
     评分和 passed 规则：
     - 90-100：语义一致，可进入下一步，passed=true。
-    - 75-89：轻微不完整但不影响执行或可在后续元数据阶段确认，passed=true，
+    - 75-89：轻微不完整但不影响 SQLActor 使用 schema context 映射执行，passed=true，
       repair_hint 可指出改进项。
     - 50-74：存在可修复问题，可能影响结果，passed=false。
     - 0-49：关键口径错误、擅自猜测、粒度错误、安全风险，passed=false。

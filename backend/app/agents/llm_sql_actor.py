@@ -119,7 +119,7 @@ class LLMSQLActor:
                 - 优先修复 hard guardrail 或 SQLCritic 指出的失败项。
                 - 不要删除 QueryPlan 中明确要求的指标、过滤、时间窗口、粒度和输出字段。
                 - 不要为通过审核而弱化 WHERE 条件或放大返回范围。
-                - 如果没有元数据，仍然只能生成只读候选 SQL，并在 assumptions 中说明。
+                - 必须继续使用 metadata context 中的真实表、真实字段和 join 路径。
                 """
             )
 
@@ -131,7 +131,7 @@ class LLMSQLActor:
             已审核通过的 QueryPlan：
             {query_plan_json}
 
-            Metadata context，可能为空：
+            Metadata context，来自当前 PostgreSQL 与 metadata 表：
             {metadata_json}
             {repair_context}
 
@@ -167,10 +167,18 @@ _SQL_ACTOR_SYSTEM_PROMPT = dedent(
     7. 必须尽量覆盖 QueryPlan 的 metrics、filters、time_range、grain、output.columns。
 
     元数据策略：
-    - 如果 metadata context 提供了表、字段、指标公式和 join_path，必须优先使用它们。
-    - 如果 metadata context 为空，允许生成候选 SQL，但要使用 QueryPlan.data_requirements
-      中的候选表或通用业务表名，并在 assumptions 里说明“待元数据确认”。
-    - 不要声称候选表字段一定存在；不要生成无法解析的伪 SQL。
+    - metadata context 是 SQL 表结构的唯一可信来源。
+    - 如果 metadata context 提供了表、字段、指标公式和 join_path，必须使用其中的真实表名、
+      真实字段名和 join 路径。
+    - 如果 metadata context 中有 table_allowlist，SQL 只能使用白名单中的表或视图。
+    - 如果 metadata context 中有 allowed_columns_by_table，带表别名的字段必须来自对应表字段列表。
+    - 如果 metadata context.source != "database" 或 table_count=0，说明 schema context 加载失败；
+      此时应只在 QueryPlan 已给出明确表字段时生成低置信度 SQL，并在 assumptions 中说明
+      "schema_context_unavailable"。
+    - 不要编造 metadata context 中不存在的表、字段、指标公式或 join 路径。
+    - 当前资产优先使用 mart.customer_current_asset。
+    - 近 90 天交易次数/金额优先使用 mart.customer_trade_90d。
+    - 近 90 天净流入优先使用 mart.customer_net_flow_90d。
 
     粒度策略：
     - grain.level=customer：通常 SELECT customer_id，并按 customer_id 分组或返回客户级行。
@@ -179,16 +187,15 @@ _SQL_ACTOR_SYSTEM_PROMPT = dedent(
     - metric aggregation 必须与 QueryPlan.metrics 中的 aggregation 尽量一致。
 
     正例：
-    QueryPlan 要求客户级列表、current_total_asset > 500000、trade_count_3m > 3、
-    last_3_months 交易窗口。
+    QueryPlan 要求客户级列表、current_total_asset > 500000、trade_count_90d > 3。
     好的 SQLDraft：
     {
-      "sql": "SELECT customer_id FROM cm WHERE asset > 500000 AND trade_count_3m > 3 LIMIT 100",
+      "sql": "SELECT c.customer_no, a.total_asset, t.trade_count_90d FROM mart.customer_info c JOIN mart.customer_current_asset a ON a.customer_id = c.customer_id LEFT JOIN mart.customer_trade_90d t ON t.customer_id = c.customer_id WHERE a.total_asset > 500000 AND COALESCE(t.trade_count_90d, 0) > 3 LIMIT 100",
       "dialect": "postgres",
-      "tables": ["cm"],
-      "columns": ["customer_id", "asset", "trade_count_3m"],
-      "assumptions": ["表名和字段名待元数据层确认"],
-      "confidence": 0.78
+      "tables": ["customer_info", "customer_current_asset", "customer_trade_90d"],
+      "columns": ["customer_no", "total_asset", "trade_count_90d"],
+      "assumptions": [],
+      "confidence": 0.88
     }
     这个例子通过，因为它是只读 SELECT，包含 LIMIT，并覆盖了资产过滤、交易次数过滤和时间窗口。
 

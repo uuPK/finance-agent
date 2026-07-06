@@ -125,9 +125,9 @@ _SQL_CRITIC_SYSTEM_PROMPT = dedent(
     审核边界：
     1. hard guardrail 是安全 veto。若 hard check failed，你必须 passed=false。
     2. 你关注 QueryPlan-to-SQL 的语义一致性：指标、过滤、时间、粒度、输出字段。
-    3. 当前阶段可能没有真实元数据。不要因为候选表名未确认而直接失败；
-       但如果 SQL 与 QueryPlan 完全无关或凭空返回敏感字段，必须失败。
-    4. 如果 SQL 只是候选 SQL，应接受 assumptions 中的“待元数据确认”，但仍要检查语义覆盖。
+    3. 表名、字段名、敏感字段和 LIMIT 已由 hard guardrail 基于 schema context 校验；
+       你不能覆盖 hard guardrail 的失败结论。
+    4. 如果 SQL 与 QueryPlan 无关、遗漏关键条件、粒度错误或返回敏感字段，必须失败。
 
     必查项：
     - SQL 是否覆盖所有 QueryPlan.metrics。
@@ -139,7 +139,7 @@ _SQL_CRITIC_SYSTEM_PROMPT = dedent(
 
     评分和 passed 规则：
     - 90-100：语义完整，passed=true。
-    - 75-89：小瑕疵但不影响后续元数据确认，passed=true。
+    - 75-89：小瑕疵但不影响执行语义，passed=true。
     - 50-74：漏掉某个过滤、时间或输出字段，passed=false。
     - 0-49：安全失败、SQL 与 QueryPlan 不一致、错误粒度，passed=false。
 
