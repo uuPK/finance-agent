@@ -60,7 +60,15 @@ cp .env.example .env
 docker compose up -d postgres
 ```
 
-3. 启动后端：
+3. 初始化数据库结构和本地 synthetic 数据：
+
+```bash
+docker exec -i finance-agent-postgres psql -U finance_agent -d finance_agent -v ON_ERROR_STOP=1 < backend/db/schema.sql
+cd backend
+uv run python db/seed_synthetic_data.py --reset --customers 500 --days 180
+```
+
+4. 启动后端：
 
 ```bash
 cd backend
@@ -84,7 +92,7 @@ uv sync
 uv run uvicorn app.main:app --reload
 ```
 
-4. 启动前端：
+5. 启动前端：
 
 ```bash
 cd frontend

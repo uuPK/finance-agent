@@ -366,6 +366,80 @@ create table if not exists agent.guardrail_events (
 create index if not exists idx_guardrail_events_query on agent.guardrail_events(query_id);
 create index if not exists idx_guardrail_events_passed on agent.guardrail_events(passed);
 
+create table if not exists agent.stage_logs (
+    stage_log_id uuid primary key default gen_random_uuid(),
+    query_id uuid references agent.query_runs(query_id) on delete cascade,
+    stage_name varchar(64) not null,
+    attempt integer not null default 0,
+    stage_status varchar(32) not null,
+    input_payload jsonb not null default '{}'::jsonb,
+    output_payload jsonb not null default '{}'::jsonb,
+    error_type varchar(64),
+    error_message text,
+    elapsed_ms integer,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_stage_logs_query on agent.stage_logs(query_id);
+create index if not exists idx_stage_logs_stage on agent.stage_logs(stage_name);
+create index if not exists idx_stage_logs_created_at on agent.stage_logs(created_at);
+
+create table if not exists agent.llm_call_logs (
+    llm_call_id uuid primary key default gen_random_uuid(),
+    query_id uuid references agent.query_runs(query_id) on delete cascade,
+    stage_name varchar(64) not null,
+    provider varchar(32) not null,
+    model varchar(128) not null,
+    prompt_version varchar(64),
+    system_prompt text,
+    user_prompt text,
+    response_text text,
+    parsed_payload jsonb not null default '{}'::jsonb,
+    token_usage jsonb not null default '{}'::jsonb,
+    elapsed_ms integer,
+    error_message text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_llm_call_logs_query on agent.llm_call_logs(query_id);
+create index if not exists idx_llm_call_logs_stage on agent.llm_call_logs(stage_name);
+create index if not exists idx_llm_call_logs_created_at on agent.llm_call_logs(created_at);
+
+create table if not exists agent.sql_execution_logs (
+    execution_id uuid primary key default gen_random_uuid(),
+    query_id uuid references agent.query_runs(query_id) on delete cascade,
+    attempt integer not null default 0,
+    sql_text text not null,
+    execution_status varchar(32) not null,
+    row_count integer,
+    result_schema jsonb not null default '[]'::jsonb,
+    result_preview jsonb not null default '[]'::jsonb,
+    elapsed_ms integer,
+    error_message text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_sql_execution_logs_query on agent.sql_execution_logs(query_id);
+create index if not exists idx_sql_execution_logs_status on agent.sql_execution_logs(execution_status);
+create index if not exists idx_sql_execution_logs_created_at on agent.sql_execution_logs(created_at);
+
+create table if not exists agent.result_validation_logs (
+    validation_id uuid primary key default gen_random_uuid(),
+    query_id uuid references agent.query_runs(query_id) on delete cascade,
+    execution_id uuid references agent.sql_execution_logs(execution_id) on delete cascade,
+    hard_checks jsonb not null default '[]'::jsonb,
+    critic_review jsonb not null default '{}'::jsonb,
+    passed boolean not null default false,
+    score numeric(5, 2),
+    error_type varchar(64),
+    repair_hint text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_result_validation_logs_query on agent.result_validation_logs(query_id);
+create index if not exists idx_result_validation_logs_execution on agent.result_validation_logs(execution_id);
+create index if not exists idx_result_validation_logs_passed on agent.result_validation_logs(passed);
+
 -- Evaluation tables.
 
 create table if not exists evaluation.eval_cases (
@@ -449,3 +523,54 @@ select
 from metadata.column_metadata
 where is_active = true
   and is_sensitive = true;
+
+-- Business views used by SQL generation and result validation.
+
+create or replace view mart.customer_current_asset as
+select
+    cad.customer_id,
+    cad.as_of_date,
+    cad.total_asset,
+    cad.cash_asset,
+    cad.security_market_value,
+    cad.fund_market_value,
+    cad.product_market_value,
+    cad.net_asset,
+    cad.asset_level
+from mart.customer_asset_daily cad
+join (
+    select max(as_of_date) as as_of_date
+    from mart.customer_asset_daily
+) latest on latest.as_of_date = cad.as_of_date;
+
+create or replace view mart.customer_trade_90d as
+with latest as (
+    select coalesce(max(as_of_date), current_date) as as_of_date
+    from mart.customer_asset_daily
+)
+select
+    ct.customer_id,
+    count(*)::integer as trade_count_90d,
+    coalesce(sum(ct.trade_amount), 0) as trade_amount_90d,
+    coalesce(sum(ct.fee_amount), 0) as fee_amount_90d
+from mart.customer_trade ct
+cross join latest
+where ct.trade_date > latest.as_of_date - interval '90 days'
+  and ct.trade_date <= latest.as_of_date
+group by ct.customer_id;
+
+create or replace view mart.customer_net_flow_90d as
+with latest as (
+    select coalesce(max(as_of_date), current_date) as as_of_date
+    from mart.customer_asset_daily
+)
+select
+    caf.customer_id,
+    coalesce(sum(case when caf.flow_type in ('inflow', 'transfer_in') then caf.amount else 0 end), 0) as inflow_amount_90d,
+    coalesce(sum(case when caf.flow_type in ('outflow', 'transfer_out') then caf.amount else 0 end), 0) as outflow_amount_90d,
+    coalesce(sum(case when caf.flow_type in ('inflow', 'transfer_in') then caf.amount else -caf.amount end), 0) as net_flow_amount_90d
+from mart.customer_asset_flow caf
+cross join latest
+where caf.occur_date > latest.as_of_date - interval '90 days'
+  and caf.occur_date <= latest.as_of_date
+group by caf.customer_id;
