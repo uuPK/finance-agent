@@ -3,10 +3,12 @@ import json
 
 from app.agents.llm_plan_critic import LLMPlanCritic
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor
+from app.agents.llm_result_critic import LLMResultCritic
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.llm.schemas import LLMMessage, LLMResponse
 from app.schemas.query import QueryRequest
 from app.schemas.review import ReviewDecision
+from app.schemas.sql import SQLDraft
 from app.services.query_service import QueryService
 from app.services.sql_executor import SQLExecutionResult
 
@@ -194,6 +196,37 @@ def test_llm_plan_critic_prompt_contains_review_rubric() -> None:
     assert "ReviewDecision schema 校验通过" in prompt_text
 
 
+def test_llm_result_critic_prompt_contains_review_rubric_and_examples() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    plan = RuleBasedQueryPlanActor().build(question)
+    sql_draft = SQLDraft.model_validate(json.loads(_sql_draft_json()))
+    execution_result = SQLExecutionResult(
+        status="success",
+        sql=sql_draft.sql,
+        columns=["customer_no", "total_asset", "trade_count_90d"],
+        rows=[{"customer_no": "C000001", "total_asset": 800000.0, "trade_count_90d": 5}],
+        row_count=1,
+    )
+    critic = LLMResultCritic(QueueLLMService([]))
+
+    messages = critic._build_messages(  # noqa: SLF001
+        question=question,
+        query_plan=plan,
+        sql_draft=sql_draft,
+        execution_result=execution_result,
+        hard_checks=[],
+        metadata_context=StaticSchemaContextProvider().load(plan),
+        preview_rows=100,
+    )
+    prompt_text = "\n".join(message.content for message in messages)
+
+    assert "ResultCritic" in prompt_text
+    assert "wrong_result_grain" in prompt_text
+    assert "正例" in prompt_text
+    assert "反例" in prompt_text
+    assert "stage 必须是 result_review" in prompt_text
+
+
 def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None:
     question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
     llm_service = QueueLLMService(
@@ -202,6 +235,7 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
             _passing_critic_json(),
             _sql_draft_json(),
             _passing_sql_critic_json(),
+            _passing_result_critic_json(),
         ]
     )
 
@@ -218,6 +252,9 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     critic_step = next(step for step in response.steps if step.name == "query_plan_llm_review")
     sql_step = next(step for step in response.steps if step.name == "generate_sql")
     sql_critic_step = next(step for step in response.steps if step.name == "sql_llm_review")
+    result_critic_step = next(
+        step for step in response.steps if step.name == "result_llm_review"
+    )
 
     assert response.status == "completed"
     assert response.sql is not None
@@ -228,6 +265,7 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     assert critic_step.status == "passed"
     assert sql_step.status == "passed"
     assert sql_critic_step.status == "passed"
+    assert result_critic_step.status == "passed"
     assert next(step for step in response.steps if step.name == "execute_sql").status == "passed"
     assert next(step for step in response.steps if step.name == "result_hard_review").status == "passed"
     assert "customer_current_asset" in llm_service.calls[2][-1].content
@@ -243,6 +281,7 @@ def test_query_service_limits_response_preview_rows() -> None:
             _passing_critic_json(),
             _sql_draft_json(),
             _passing_sql_critic_json(),
+            _passing_result_critic_json(),
         ]
     )
     sql_result = SQLExecutionResult(
@@ -285,6 +324,7 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
             _passing_critic_json(),
             _sql_draft_json(),
             _passing_sql_critic_json(),
+            _passing_result_critic_json(),
         ]
     )
 
@@ -320,6 +360,7 @@ def test_query_service_repairs_sql_with_guardrail_feedback() -> None:
             _sql_draft_json(include_limit=False),
             _sql_draft_json(include_limit=True),
             _passing_sql_critic_json(),
+            _passing_result_critic_json(),
         ]
     )
 
@@ -353,6 +394,7 @@ def test_query_service_repairs_sql_with_execution_feedback() -> None:
             _passing_sql_critic_json(),
             _sql_draft_json(),
             _passing_sql_critic_json(),
+            _passing_result_critic_json(),
         ]
     )
     sql_executor = QueueSQLExecutor(
@@ -398,6 +440,75 @@ def test_query_service_repairs_sql_with_execution_feedback() -> None:
     assert repair_sql_step.status == "passed"
     assert execution_step.status == "passed"
     assert "column_not_found" in llm_service.calls[4][-1].content
+
+
+def test_query_service_repairs_sql_with_result_critic_feedback() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    llm_service = QueueLLMService(
+        [
+            _ready_plan_json(question, confidence=0.93),
+            _passing_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
+            _failing_result_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
+            _passing_result_critic_json(),
+        ]
+    )
+    sql_executor = QueueSQLExecutor(
+        [
+            SQLExecutionResult(
+                status="success",
+                sql="",
+                columns=["customer_no", "total_asset", "trade_count_3m"],
+                rows=[
+                    {
+                        "customer_no": "C000001",
+                        "total_asset": 800000.0,
+                        "trade_count_3m": 5,
+                    }
+                ],
+                row_count=1,
+                elapsed_ms=4,
+            ),
+            SQLExecutionResult(
+                status="success",
+                sql="",
+                columns=["customer_no", "total_asset", "trade_count_3m"],
+                rows=[
+                    {
+                        "customer_no": "C000001",
+                        "total_asset": 800000.0,
+                        "trade_count_3m": 5,
+                    }
+                ],
+                row_count=1,
+                elapsed_ms=4,
+            ),
+        ]
+    )
+
+    response = asyncio.run(
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=sql_executor,
+            audit_logger=NoopAuditLogger(),
+        ).run(QueryRequest(question=question))
+    )
+
+    repair_sql_step = next(step for step in response.steps if step.name == "repair_sql")
+    result_critic_step = next(
+        step for step in response.steps if step.name == "result_llm_review"
+    )
+
+    assert response.status == "completed"
+    assert response.retry_count == 1
+    assert len(sql_executor.calls) == 2
+    assert repair_sql_step.status == "passed"
+    assert result_critic_step.status == "passed"
+    assert "wrong_result_grain" in llm_service.calls[5][-1].content
 
 
 def test_query_service_returns_failed_for_invalid_plan_without_repair() -> None:
@@ -506,6 +617,39 @@ def _passing_sql_critic_json() -> str:
             "repair_hint": None,
             "clarification_questions": [],
             "confidence": 0.91,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _passing_result_critic_json() -> str:
+    return json.dumps(
+        {
+            "passed": True,
+            "score": 94,
+            "stage": "result_review",
+            "reason": "Result columns and grain support the user question.",
+            "evidence": ["columns_covered", "grain_covered", "row_count_valid"],
+            "repair_hint": None,
+            "clarification_questions": [],
+            "confidence": 0.91,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _failing_result_critic_json() -> str:
+    return json.dumps(
+        {
+            "passed": False,
+            "score": 45,
+            "stage": "result_review",
+            "error_type": "wrong_result_grain",
+            "reason": "The result does not provide the customer-level detail required.",
+            "evidence": ["QueryPlan grain=customer", "Result grain is ambiguous"],
+            "repair_hint": "Regenerate SQL to return customer-level rows with identifiers.",
+            "clarification_questions": [],
+            "confidence": 0.9,
         },
         ensure_ascii=False,
     )

@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from app.agents.llm_plan_critic import LLMPlanCritic, LLMPlanCriticResult
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor, QueryPlanBuildResult
+from app.agents.llm_result_critic import LLMResultCritic, LLMResultCriticResult
 from app.agents.llm_sql_actor import LLMSQLActor, SQLBuildResult
 from app.agents.llm_sql_critic import LLMSQLCritic, LLMSQLCriticResult
 from app.agents.plan_reviewer import QueryPlanHardValidator
@@ -33,7 +34,9 @@ class SQLLoopResult:
     repair_count: int
     metadata_context: dict[str, object]
     execution_result: SQLExecutionResult | None = None
+    result_hard_validation: ResultValidationResult | None = None
     result_validation: ResultValidationResult | None = None
+    result_critic_result: LLMResultCriticResult | None = None
     execution_history: list[dict[str, object]] | None = None
     failure_reason: str | None = None
 
@@ -73,6 +76,7 @@ class QueryService:
         self.plan_critic = LLMPlanCritic(llm_service=resolved_llm_service)
         self.sql_actor = LLMSQLActor(llm_service=resolved_llm_service)
         self.sql_critic = LLMSQLCritic(llm_service=resolved_llm_service)
+        self.result_critic = LLMResultCritic(llm_service=resolved_llm_service)
         self.schema_context_provider = schema_context_provider or SchemaContextProvider()
         self.sql_executor = sql_executor or SQLExecutor()
         self.result_validator = result_validator
@@ -162,7 +166,7 @@ class QueryService:
                 status = "completed"
                 answer = (
                     "QueryPlan and SQL passed review, SQL executed successfully, and result "
-                    "hard validation passed."
+                    "hard and semantic validation passed."
                 )
             else:
                 status = "failed"
@@ -363,7 +367,12 @@ class QueryService:
         critic_result = LLMSQLCriticResult(status="failed")
         review_history: list[dict[str, object]] = []
         execution_result: SQLExecutionResult | None = None
+        result_hard_validation: ResultValidationResult | None = None
         result_validation: ResultValidationResult | None = None
+        result_critic_result = LLMResultCriticResult(
+            status="skipped",
+            llm_error="Result review has not run.",
+        )
         execution_history: list[dict[str, object]] = []
 
         while True:
@@ -380,7 +389,12 @@ class QueryService:
             )
 
             execution_result = None
+            result_hard_validation = None
             result_validation = None
+            result_critic_result = LLMResultCriticResult(
+                status="skipped",
+                llm_error="Result review skipped before SQL execution.",
+            )
             if review_bundle.passed and build_result.draft is not None:
                 execution_result = self.sql_executor.execute(build_result.draft.sql)
                 execution_id = self.audit_logger.log_sql_execution(
@@ -388,21 +402,33 @@ class QueryService:
                     attempt=build_result.repair_attempt,
                     result=execution_result,
                 )
-                result_validation = self._validate_execution_result(
+                result_hard_validation = self._validate_execution_result(
                     query_plan=query_plan,
                     execution_result=execution_result,
+                    metadata_context=metadata_context,
+                )
+                result_validation, result_critic_result = await self._review_result(
+                    question=question,
+                    query_plan=query_plan,
+                    sql_draft=build_result.draft,
+                    execution_result=execution_result,
+                    hard_validation=result_hard_validation,
                     metadata_context=metadata_context,
                 )
                 self.audit_logger.log_result_validation(
                     query_id=query_id,
                     execution_id=execution_id,
                     result=result_validation,
+                    critic_review=self._result_critic_log_payload(result_critic_result),
+                    hard_checks=result_hard_validation.checks,
                 )
                 execution_history.append(
                     self._build_execution_details(
                         build_result.repair_attempt,
                         execution_result,
+                        result_hard_validation,
                         result_validation,
+                        result_critic_result,
                         execution_id,
                     )
                 )
@@ -463,7 +489,9 @@ class QueryService:
             repair_count=repair_count,
             metadata_context=metadata_context,
             execution_result=execution_result,
+            result_hard_validation=result_hard_validation,
             result_validation=result_validation,
+            result_critic_result=result_critic_result,
             execution_history=execution_history,
             failure_reason=failure_reason,
         )
@@ -515,6 +543,102 @@ class QueryService:
             sensitive_columns=set(self._string_list(metadata_context.get("sensitive_columns"))),
         )
         return validator.validate(query_plan, execution_result)
+
+    async def _review_result(
+        self,
+        question: str,
+        query_plan: QueryPlan,
+        sql_draft: SQLDraft,
+        execution_result: SQLExecutionResult,
+        hard_validation: ResultValidationResult,
+        metadata_context: dict[str, object],
+    ) -> tuple[ResultValidationResult, LLMResultCriticResult]:
+        critic_result = LLMResultCriticResult(
+            status="skipped",
+            llm_error="Result hard validation failed; ResultCritic skipped.",
+        )
+        if hard_validation.passed:
+            critic_result = await self.result_critic.review(
+                question=question,
+                query_plan=query_plan,
+                sql_draft=sql_draft,
+                execution_result=execution_result,
+                hard_checks=hard_validation.checks,
+                metadata_context=metadata_context,
+                preview_rows=self.result_preview_rows,
+            )
+            return (
+                self._merge_result_critic_decision(hard_validation, critic_result),
+                critic_result,
+            )
+        return hard_validation, critic_result
+
+    def _merge_result_critic_decision(
+        self,
+        hard_validation: ResultValidationResult,
+        critic_result: LLMResultCriticResult,
+    ) -> ResultValidationResult:
+        if critic_result.decision is not None:
+            decision = self._enforce_result_critic_confidence(critic_result.decision)
+        else:
+            decision = self._result_critic_failure_decision(critic_result)
+
+        checks = [*hard_validation.checks, decision]
+        failed_check = next((check for check in checks if not check.passed), None)
+        score = int(sum(check.score for check in checks) / len(checks)) if checks else 0
+        return ResultValidationResult(
+            passed=failed_check is None,
+            checks=checks,
+            score=score,
+            error_type=failed_check.error_type if failed_check else None,
+            repair_hint=failed_check.repair_hint if failed_check else None,
+        )
+
+    def _result_critic_failure_decision(
+        self, result: LLMResultCriticResult
+    ) -> ReviewDecision:
+        return ReviewDecision(
+            passed=False,
+            score=0,
+            stage="result_review",
+            error_type="result_critic_failed",
+            reason=result.llm_error or "ResultCritic did not return a valid decision.",
+            evidence=["result_critic"],
+            repair_hint="Check LLM configuration and retry result semantic review.",
+            confidence=1.0,
+        )
+
+    def _enforce_result_critic_confidence(
+        self, decision: ReviewDecision
+    ) -> ReviewDecision:
+        if decision.passed and decision.confidence < 0.7:
+            return decision.model_copy(
+                update={
+                    "passed": False,
+                    "error_type": "low_result_critic_confidence",
+                    "reason": (
+                        "ResultCritic confidence is below the auto-pass threshold: "
+                        f"{decision.confidence}."
+                    ),
+                    "repair_hint": "Regenerate SQL or request stronger metadata context.",
+                }
+            )
+        return decision
+
+    def _result_critic_log_payload(
+        self, result: LLMResultCriticResult | None
+    ) -> dict[str, object]:
+        if result is None:
+            return {}
+        return {
+            "status": result.status,
+            "decision": result.decision.model_dump(mode="json")
+            if result.decision is not None
+            else None,
+            "llm_error": result.llm_error,
+            "llm_model": result.llm_model,
+            "llm_provider": result.llm_provider,
+        }
 
     def _response_preview_rows(
         self, execution_result: SQLExecutionResult
@@ -698,6 +822,7 @@ class QueryService:
             self._build_sql_critic_step(result.critic_result),
             self._build_sql_execution_step(result),
             self._build_result_validation_step(result),
+            self._build_result_critic_step(result),
         ]
 
     def _build_sql_actor_details(self, result: SQLLoopResult) -> dict[str, object]:
@@ -844,7 +969,7 @@ class QueryService:
         )
 
     def _build_result_validation_step(self, result: SQLLoopResult) -> AgentStep:
-        if result.result_validation is None:
+        if result.result_hard_validation is None:
             return AgentStep(
                 name="result_hard_review",
                 status="skipped",
@@ -854,15 +979,62 @@ class QueryService:
 
         return AgentStep(
             name="result_hard_review",
-            status="passed" if result.result_validation.passed else "failed",
+            status="passed" if result.result_hard_validation.passed else "failed",
             summary="Ran deterministic result hard validation.",
             details={
-                "score": result.result_validation.score,
-                "error_type": result.result_validation.error_type,
-                "repair_hint": result.result_validation.repair_hint,
+                "score": result.result_hard_validation.score,
+                "error_type": result.result_hard_validation.error_type,
+                "repair_hint": result.result_hard_validation.repair_hint,
                 "checks": [
-                    check.model_dump() for check in result.result_validation.checks
+                    check.model_dump() for check in result.result_hard_validation.checks
                 ],
+            },
+        )
+
+    def _build_result_critic_step(self, result: SQLLoopResult) -> AgentStep:
+        critic_result = result.result_critic_result
+        if critic_result is None:
+            return AgentStep(
+                name="result_llm_review",
+                status="skipped",
+                summary="Result semantic critic was skipped.",
+                details={},
+            )
+        if critic_result.decision is None:
+            status = (
+                "failed"
+                if result.result_hard_validation is not None
+                and result.result_hard_validation.passed
+                else "skipped"
+            )
+            return AgentStep(
+                name="result_llm_review",
+                status=status,
+                summary="Result semantic critic did not approve the result.",
+                details={
+                    "status": critic_result.status,
+                    "llm_error": critic_result.llm_error,
+                    "llm_model": critic_result.llm_model,
+                    "llm_provider": critic_result.llm_provider,
+                    "final_result_review_passed": result.result_validation.passed
+                    if result.result_validation is not None
+                    else None,
+                },
+            )
+
+        return AgentStep(
+            name="result_llm_review",
+            status="passed" if critic_result.decision.passed else "failed",
+            summary="Ran LLM semantic result critic.",
+            details={
+                "status": critic_result.status,
+                "decision": critic_result.decision.model_dump(),
+                "llm_error": critic_result.llm_error,
+                "llm_model": critic_result.llm_model,
+                "llm_provider": critic_result.llm_provider,
+                "final_result_review_passed": result.result_validation.passed
+                if result.result_validation is not None
+                else None,
             },
         )
 
@@ -870,7 +1042,9 @@ class QueryService:
         self,
         repair_attempt: int,
         execution_result: SQLExecutionResult,
+        result_hard_validation: ResultValidationResult,
         result_validation: ResultValidationResult,
+        result_critic_result: LLMResultCriticResult | None,
         execution_id: str | None,
     ) -> dict[str, object]:
         return {
@@ -883,6 +1057,14 @@ class QueryService:
             "elapsed_ms": execution_result.elapsed_ms,
             "error_type": execution_result.error_type,
             "error_message": execution_result.error_message,
+            "result_hard_validation_passed": result_hard_validation.passed,
+            "result_critic_status": result_critic_result.status
+            if result_critic_result is not None
+            else None,
+            "result_critic_passed": result_critic_result.decision.passed
+            if result_critic_result is not None
+            and result_critic_result.decision is not None
+            else None,
             "result_validation_passed": result_validation.passed,
             "result_validation_error_type": result_validation.error_type,
             "result_validation_repair_hint": result_validation.repair_hint,

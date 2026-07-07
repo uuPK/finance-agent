@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 
 from app.db.session import engine as default_engine
 from app.guardrails.result_validator import ResultValidationResult
+from app.schemas.review import ReviewDecision
 from app.services.sql_executor import SQLExecutionResult
 
 
@@ -140,7 +141,10 @@ class QueryAuditLogger:
         query_id: UUID,
         execution_id: str | None,
         result: ResultValidationResult,
+        critic_review: dict[str, Any] | None = None,
+        hard_checks: list[ReviewDecision] | None = None,
     ) -> None:
+        checks_to_log = hard_checks or result.checks
         self._safe_execute(
             """
             insert into agent.result_validation_logs
@@ -159,7 +163,7 @@ class QueryAuditLogger:
                     :query_id,
                     cast(:execution_id as uuid),
                     cast(:hard_checks as jsonb),
-                    '{}'::jsonb,
+                    cast(:critic_review as jsonb),
                     :passed,
                     :score,
                     :error_type,
@@ -170,9 +174,10 @@ class QueryAuditLogger:
                 "query_id": str(query_id),
                 "execution_id": execution_id,
                 "hard_checks": json.dumps(
-                    [check.model_dump(mode="json") for check in result.checks],
+                    [check.model_dump(mode="json") for check in checks_to_log],
                     ensure_ascii=False,
                 ),
+                "critic_review": json.dumps(critic_review or {}, ensure_ascii=False),
                 "passed": result.passed,
                 "score": result.score,
                 "error_type": result.error_type,

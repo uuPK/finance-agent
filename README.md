@@ -111,8 +111,9 @@ npm run dev
 - SQL 生成前会读取当前数据库表、字段、指标、业务词和 join 路径作为上下文。
 - SQLExecutor 已接入主查询循环，会以只读事务执行通过审核的 SELECT。
 - ResultHardValidator 已接入，支持执行成功、行数、字段、敏感字段和粒度硬校验。
+- LLM ResultCritic 已接入，支持执行后结果语义审核，并可将失败反馈回 SQL Actor 修复循环。
 - 主接口只返回受控 `result_preview`；`MAX_RESULT_ROWS` 控制执行取数上限，`RESULT_PREVIEW_ROWS` 控制 API 预览返回上限。
-- LLM ResultCritic 和更完整的结果语义审核将在后续阶段接入。
+- AnswerCritic、自然语言最终回答和更完整的评测集将在后续阶段接入。
 
 后端启动后可访问：
 

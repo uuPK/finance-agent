@@ -378,10 +378,13 @@ Result and answer review happens after SQL execution and before the final respon
 
 ```text
 SQLExecutor
+  -> ResultHardValidator
   -> ResultCritic
   -> AnswerCritic
   -> FinalResponder
 ```
+
+当前实现已经接入 ResultHardValidator 和 ResultCritic。AnswerCritic 与更完整的自然语言最终回答仍属于后续阶段。
 
 ### 6.2 Goal
 
