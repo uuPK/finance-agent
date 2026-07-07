@@ -34,12 +34,24 @@ class QueueLLMService:
 
 
 class StaticSchemaContextProvider:
-    def load(self, query_plan=None) -> dict:
+    def load(self, query_plan=None, question=None) -> dict:
         return {
             "version": "1.0",
             "source": "database",
             "table_count": 4,
             "metric_count": 2,
+            "retrieval": {
+                "strategy": "structured_keyword_retrieval",
+                "keywords": ["当前资产", "交易次数"],
+                "table_names": [
+                    "customer_info",
+                    "customer_current_asset",
+                    "customer_trade_90d",
+                ],
+                "metric_codes": ["current_total_asset", "trade_count_90d"],
+                "business_terms": [],
+                "confidence": 0.9,
+            },
             "tables": [],
             "metrics": [
                 {"metric_code": "current_total_asset"},
@@ -134,12 +146,15 @@ def test_llm_query_plan_actor_initial_prompt_has_no_rule_draft() -> None:
         question=question,
         previous_plan=None,
         critic_feedback=None,
+        metadata_context=StaticSchemaContextProvider().load(question=question),
     )
     prompt_text = "\n".join(message.content for message in messages)
 
     assert "规则版 QueryPlan 草稿" not in prompt_text
     assert "JSON 必须能被 QueryPlan schema 校验通过" in prompt_text
     assert "高净值" in prompt_text
+    assert "Retrieved metadata context" in prompt_text
+    assert "current_total_asset" in prompt_text
 
 
 def test_llm_query_plan_actor_repair_prompt_includes_critic_feedback() -> None:
@@ -162,6 +177,7 @@ def test_llm_query_plan_actor_repair_prompt_includes_critic_feedback() -> None:
                 confidence=0.9,
             )
         ],
+        metadata_context=StaticSchemaContextProvider().load(question=question),
     )
     repair_prompt = messages[-1].content
 
@@ -188,12 +204,18 @@ def test_llm_plan_critic_prompt_contains_review_rubric() -> None:
     plan = RuleBasedQueryPlanActor().build(question)
     critic = LLMPlanCritic(QueueLLMService([]))
 
-    messages = critic._build_messages(plan, [])  # noqa: SLF001
+    messages = critic._build_messages(  # noqa: SLF001
+        plan,
+        [],
+        StaticSchemaContextProvider().load(query_plan=plan, question=question),
+    )
     prompt_text = "\n".join(message.content for message in messages)
 
     assert "wrong_grain" in prompt_text
     assert "guessed_business_definition" in prompt_text
     assert "ReviewDecision schema 校验通过" in prompt_text
+    assert "fabricated_metadata" in prompt_text
+    assert "trade_count_90d" in prompt_text
 
 
 def test_llm_result_critic_prompt_contains_review_rubric_and_examples() -> None:
@@ -269,7 +291,9 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     assert next(step for step in response.steps if step.name == "execute_sql").status == "passed"
     assert next(step for step in response.steps if step.name == "result_hard_review").status == "passed"
     assert "customer_current_asset" in llm_service.calls[2][-1].content
+    assert "Retrieved metadata context" in llm_service.calls[0][-1].content
     assert sql_step.details["metadata_context"]["source"] == "database"
+    assert sql_step.details["metadata_context"]["retrieval"]["confidence"] == 0.9
     assert llm_service.contents == []
 
 

@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Literal
+from typing import Any, Literal
 
 from app.llm.json_parser import extract_json_object
 from app.llm.protocols import SupportsLLMComplete
@@ -30,7 +30,10 @@ class LLMPlanCritic:
         self.llm_service = llm_service
 
     async def review(
-        self, plan: QueryPlan, hard_checks: list[ReviewDecision]
+        self,
+        plan: QueryPlan,
+        hard_checks: list[ReviewDecision],
+        metadata_context: dict[str, Any] | None = None,
     ) -> LLMPlanCriticResult:
         if self.llm_service is None:
             return LLMPlanCriticResult(
@@ -40,7 +43,7 @@ class LLMPlanCritic:
 
         try:
             response = await self.llm_service.complete(
-                messages=self._build_messages(plan, hard_checks),
+                messages=self._build_messages(plan, hard_checks, metadata_context),
                 temperature=0.0,
                 max_tokens=1800,
                 response_format={"type": "json_object"},
@@ -63,7 +66,10 @@ class LLMPlanCritic:
             )
 
     def _build_messages(
-        self, plan: QueryPlan, hard_checks: list[ReviewDecision]
+        self,
+        plan: QueryPlan,
+        hard_checks: list[ReviewDecision],
+        metadata_context: dict[str, Any] | None = None,
     ) -> list[LLMMessage]:
         review_schema = json.dumps(ReviewDecision.model_json_schema(), ensure_ascii=False)
         plan_json = json.dumps(
@@ -76,6 +82,11 @@ class LLMPlanCritic:
             ensure_ascii=False,
             indent=2,
         )
+        metadata_json = json.dumps(
+            self._metadata_summary(metadata_context or {}),
+            ensure_ascii=False,
+            indent=2,
+        )
         user_prompt = dedent(
             f"""
             待审核 QueryPlan：
@@ -83,6 +94,15 @@ class LLMPlanCritic:
 
             已完成的硬条件审核：
             {hard_review_json}
+
+            Retrieved metadata context：
+            {metadata_json}
+
+            元数据审核要求：
+            - QueryPlan 的 metadata_ref、metric_code、field_code、candidate_tables 应尽量能在 metadata context 中找到依据。
+            - 如果计划使用了 metadata context 中没有的具体指标、业务词、表或字段，且不是用户原文明确给出的，应判定 fabricated_metadata。
+            - 如果命中的 business_terms 标记 clarification_required=true，但计划直接 ready，应判定 guessed_business_definition。
+            - 如果元数据召回置信度低，且用户问题依赖模糊业务词，应要求澄清或补充元数据，不要勉强通过。
 
             ReviewDecision JSON Schema：
             {review_schema}
@@ -99,6 +119,39 @@ class LLMPlanCritic:
             LLMMessage(role="user", content=user_prompt),
         ]
 
+    def _metadata_summary(self, metadata_context: dict[str, Any]) -> dict[str, Any]:
+        retrieval = metadata_context.get("retrieval")
+        tables = metadata_context.get("tables")
+        metrics = metadata_context.get("metrics")
+        business_terms = metadata_context.get("business_terms")
+        return {
+            "source": metadata_context.get("source"),
+            "error": metadata_context.get("error"),
+            "retrieval": retrieval if isinstance(retrieval, dict) else {},
+            "table_allowlist": metadata_context.get("table_allowlist", []),
+            "metrics": self._compact_items(
+                metrics,
+                ("metric_code", "metric_name", "description", "grain", "required_filters"),
+            ),
+            "business_terms": self._compact_items(
+                business_terms,
+                ("term", "definition", "synonyms", "default_plan_fragment", "clarification_required"),
+            ),
+            "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
+        }
+
+    def _compact_items(
+        self, value: object, keys: tuple[str, ...], limit: int = 8
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        compacted: list[dict[str, Any]] = []
+        for item in value[:limit]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append({key: item.get(key) for key in keys if key in item})
+        return compacted
+
 
 _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
     """
@@ -113,6 +166,7 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
        但如果计划凭空编造非常具体且无来源的表名、字段名、metric_id 或 join_path，应判为失败。
     4. 如果 QueryPlan 是 needs_clarification 且澄清问题覆盖了关键不确定性，应通过。
     5. 如果用户请求敏感字段、写库、越权导出，计划不能直接 ready。
+    6. Retrieved metadata context 是本轮审核的业务证据；计划引用的具体口径应能追溯到它或用户原文。
 
     必查项：
     1. 用户明示条件是否完整保留：主体、指标、阈值、比较符、时间窗口、产品/客户范围。
@@ -121,6 +175,7 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
     4. 澄清问题是否具体可回答：不能只说“请补充信息”。
     5. 安全要求是否满足：readonly、limit、敏感字段、脱敏要求。
     6. assumptions 是否只是低风险默认值；不能用 assumptions 替代关键业务口径。
+    7. metadata context 是否支持计划中的 metric_code、business term、candidate_tables 和关键口径。
 
     评分和 passed 规则：
     - 90-100：语义一致，可进入下一步，passed=true。

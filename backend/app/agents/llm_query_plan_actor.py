@@ -1,7 +1,7 @@
 import json
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Literal
+from typing import Any, Literal
 
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.llm.json_parser import extract_json_object
@@ -42,6 +42,7 @@ class LLMQueryPlanActor:
         fallback_plan: QueryPlan | None = None,
         previous_plan: QueryPlan | None = None,
         critic_feedback: list[ReviewDecision] | None = None,
+        metadata_context: dict[str, Any] | None = None,
         repair_attempt: int = 0,
     ) -> QueryPlanBuildResult:
         fallback = fallback_plan or previous_plan or self.fallback_actor.build(question)
@@ -55,7 +56,12 @@ class LLMQueryPlanActor:
 
         try:
             response = await self.llm_service.complete(
-                messages=self._build_messages(question, previous_plan, critic_feedback),
+                messages=self._build_messages(
+                    question,
+                    previous_plan,
+                    critic_feedback,
+                    metadata_context=metadata_context,
+                ),
                 temperature=0.0,
                 max_tokens=3000,
                 response_format={"type": "json_object"},
@@ -85,8 +91,14 @@ class LLMQueryPlanActor:
         question: str,
         previous_plan: QueryPlan | None,
         critic_feedback: list[ReviewDecision] | None,
+        metadata_context: dict[str, Any] | None = None,
     ) -> list[LLMMessage]:
         schema = json.dumps(QueryPlan.model_json_schema(), ensure_ascii=False)
+        metadata_json = json.dumps(
+            self._metadata_summary(metadata_context or {}),
+            ensure_ascii=False,
+            indent=2,
+        )
         repair_context = ""
         if previous_plan is not None and critic_feedback:
             previous_plan_json = json.dumps(
@@ -126,6 +138,15 @@ class LLMQueryPlanActor:
             {question}
             {repair_context}
 
+            Retrieved metadata context：
+            {metadata_json}
+
+            元数据使用要求：
+            - metadata context 是已召回的业务证据，只能把其中存在的指标、业务词、表或字段写入 metadata_ref。
+            - 如果用户使用了模糊业务词，而 metadata context 未给出明确口径，应返回 needs_clarification。
+            - 如果 business_terms 中 clarification_required=true，除非用户已经给出口径，否则应返回 needs_clarification。
+            - 不要编造 metadata context 中不存在的 metric_code、field_code、table、column 或 join_path。
+
             QueryPlan JSON Schema：
             {schema}
 
@@ -140,6 +161,43 @@ class LLMQueryPlanActor:
             LLMMessage(role="system", content=_QUERY_PLAN_ACTOR_SYSTEM_PROMPT),
             LLMMessage(role="user", content=user_prompt),
         ]
+
+    def _metadata_summary(self, metadata_context: dict[str, Any]) -> dict[str, Any]:
+        retrieval = metadata_context.get("retrieval")
+        tables = metadata_context.get("tables")
+        metrics = metadata_context.get("metrics")
+        business_terms = metadata_context.get("business_terms")
+        examples = metadata_context.get("question_examples")
+        return {
+            "source": metadata_context.get("source"),
+            "error": metadata_context.get("error"),
+            "retrieval": retrieval if isinstance(retrieval, dict) else {},
+            "table_allowlist": metadata_context.get("table_allowlist", []),
+            "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
+            "metrics": self._compact_items(
+                metrics,
+                ("metric_code", "metric_name", "description", "grain", "required_filters"),
+            ),
+            "business_terms": self._compact_items(
+                business_terms,
+                ("term", "definition", "synonyms", "default_plan_fragment", "clarification_required"),
+            ),
+            "question_examples": self._compact_items(
+                examples, ("question", "difficulty", "tags")
+            ),
+        }
+
+    def _compact_items(
+        self, value: object, keys: tuple[str, ...], limit: int = 8
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        compacted: list[dict[str, Any]] = []
+        for item in value[:limit]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append({key: item.get(key) for key in keys if key in item})
+        return compacted
 
 
 _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
@@ -167,7 +225,8 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
        如果没有明确口径，必须进入 needs_clarification。
     4. QueryPlan 是业务规划层，不直接绑定物理 SQL 字段；真实表、字段、指标公式和 join 路径
        会由 SQLActor 的 schema context 负责映射与校验。
-    5. metadata_ref 只能引用你有把握的业务指标、业务词、表或字段；不确定时不要编造
+    5. 用户消息会提供 Retrieved metadata context；metadata_ref 只能引用其中召回到的业务指标、
+       业务词、表或字段。不确定时不要编造
        table、column、metric_id 或 join_path。
     6. metric_code / field_code 是业务规划代码，不等同于真实数据库字段名。
     7. output.limit 必须为正数且不超过 safety.max_rows。

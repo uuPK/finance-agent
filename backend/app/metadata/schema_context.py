@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 from app.db.session import engine as default_engine
+from app.metadata.retriever import MetadataRetriever
 from app.schemas.query_plan import QueryPlan
 
 
@@ -15,10 +16,12 @@ class SchemaContextProvider:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or default_engine
 
-    def load(self, query_plan: QueryPlan | None = None) -> dict[str, Any]:
+    def load(
+        self, query_plan: QueryPlan | None = None, question: str | None = None
+    ) -> dict[str, Any]:
         try:
             with self.engine.connect() as connection:
-                return self._load_from_database(connection, query_plan)
+                return self._load_from_database(connection, query_plan, question)
         except Exception as exc:
             return self._empty_context(
                 source="unavailable",
@@ -26,7 +29,10 @@ class SchemaContextProvider:
             )
 
     def _load_from_database(
-        self, connection: Connection, query_plan: QueryPlan | None
+        self,
+        connection: Connection,
+        query_plan: QueryPlan | None,
+        question: str | None,
     ) -> dict[str, Any]:
         physical_tables = self._load_physical_tables(connection)
         physical_columns = self._load_physical_columns(connection)
@@ -36,6 +42,26 @@ class SchemaContextProvider:
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
         examples = self._load_question_examples(connection)
+        retrieval = MetadataRetriever(connection).retrieve(
+            question=question, query_plan=query_plan
+        )
+        selected_table_names = set(retrieval.table_names)
+        selected_metric_codes = set(retrieval.metric_codes)
+        selected_terms = set(retrieval.business_terms)
+        selected_examples = {
+            row.get("question")
+            for row in retrieval.matched_question_examples
+            if isinstance(row.get("question"), str)
+        }
+        selected_join_pairs = {
+            (
+                row.get("left_table"),
+                row.get("left_column"),
+                row.get("right_table"),
+                row.get("right_column"),
+            )
+            for row in retrieval.matched_join_relationships
+        }
 
         tables: list[dict[str, Any]] = []
         table_allowlist: set[str] = set()
@@ -43,6 +69,10 @@ class SchemaContextProvider:
         allowed_columns_by_table: dict[str, list[str]] = {}
 
         for table in physical_tables:
+            table_name = table["table_name"]
+            if selected_table_names and table_name not in selected_table_names:
+                continue
+
             key = (table["table_schema"], table["table_name"])
             metadata = table_metadata.get(key, {})
             columns = []
@@ -65,7 +95,6 @@ class SchemaContextProvider:
                     }
                 )
 
-            table_name = table["table_name"]
             table_allowlist.add(table_name)
             allowed_columns_by_table[table_name] = [column["name"] for column in columns]
             tables.append(
@@ -81,23 +110,53 @@ class SchemaContextProvider:
                 }
             )
 
+        selected_metrics = [
+            metric
+            for metric in metrics
+            if not selected_metric_codes or metric.get("metric_code") in selected_metric_codes
+        ]
+        selected_business_terms = [
+            term
+            for term in business_terms
+            if selected_terms and term.get("term") in selected_terms
+        ]
+        selected_join_relationships = [
+            relationship
+            for relationship in join_relationships
+            if not selected_join_pairs
+            or (
+                relationship.get("left_table"),
+                relationship.get("left_column"),
+                relationship.get("right_table"),
+                relationship.get("right_column"),
+            )
+            in selected_join_pairs
+        ]
+        selected_question_examples = [
+            example
+            for example in examples
+            if not selected_examples or example.get("question") in selected_examples
+        ]
+
         return {
             "version": "1.0",
             "source": "database",
             "query_intent": query_plan.intent if query_plan else None,
             "scenario": query_plan.scenario if query_plan else "customer_marketing",
             "table_count": len(tables),
-            "metric_count": len(metrics),
+            "metric_count": len(selected_metrics),
+            "retrieval": retrieval.to_context(),
             "tables": tables,
-            "metrics": metrics,
-            "business_terms": business_terms,
-            "join_relationships": join_relationships,
-            "question_examples": examples,
+            "metrics": selected_metrics,
+            "business_terms": selected_business_terms,
+            "join_relationships": selected_join_relationships,
+            "question_examples": selected_question_examples,
             "table_allowlist": sorted(table_allowlist),
             "sensitive_columns": sorted(sensitive_columns),
             "allowed_columns_by_table": allowed_columns_by_table,
             "notes": [
-                "Use only tables/views and columns listed in this context.",
+                "Use only retrieved tables/views and columns listed in this context.",
+                "The retrieval field explains why this metadata context was selected.",
                 "Prefer mart.customer_current_asset for current asset queries.",
                 "Prefer mart.customer_trade_90d for recent trade-count queries.",
                 "Prefer mart.customer_net_flow_90d for recent net-flow queries.",
@@ -259,6 +318,14 @@ class SchemaContextProvider:
             "source": source,
             "table_count": 0,
             "metric_count": 0,
+            "retrieval": {
+                "strategy": "structured_keyword_retrieval",
+                "keywords": [],
+                "table_names": [],
+                "metric_codes": [],
+                "business_terms": [],
+                "confidence": 0.0,
+            },
             "tables": [],
             "metrics": [],
             "business_terms": [],

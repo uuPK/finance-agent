@@ -104,11 +104,16 @@ class QueryService:
             user_id=request.user_id,
         )
 
-        build_result = await self.query_plan_actor.build(request.question)
+        metadata_context = self._load_metadata_context(request.question)
+        build_result = await self.query_plan_actor.build(
+            request.question,
+            metadata_context=metadata_context,
+        )
         query_plan = build_result.plan
         build_results = [build_result]
+        metadata_context = self._load_metadata_context(request.question, query_plan)
         review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-            query_plan
+            query_plan, metadata_context
         )
         review_history = [
             self._build_review_details(
@@ -128,6 +133,7 @@ class QueryService:
                 fallback_plan=query_plan,
                 previous_plan=query_plan,
                 critic_feedback=repair_feedback,
+                metadata_context=metadata_context,
                 repair_attempt=repair_count,
             )
             build_results.append(build_result)
@@ -136,8 +142,9 @@ class QueryService:
                 break
 
             query_plan = build_result.plan
+            metadata_context = self._load_metadata_context(request.question, query_plan)
             review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                query_plan
+                query_plan, metadata_context
             )
             review_history.append(
                 self._build_review_details(
@@ -274,7 +281,9 @@ class QueryService:
             return None, f"{type(exc).__name__}: {exc}"
 
     async def _review_query_plan(
-        self, query_plan: QueryPlan
+        self,
+        query_plan: QueryPlan,
+        metadata_context: dict[str, object] | None = None,
     ) -> tuple[ReviewBundle, bool, LLMPlanCriticResult]:
         review_bundle = self.plan_validator.review(query_plan)
         hard_review_passed = all(check.passed for check in review_bundle.hard_checks)
@@ -290,7 +299,9 @@ class QueryService:
             )
         elif hard_review_passed:
             critic_result = await self.plan_critic.review(
-                query_plan, review_bundle.hard_checks
+                query_plan,
+                review_bundle.hard_checks,
+                metadata_context=metadata_context,
             )
             if critic_result.decision is not None:
                 review_bundle.llm_checks.append(critic_result.decision)
@@ -325,7 +336,7 @@ class QueryService:
     async def _run_sql_loop(
         self, query_id: UUID, question: str, query_plan: QueryPlan
     ) -> SQLLoopResult:
-        metadata_context = self.schema_context_provider.load(query_plan)
+        metadata_context = self._load_metadata_context(question, query_plan)
         build_result = await self.sql_actor.build(
             question=question,
             query_plan=query_plan,
@@ -495,6 +506,21 @@ class QueryService:
             execution_history=execution_history,
             failure_reason=failure_reason,
         )
+
+    def _load_metadata_context(
+        self, question: str, query_plan: QueryPlan | None = None
+    ) -> dict[str, object]:
+        try:
+            return self.schema_context_provider.load(
+                query_plan=query_plan,
+                question=question,
+            )
+        except TypeError as exc:
+            if "question" not in str(exc):
+                raise
+            if query_plan is not None:
+                return self.schema_context_provider.load(query_plan)
+            return self.schema_context_provider.load()
 
     async def _review_sql_draft(
         self,
@@ -865,6 +891,15 @@ class QueryService:
                 for metric in metrics
                 if isinstance(metric, dict) and isinstance(metric.get("metric_code"), str)
             ]
+        retrieval = metadata_context.get("retrieval")
+        retrieval_summary: dict[str, object] = {}
+        if isinstance(retrieval, dict):
+            retrieval_summary = {
+                "strategy": retrieval.get("strategy"),
+                "confidence": retrieval.get("confidence"),
+                "keywords": self._string_list(retrieval.get("keywords"))[:12],
+                "business_terms": self._string_list(retrieval.get("business_terms")),
+            }
         return {
             "source": metadata_context.get("source"),
             "error": metadata_context.get("error"),
@@ -872,6 +907,7 @@ class QueryService:
             "metric_count": metadata_context.get("metric_count", 0),
             "tables": table_allowlist,
             "metrics": metric_codes,
+            "retrieval": retrieval_summary,
         }
 
     def _build_sql_repair_step(self, result: SQLLoopResult) -> AgentStep:
