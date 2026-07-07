@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from uuid import UUID, uuid4
 
+from app.agents.answer_actor import AnswerActor, AnswerRenderResult
 from app.agents.llm_plan_critic import LLMPlanCritic, LLMPlanCriticResult
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor, QueryPlanBuildResult
 from app.agents.llm_result_critic import LLMResultCritic, LLMResultCriticResult
@@ -77,6 +78,7 @@ class QueryService:
         self.sql_actor = LLMSQLActor(llm_service=resolved_llm_service)
         self.sql_critic = LLMSQLCritic(llm_service=resolved_llm_service)
         self.result_critic = LLMResultCritic(llm_service=resolved_llm_service)
+        self.answer_actor = AnswerActor()
         self.schema_context_provider = schema_context_provider or SchemaContextProvider()
         self.sql_executor = sql_executor or SQLExecutor()
         self.result_validator = result_validator
@@ -157,6 +159,7 @@ class QueryService:
 
         review_passed = review_bundle.passed
         sql_loop_result: SQLLoopResult | None = None
+        answer_result: AnswerRenderResult | None = None
 
         if query_plan.plan_status == "invalid":
             status = "failed"
@@ -170,11 +173,20 @@ class QueryService:
         else:
             sql_loop_result = await self._run_sql_loop(query_id, request.question, query_plan)
             if sql_loop_result.passed:
-                status = "completed"
-                answer = (
-                    "QueryPlan and SQL passed review, SQL executed successfully, and result "
-                    "hard and semantic validation passed."
-                )
+                if sql_loop_result.execution_result is None:
+                    status = "failed"
+                    answer = "SQL execution result is unavailable after validation."
+                else:
+                    status = "completed"
+                    answer_result = self.answer_actor.render(
+                        question=request.question,
+                        query_plan=query_plan,
+                        execution_result=sql_loop_result.execution_result,
+                        preview_rows=self._response_preview_rows(
+                            sql_loop_result.execution_result
+                        ),
+                    )
+                    answer = answer_result.answer
             else:
                 status = "failed"
                 answer = sql_loop_result.failure_reason or (
@@ -249,6 +261,11 @@ class QueryService:
                 ),
                 self._build_critic_step(critic_result),
                 *sql_steps,
+                *(
+                    [self._build_answer_step(answer_result, status)]
+                    if sql_loop_result is not None
+                    else []
+                ),
             ],
             retry_count=total_retry_count,
             elapsed_ms=elapsed_ms,
@@ -670,6 +687,23 @@ class QueryService:
         self, execution_result: SQLExecutionResult
     ) -> list[dict[str, object]]:
         return execution_result.rows[: self.result_preview_rows]
+
+    def _build_answer_step(
+        self, result: AnswerRenderResult | None, response_status: str
+    ) -> AgentStep:
+        if result is None:
+            return AgentStep(
+                name="render_answer",
+                status="skipped" if response_status != "completed" else "failed",
+                summary="Answer rendering was skipped because no reviewed result was available.",
+                details={"renderer": "deterministic_result_renderer"},
+            )
+        return AgentStep(
+            name="render_answer",
+            status="passed",
+            summary="Rendered final answer from reviewed database result.",
+            details=result.to_dict(),
+        )
 
     def _build_sql_guardrail(self, metadata_context: dict[str, object]) -> SQLGuardrail:
         table_allowlist = set(self._string_list(metadata_context.get("table_allowlist")))

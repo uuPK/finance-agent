@@ -277,8 +277,11 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     result_critic_step = next(
         step for step in response.steps if step.name == "result_llm_review"
     )
+    answer_step = next(step for step in response.steps if step.name == "render_answer")
 
     assert response.status == "completed"
+    assert "本次查询返回 1 条记录" in response.answer
+    assert "客户级" in response.answer
     assert response.sql is not None
     assert response.result_preview
     assert response.query_plan is not None
@@ -288,6 +291,8 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     assert sql_step.status == "passed"
     assert sql_critic_step.status == "passed"
     assert result_critic_step.status == "passed"
+    assert answer_step.status == "passed"
+    assert answer_step.details["renderer"] == "deterministic_result_renderer"
     assert next(step for step in response.steps if step.name == "execute_sql").status == "passed"
     assert next(step for step in response.steps if step.name == "result_hard_review").status == "passed"
     assert "customer_current_asset" in llm_service.calls[2][-1].content
@@ -335,6 +340,7 @@ def test_query_service_limits_response_preview_rows() -> None:
 
     assert response.status == "completed"
     assert len(response.result_preview) == 2
+    assert "当前响应展示前 2 条预览" in response.answer
     assert execution_step.details["row_count"] == 3
     assert execution_step.details["response_preview_rows"] == 2
 
