@@ -16,6 +16,14 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}")
 _ALIASES: dict[str, tuple[str, ...]] = {
     "客户": ("客户",),
     "客户列表": ("客户列表",),
+    "客户数量": ("customer_count", "客户数量", "客户数"),
+    "客户数": ("customer_count", "客户数量", "客户数"),
+    "数量": ("customer_count", "客户数量", "总数"),
+    "人数": ("customer_count", "客户数量", "人数"),
+    "总数": ("customer_count", "total_count", "总数"),
+    "多少": ("customer_count", "客户数量", "总数"),
+    "几个": ("customer_count", "客户数量", "总数"),
+    "几位": ("customer_count", "客户数量", "总数"),
     "资产": ("total_asset", "current_total_asset", "customer_current_asset", "资产"),
     "当前资产": (
         "current_total_asset",

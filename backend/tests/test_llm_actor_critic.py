@@ -4,6 +4,7 @@ import json
 from app.agents.llm_plan_critic import LLMPlanCritic
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor
 from app.agents.llm_result_critic import LLMResultCritic
+from app.agents.llm_sql_actor import LLMSQLActor
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.llm.schemas import LLMMessage, LLMResponse
 from app.schemas.query import QueryRequest
@@ -155,6 +156,8 @@ def test_llm_query_plan_actor_initial_prompt_has_no_rule_draft() -> None:
     assert "高净值" in prompt_text
     assert "Retrieved metadata context" in prompt_text
     assert "current_total_asset" in prompt_text
+    assert "grain.level=aggregate" in prompt_text
+    assert "customer_count" in prompt_text
 
 
 def test_llm_query_plan_actor_repair_prompt_includes_critic_feedback() -> None:
@@ -247,6 +250,25 @@ def test_llm_result_critic_prompt_contains_review_rubric_and_examples() -> None:
     assert "正例" in prompt_text
     assert "反例" in prompt_text
     assert "stage 必须是 result_review" in prompt_text
+
+
+def test_llm_sql_actor_prompt_contains_count_rules() -> None:
+    question = "当前资产大于50万的客户总数是多少"
+    plan = RuleBasedQueryPlanActor().build(question)
+    actor = LLMSQLActor(QueueLLMService([]))
+
+    messages = actor._build_messages(  # noqa: SLF001
+        question=question,
+        query_plan=plan,
+        metadata_context=StaticSchemaContextProvider().load(query_plan=plan, question=question),
+        previous_sql=None,
+        critic_feedback=None,
+    )
+    prompt_text = "\n".join(message.content for message in messages)
+
+    assert "customer_count" in prompt_text
+    assert "LIMIT 1" in prompt_text
+    assert "count(*) over()" in prompt_text
 
 
 def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None:
@@ -546,7 +568,11 @@ def test_query_service_returns_failed_for_invalid_plan_without_repair() -> None:
     llm_service = QueueLLMService([_invalid_sensitive_plan_json(question)])
 
     response = asyncio.run(
-        QueryService(llm_service=llm_service).run(QueryRequest(question=question))
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+            audit_logger=NoopAuditLogger(),
+        ).run(QueryRequest(question=question))
     )
 
     repair_step = next(step for step in response.steps if step.name == "repair_query_plan")

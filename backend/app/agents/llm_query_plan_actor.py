@@ -232,6 +232,11 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     7. output.limit 必须为正数且不超过 safety.max_rows。
     8. safety.readonly 必须为 true，allow_sensitive_fields 默认为 false。
     9. 不得输出客户手机号、身份证、银行卡号等敏感字段；如用户要求，应标记 invalid 或澄清脱敏方式。
+    10. 如果用户问“多少、数量、人数、总数、几个、几位客户”，通常应生成 metric_query，
+        grain.level=aggregate，metrics 包含 customer_count，output.format=summary。
+        不要把这类问题误规划成客户列表。
+    11. 如果用户同时要求“列表/名单”和“总数/共多少”，应保留客户级 grain，
+        并在 output.columns 中包含 total_count 或“总命中数”这类字段提示 SQLActor 返回列表和总命中数。
 
     澄清问题策略：
     - 每个 clarification 必须包含 field、question、reason。
@@ -287,5 +292,15 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     用户问“把筛选出的客户手机号导出来”。
     错误做法是 output.columns 包含手机号并 ready。
     正确做法是 invalid 或 needs_clarification，说明敏感字段需要脱敏或授权策略。
+
+    正例 3：
+    用户问“当前资产大于50万且近90天交易次数超过3次的客户有多少？”
+    正确做法是 intent=metric_query，metrics 包含 customer_count，
+    filters 保留 current_total_asset > 500000 和 trade_count_90d > 3，
+    grain.level=aggregate，output.format=summary，output.columns 包含“客户数量”。
+
+    反例 3：
+    用户问“满足条件的客户有多少？”，错误做法是 grain.level=customer 并返回客户列表。
+    这会让后续 AnswerActor 只能看到返回行数，不能得到总命中数。
     """
 ).strip()

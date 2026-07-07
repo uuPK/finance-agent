@@ -21,6 +21,8 @@ from app.schemas.query_plan import (
 class RuleBasedQueryPlanActor:
     """Offline QueryPlan actor used before the LLM implementation is wired in."""
 
+    COUNT_INTENT_TOKENS = ("数量", "人数", "多少", "总数", "几个", "几位", "count")
+
     def build(self, question: str) -> QueryPlan:
         normalized = question.strip()
         lower_question = normalized.lower()
@@ -67,7 +69,7 @@ class RuleBasedQueryPlanActor:
             return "metadata_question"
         if "客户" in question and any(token in question for token in ["筛选", "找出", "列表", "名单"]):
             return "customer_segmentation"
-        if any(token in question for token in ["数量", "人数", "多少", "count"]):
+        if any(token in question for token in self.COUNT_INTENT_TOKENS):
             return "metric_query"
         if "客户" in question:
             return "customer_segmentation"
@@ -145,7 +147,7 @@ class RuleBasedQueryPlanActor:
                 )
             )
 
-        if any(token in question for token in ["数量", "人数", "多少"]):
+        if any(token in question for token in self.COUNT_INTENT_TOKENS):
             metrics.append(
                 QueryMetric(
                     name="客户数量",
@@ -269,7 +271,7 @@ class RuleBasedQueryPlanActor:
         return None
 
     def _detect_grain(self, question: str) -> QueryGrain:
-        if any(token in question for token in ["数量", "人数", "多少"]):
+        if any(token in question for token in self.COUNT_INTENT_TOKENS):
             return QueryGrain(
                 level="aggregate", keys=[], description="汇总级", is_resolved=True
             )

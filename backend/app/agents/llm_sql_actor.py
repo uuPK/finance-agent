@@ -186,6 +186,17 @@ _SQL_ACTOR_SYSTEM_PROMPT = dedent(
     - grain.level=aggregate：返回汇总指标，可不按实体分组。
     - metric aggregation 必须与 QueryPlan.metrics 中的 aggregation 尽量一致。
 
+    数量与总数策略：
+    - 如果 QueryPlan.intent=metric_query 或 grain.level=aggregate，且 metrics 中包含
+      customer_count / count / count_distinct，SQL 应返回一行汇总结果，使用
+      count(distinct customer_id) as customer_count 或 count(*) as total_count。
+    - 汇总 count SQL 仍必须包含 LIMIT 1。
+    - 如果用户明确要求“列表/名单/明细”同时要求“总数/共多少”，SQL 应先用 CTE 构造 base 明细，
+      再在外层 SELECT 中加入 count(*) over() as total_count，并保留客户级明细列。
+    - 如果用户只要求列表/名单/明细，不要为了回答方便强制计算 total_count，优先保证速度。
+    - AnswerActor 会优先读取 total_count、customer_count、count、客户数量等字段；没有这些字段时，
+      row_count 只代表本次 SQL 实际返回行数，不代表全量命中数。
+
     正例：
     QueryPlan 要求客户级列表、current_total_asset > 500000、trade_count_90d > 3。
     好的 SQLDraft：
@@ -198,6 +209,29 @@ _SQL_ACTOR_SYSTEM_PROMPT = dedent(
       "confidence": 0.88
     }
     这个例子通过，因为它是只读 SELECT，包含 LIMIT，并覆盖了资产过滤、交易次数过滤和时间窗口。
+
+    正例：数量查询
+    QueryPlan 要求汇总当前资产大于50万且近90天交易次数大于3的客户数量。
+    好的 SQLDraft：
+    {
+      "sql": "SELECT COUNT(DISTINCT c.customer_id) AS customer_count FROM mart.customer_info c JOIN mart.customer_current_asset a ON a.customer_id = c.customer_id LEFT JOIN mart.customer_trade_90d t ON t.customer_id = c.customer_id WHERE a.total_asset > 500000 AND COALESCE(t.trade_count_90d, 0) > 3 LIMIT 1",
+      "dialect": "postgres",
+      "tables": ["customer_info", "customer_current_asset", "customer_trade_90d"],
+      "columns": ["customer_count"],
+      "assumptions": [],
+      "confidence": 0.9
+    }
+
+    正例：列表同时带总数
+    用户要求客户列表并要求总数时，可以使用窗口函数：
+    {
+      "sql": "WITH base AS (SELECT c.customer_no, a.total_asset, t.trade_count_90d FROM mart.customer_info c JOIN mart.customer_current_asset a ON a.customer_id = c.customer_id LEFT JOIN mart.customer_trade_90d t ON t.customer_id = c.customer_id WHERE a.total_asset > 500000 AND COALESCE(t.trade_count_90d, 0) > 3) SELECT customer_no, total_asset, trade_count_90d, COUNT(*) OVER() AS total_count FROM base LIMIT 100",
+      "dialect": "postgres",
+      "tables": ["customer_info", "customer_current_asset", "customer_trade_90d"],
+      "columns": ["customer_no", "total_asset", "trade_count_90d", "total_count"],
+      "assumptions": [],
+      "confidence": 0.88
+    }
 
     反例：
     {
