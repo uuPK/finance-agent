@@ -8,6 +8,7 @@ from app.llm.schemas import LLMMessage, LLMResponse
 from app.schemas.query import QueryRequest
 from app.schemas.review import ReviewDecision
 from app.services.query_service import QueryService
+from app.services.sql_executor import SQLExecutionResult
 
 
 class QueueLLMService:
@@ -59,6 +60,55 @@ class StaticSchemaContextProvider:
                 "customer_trade_90d": ["customer_id", "trade_count_90d"],
             },
         }
+
+
+class StaticSQLExecutor:
+    def __init__(self, result: SQLExecutionResult | None = None) -> None:
+        self.result = result or SQLExecutionResult(
+            status="success",
+            sql="",
+            columns=["customer_no", "total_asset", "trade_count_3m"],
+            rows=[
+                {
+                    "customer_no": "C000001",
+                    "total_asset": 800000.0,
+                    "trade_count_3m": 5,
+                }
+            ],
+            row_count=1,
+            elapsed_ms=3,
+        )
+        self.calls: list[str] = []
+
+    def execute(self, sql: str) -> SQLExecutionResult:
+        self.calls.append(sql)
+        return self.result
+
+
+class QueueSQLExecutor:
+    def __init__(self, results: list[SQLExecutionResult]) -> None:
+        self.results = list(results)
+        self.calls: list[str] = []
+
+    def execute(self, sql: str) -> SQLExecutionResult:
+        self.calls.append(sql)
+        result = self.results.pop(0)
+        result.sql = sql
+        return result
+
+
+class NoopAuditLogger:
+    def start_query_run(self, *args, **kwargs) -> None:
+        return None
+
+    def finish_query_run(self, *args, **kwargs) -> None:
+        return None
+
+    def log_sql_execution(self, *args, **kwargs) -> str:
+        return "00000000-0000-0000-0000-000000000001"
+
+    def log_result_validation(self, *args, **kwargs) -> None:
+        return None
 
 
 def test_llm_query_plan_actor_uses_llm_response() -> None:
@@ -159,6 +209,8 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
         QueryService(
             llm_service=llm_service,
             schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=StaticSQLExecutor(),
+            audit_logger=NoopAuditLogger(),
         ).run(QueryRequest(question=question))
     )
 
@@ -167,17 +219,61 @@ def test_query_service_runs_llm_actor_and_critic_when_service_provided() -> None
     sql_step = next(step for step in response.steps if step.name == "generate_sql")
     sql_critic_step = next(step for step in response.steps if step.name == "sql_llm_review")
 
-    assert response.status == "planned"
+    assert response.status == "completed"
     assert response.sql is not None
+    assert response.result_preview
     assert response.query_plan is not None
     assert response.query_plan.confidence == 0.93
     assert build_step.details["actor_source"] == "llm"
     assert critic_step.status == "passed"
     assert sql_step.status == "passed"
     assert sql_critic_step.status == "passed"
+    assert next(step for step in response.steps if step.name == "execute_sql").status == "passed"
+    assert next(step for step in response.steps if step.name == "result_hard_review").status == "passed"
     assert "customer_current_asset" in llm_service.calls[2][-1].content
     assert sql_step.details["metadata_context"]["source"] == "database"
     assert llm_service.contents == []
+
+
+def test_query_service_limits_response_preview_rows() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    llm_service = QueueLLMService(
+        [
+            _ready_plan_json(question, confidence=0.93),
+            _passing_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
+        ]
+    )
+    sql_result = SQLExecutionResult(
+        status="success",
+        sql="",
+        columns=["customer_no", "total_asset", "trade_count_3m"],
+        rows=[
+            {"customer_no": "C000001", "total_asset": 800000.0, "trade_count_3m": 5},
+            {"customer_no": "C000002", "total_asset": 700000.0, "trade_count_3m": 4},
+            {"customer_no": "C000003", "total_asset": 650000.0, "trade_count_3m": 6},
+        ],
+        row_count=3,
+        elapsed_ms=3,
+    )
+
+    response = asyncio.run(
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=StaticSQLExecutor(sql_result),
+            audit_logger=NoopAuditLogger(),
+            result_preview_rows=2,
+        ).run(QueryRequest(question=question))
+    )
+
+    execution_step = next(step for step in response.steps if step.name == "execute_sql")
+
+    assert response.status == "completed"
+    assert len(response.result_preview) == 2
+    assert execution_step.details["row_count"] == 3
+    assert execution_step.details["response_preview_rows"] == 2
 
 
 def test_query_service_repairs_plan_with_critic_feedback() -> None:
@@ -196,13 +292,15 @@ def test_query_service_repairs_plan_with_critic_feedback() -> None:
         QueryService(
             llm_service=llm_service,
             schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=StaticSQLExecutor(),
+            audit_logger=NoopAuditLogger(),
         ).run(QueryRequest(question=question))
     )
 
     build_step = next(step for step in response.steps if step.name == "build_query_plan")
     repair_step = next(step for step in response.steps if step.name == "repair_query_plan")
 
-    assert response.status == "planned"
+    assert response.status == "completed"
     assert response.sql is not None
     assert response.retry_count == 1
     assert response.query_plan is not None
@@ -229,18 +327,77 @@ def test_query_service_repairs_sql_with_guardrail_feedback() -> None:
         QueryService(
             llm_service=llm_service,
             schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=StaticSQLExecutor(),
+            audit_logger=NoopAuditLogger(),
         ).run(QueryRequest(question=question))
     )
 
     repair_sql_step = next(step for step in response.steps if step.name == "repair_sql")
     sql_hard_step = next(step for step in response.steps if step.name == "sql_hard_review")
 
-    assert response.status == "planned"
+    assert response.status == "completed"
     assert response.sql is not None
     assert response.retry_count == 1
     assert repair_sql_step.status == "passed"
     assert sql_hard_step.status == "passed"
     assert "limit_required" in llm_service.calls[3][-1].content
+
+
+def test_query_service_repairs_sql_with_execution_feedback() -> None:
+    question = "查询近三个月交易次数超过3次且当前资产大于50万的客户列表"
+    llm_service = QueueLLMService(
+        [
+            _ready_plan_json(question, confidence=0.93),
+            _passing_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
+            _sql_draft_json(),
+            _passing_sql_critic_json(),
+        ]
+    )
+    sql_executor = QueueSQLExecutor(
+        [
+            SQLExecutionResult(
+                status="failed",
+                sql="",
+                error_type="column_not_found",
+                error_message="column c.missing_column does not exist",
+            ),
+            SQLExecutionResult(
+                status="success",
+                sql="",
+                columns=["customer_no", "total_asset", "trade_count_3m"],
+                rows=[
+                    {
+                        "customer_no": "C000001",
+                        "total_asset": 800000.0,
+                        "trade_count_3m": 5,
+                    }
+                ],
+                row_count=1,
+                elapsed_ms=4,
+            ),
+        ]
+    )
+
+    response = asyncio.run(
+        QueryService(
+            llm_service=llm_service,
+            schema_context_provider=StaticSchemaContextProvider(),
+            sql_executor=sql_executor,
+            audit_logger=NoopAuditLogger(),
+        ).run(QueryRequest(question=question))
+    )
+
+    repair_sql_step = next(step for step in response.steps if step.name == "repair_sql")
+    execution_step = next(step for step in response.steps if step.name == "execute_sql")
+
+    assert response.status == "completed"
+    assert response.retry_count == 1
+    assert len(sql_executor.calls) == 2
+    assert repair_sql_step.status == "passed"
+    assert execution_step.status == "passed"
+    assert "column_not_found" in llm_service.calls[4][-1].content
 
 
 def test_query_service_returns_failed_for_invalid_plan_without_repair() -> None:

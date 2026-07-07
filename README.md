@@ -102,21 +102,32 @@ npm run dev
 
 ## 当前阶段
 
-当前仓库已经实现核心问数主循环的前两段：
+当前仓库已经走通核心问数主循环：
 
 - QueryPlan Actor-Critic 生成、审核和修复循环。
 - SQL Actor-Critic 生成、Guardrail 审核和修复循环。
 - DeepSeek OpenAI-compatible 接口接入。
 - PostgreSQL 业务表、日志表、synthetic 测试数据和真实 schema context 接入。
 - SQL 生成前会读取当前数据库表、字段、指标、业务词和 join 路径作为上下文。
-- SQL 目前只生成和审核，主查询循环尚未执行数据库查询。
-- SQL 执行、结果硬校验和 ResultCritic 将在后续阶段接入。
+- SQLExecutor 已接入主查询循环，会以只读事务执行通过审核的 SELECT。
+- ResultHardValidator 已接入，支持执行成功、行数、字段、敏感字段和粒度硬校验。
+- 主接口只返回受控 `result_preview`；`MAX_RESULT_ROWS` 控制执行取数上限，`RESULT_PREVIEW_ROWS` 控制 API 预览返回上限。
+- LLM ResultCritic 和更完整的结果语义审核将在后续阶段接入。
 
 后端启动后可访问：
 
 - `GET http://127.0.0.1:8000/api/health`
 - `GET http://127.0.0.1:8000/api/llm/status`
 - `POST http://127.0.0.1:8000/api/chat/query`
+
+## 测试
+
+推荐使用项目依赖运行测试，避免落到系统 Python：
+
+```bash
+cd backend
+uv run --no-dev --with pytest python -m pytest
+```
 
 ## 安全说明
 
@@ -146,3 +157,11 @@ DEEPSEEK_API_KEY=your_api_key_here
 ```
 
 不要把真实 API key 提交到 GitHub。`.env` 已被 `.gitignore` 排除。
+
+## 运行限制配置
+
+```bash
+SQL_TIMEOUT_SECONDS=30
+MAX_RESULT_ROWS=1000
+RESULT_PREVIEW_ROWS=100
+```

@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     max_retry: int = 2
     sql_timeout_seconds: int = 30
     max_result_rows: int = 1000
+    result_preview_rows: int = 100
     backend_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")

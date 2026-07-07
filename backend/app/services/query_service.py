@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from time import perf_counter
+from uuid import UUID, uuid4
 
 from app.agents.llm_plan_critic import LLMPlanCritic, LLMPlanCriticResult
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor, QueryPlanBuildResult
@@ -7,6 +8,8 @@ from app.agents.llm_sql_actor import LLMSQLActor, SQLBuildResult
 from app.agents.llm_sql_critic import LLMSQLCritic, LLMSQLCriticResult
 from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
+from app.core.config import get_settings
+from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
 from app.llm.protocols import SupportsLLMComplete
 from app.metadata.schema_context import SchemaContextProvider
@@ -14,6 +17,8 @@ from app.schemas.query import AgentStep, GuardrailCheck, QueryRequest, QueryResp
 from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
+from app.services.audit_logger import QueryAuditLogger
+from app.services.sql_executor import SQLExecutionResult, SQLExecutor
 
 
 @dataclass(slots=True)
@@ -27,6 +32,9 @@ class SQLLoopResult:
     review_history: list[dict[str, object]]
     repair_count: int
     metadata_context: dict[str, object]
+    execution_result: SQLExecutionResult | None = None
+    result_validation: ResultValidationResult | None = None
+    execution_history: list[dict[str, object]] | None = None
     failure_reason: str | None = None
 
 
@@ -37,7 +45,12 @@ class QueryService:
         enable_llm: bool = True,
         max_repair_attempts: int = 2,
         schema_context_provider: SchemaContextProvider | None = None,
+        sql_executor: SQLExecutor | None = None,
+        result_validator: ResultHardValidator | None = None,
+        audit_logger: QueryAuditLogger | None = None,
+        result_preview_rows: int | None = None,
     ) -> None:
+        self.settings = get_settings()
         self.rule_based_actor = RuleBasedQueryPlanActor()
         self.plan_validator = QueryPlanHardValidator()
         self.llm_unavailable_reason: str | None = None
@@ -61,6 +74,12 @@ class QueryService:
         self.sql_actor = LLMSQLActor(llm_service=resolved_llm_service)
         self.sql_critic = LLMSQLCritic(llm_service=resolved_llm_service)
         self.schema_context_provider = schema_context_provider or SchemaContextProvider()
+        self.sql_executor = sql_executor or SQLExecutor()
+        self.result_validator = result_validator
+        self.audit_logger = audit_logger or QueryAuditLogger()
+        self.result_preview_rows = max(
+            1, result_preview_rows or self.settings.result_preview_rows
+        )
         self.default_sensitive_columns = {
             "phone",
             "mobile",
@@ -74,6 +93,12 @@ class QueryService:
 
     async def run(self, request: QueryRequest) -> QueryResponse:
         started_at = perf_counter()
+        query_id = uuid4()
+        self.audit_logger.start_query_run(
+            query_id=query_id,
+            question=request.question,
+            user_id=request.user_id,
+        )
 
         build_result = await self.query_plan_actor.build(request.question)
         query_plan = build_result.plan
@@ -132,12 +157,12 @@ class QueryService:
             status = "needs_clarification"
             answer = "The request needs clarification before SQL generation."
         else:
-            sql_loop_result = await self._run_sql_loop(request.question, query_plan)
+            sql_loop_result = await self._run_sql_loop(query_id, request.question, query_plan)
             if sql_loop_result.passed:
-                status = "planned"
+                status = "completed"
                 answer = (
-                    "QueryPlan and SQL are ready against the current database schema context. "
-                    "SQL execution is not enabled in the main query loop yet."
+                    "QueryPlan and SQL passed review, SQL executed successfully, and result "
+                    "hard validation passed."
                 )
             else:
                 status = "failed"
@@ -150,10 +175,22 @@ class QueryService:
             if sql_loop_result is not None
             else []
         )
+        result_checks = (
+            sql_loop_result.result_validation.checks
+            if sql_loop_result is not None and sql_loop_result.result_validation is not None
+            else []
+        )
         sql_steps = (
             self._build_sql_steps(sql_loop_result) if sql_loop_result is not None else []
         )
         sql = sql_loop_result.sql if sql_loop_result and sql_loop_result.passed else None
+        result_preview = (
+            self._response_preview_rows(sql_loop_result.execution_result)
+            if sql_loop_result
+            and sql_loop_result.passed
+            and sql_loop_result.execution_result is not None
+            else []
+        )
         total_retry_count = repair_count + (
             sql_loop_result.repair_count if sql_loop_result is not None else 0
         )
@@ -163,14 +200,16 @@ class QueryService:
             *review_bundle.hard_checks,
             *review_bundle.llm_checks,
             *sql_checks,
+            *result_checks,
         ]
 
-        return QueryResponse(
+        response = QueryResponse(
+            query_id=query_id,
             status=status,
             answer=answer,
             query_plan=query_plan,
             sql=sql,
-            result_preview=[],
+            result_preview=result_preview,
             guardrail_checks=self._to_guardrail_checks(all_checks),
             steps=[
                 AgentStep(
@@ -203,6 +242,18 @@ class QueryService:
             retry_count=total_retry_count,
             elapsed_ms=elapsed_ms,
         )
+        failed_check = next((check for check in all_checks if not check.passed), None)
+        self.audit_logger.finish_query_run(
+            query_id=query_id,
+            status=status,
+            final_answer=answer,
+            final_sql=sql,
+            retry_count=total_retry_count,
+            elapsed_ms=elapsed_ms,
+            error_type=failed_check.error_type if failed_check else None,
+            error_message=failed_check.reason if failed_check else None,
+        )
+        return response
 
     def _build_default_llm_service(
         self,
@@ -267,7 +318,9 @@ class QueryService:
             if not check.passed
         ]
 
-    async def _run_sql_loop(self, question: str, query_plan: QueryPlan) -> SQLLoopResult:
+    async def _run_sql_loop(
+        self, query_id: UUID, question: str, query_plan: QueryPlan
+    ) -> SQLLoopResult:
         metadata_context = self.schema_context_provider.load(query_plan)
         build_result = await self.sql_actor.build(
             question=question,
@@ -300,24 +353,68 @@ class QueryService:
                 ],
                 repair_count=0,
                 metadata_context=metadata_context,
+                execution_history=[],
                 failure_reason=build_result.llm_error or "SQL generation failed.",
             )
 
-        review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-            query_plan, build_result.draft, metadata_context
-        )
-        review_history = [
-            self._build_sql_review_details(
-                build_result.repair_attempt,
-                review_bundle,
-                hard_review_passed,
-                critic_result,
-            )
-        ]
-
         repair_count = 0
-        while self._should_repair_sql(review_bundle, repair_count):
-            repair_feedback = self._failed_review_feedback(review_bundle)
+        review_bundle = ReviewBundle()
+        hard_review_passed = False
+        critic_result = LLMSQLCriticResult(status="failed")
+        review_history: list[dict[str, object]] = []
+        execution_result: SQLExecutionResult | None = None
+        result_validation: ResultValidationResult | None = None
+        execution_history: list[dict[str, object]] = []
+
+        while True:
+            review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
+                query_plan, build_result.draft, metadata_context
+            )
+            review_history.append(
+                self._build_sql_review_details(
+                    build_result.repair_attempt,
+                    review_bundle,
+                    hard_review_passed,
+                    critic_result,
+                )
+            )
+
+            execution_result = None
+            result_validation = None
+            if review_bundle.passed and build_result.draft is not None:
+                execution_result = self.sql_executor.execute(build_result.draft.sql)
+                execution_id = self.audit_logger.log_sql_execution(
+                    query_id=query_id,
+                    attempt=build_result.repair_attempt,
+                    result=execution_result,
+                )
+                result_validation = self._validate_execution_result(
+                    query_plan=query_plan,
+                    execution_result=execution_result,
+                    metadata_context=metadata_context,
+                )
+                self.audit_logger.log_result_validation(
+                    query_id=query_id,
+                    execution_id=execution_id,
+                    result=result_validation,
+                )
+                execution_history.append(
+                    self._build_execution_details(
+                        build_result.repair_attempt,
+                        execution_result,
+                        result_validation,
+                        execution_id,
+                    )
+                )
+
+            if not self._should_repair_sql_attempt(
+                review_bundle, result_validation, repair_count
+            ):
+                break
+
+            repair_feedback = self._failed_sql_attempt_feedback(
+                review_bundle, result_validation
+            )
             previous_sql = build_result.draft.sql
             repair_count += 1
             build_result = await self.sql_actor.build(
@@ -349,21 +446,11 @@ class QueryService:
                 )
                 break
 
-            review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-                query_plan, build_result.draft, metadata_context
-            )
-            review_history.append(
-                self._build_sql_review_details(
-                    build_result.repair_attempt,
-                    review_bundle,
-                    hard_review_passed,
-                    critic_result,
-                )
-            )
-
-        passed = review_bundle.passed
+        passed = bool(review_bundle.passed and result_validation and result_validation.passed)
         sql = build_result.draft.sql if passed and build_result.draft is not None else None
-        failure_reason = None if passed else "SQL generation failed review before execution."
+        failure_reason = self._sql_loop_failure_reason(
+            review_bundle, execution_result, result_validation
+        )
 
         return SQLLoopResult(
             sql=sql,
@@ -375,6 +462,9 @@ class QueryService:
             review_history=review_history,
             repair_count=repair_count,
             metadata_context=metadata_context,
+            execution_result=execution_result,
+            result_validation=result_validation,
+            execution_history=execution_history,
             failure_reason=failure_reason,
         )
 
@@ -414,6 +504,23 @@ class QueryService:
 
         return review_bundle, hard_review_passed, critic_result
 
+    def _validate_execution_result(
+        self,
+        query_plan: QueryPlan,
+        execution_result: SQLExecutionResult,
+        metadata_context: dict[str, object],
+    ) -> ResultValidationResult:
+        validator = self.result_validator or ResultHardValidator(
+            max_result_rows=self.settings.max_result_rows,
+            sensitive_columns=set(self._string_list(metadata_context.get("sensitive_columns"))),
+        )
+        return validator.validate(query_plan, execution_result)
+
+    def _response_preview_rows(
+        self, execution_result: SQLExecutionResult
+    ) -> list[dict[str, object]]:
+        return execution_result.rows[: self.result_preview_rows]
+
     def _build_sql_guardrail(self, metadata_context: dict[str, object]) -> SQLGuardrail:
         table_allowlist = set(self._string_list(metadata_context.get("table_allowlist")))
         sensitive_columns = {
@@ -442,14 +549,52 @@ class QueryService:
             return {}
         return {key: item for key, item in value.items() if isinstance(key, str)}
 
-    def _should_repair_sql(self, review_bundle: ReviewBundle, repair_count: int) -> bool:
-        if review_bundle.passed:
+    def _should_repair_sql_attempt(
+        self,
+        review_bundle: ReviewBundle,
+        result_validation: ResultValidationResult | None,
+        repair_count: int,
+    ) -> bool:
+        if review_bundle.passed and result_validation is not None and result_validation.passed:
             return False
         if repair_count >= self.max_repair_attempts:
             return False
         if not self.llm_enabled:
             return False
-        return bool(self._failed_review_feedback(review_bundle))
+        if not review_bundle.passed:
+            return bool(self._failed_review_feedback(review_bundle))
+        if result_validation is not None:
+            return bool(self._failed_result_feedback(result_validation))
+        return False
+
+    def _failed_sql_attempt_feedback(
+        self,
+        review_bundle: ReviewBundle,
+        result_validation: ResultValidationResult | None,
+    ) -> list[ReviewDecision]:
+        feedback = self._failed_review_feedback(review_bundle)
+        if result_validation is not None:
+            feedback.extend(self._failed_result_feedback(result_validation))
+        return feedback
+
+    def _failed_result_feedback(
+        self, result_validation: ResultValidationResult
+    ) -> list[ReviewDecision]:
+        return [check for check in result_validation.checks if not check.passed]
+
+    def _sql_loop_failure_reason(
+        self,
+        review_bundle: ReviewBundle,
+        execution_result: SQLExecutionResult | None,
+        result_validation: ResultValidationResult | None,
+    ) -> str | None:
+        if review_bundle.passed is False:
+            return "SQL generation failed review before execution."
+        if execution_result is not None and execution_result.status != "success":
+            return execution_result.error_message or "SQL execution failed."
+        if result_validation is not None and not result_validation.passed:
+            return result_validation.repair_hint or "SQL result failed hard validation."
+        return None
 
     def _guardrail_finding_to_review_decision(
         self, finding: GuardrailFinding
@@ -551,6 +696,8 @@ class QueryService:
                 },
             ),
             self._build_sql_critic_step(result.critic_result),
+            self._build_sql_execution_step(result),
+            self._build_result_validation_step(result),
         ]
 
     def _build_sql_actor_details(self, result: SQLLoopResult) -> dict[str, object]:
@@ -667,6 +814,79 @@ class QueryService:
                 "llm_provider": result.llm_provider,
             },
         )
+
+    def _build_sql_execution_step(self, result: SQLLoopResult) -> AgentStep:
+        if result.execution_result is None:
+            return AgentStep(
+                name="execute_sql",
+                status="skipped",
+                summary="SQL execution was skipped because SQL review did not pass.",
+                details={"execution_history": result.execution_history or []},
+            )
+
+        return AgentStep(
+            name="execute_sql",
+            status="passed" if result.execution_result.status == "success" else "failed",
+            summary="Executed SQL against PostgreSQL in a read-only transaction.",
+            details={
+                "status": result.execution_result.status,
+                "row_count": result.execution_result.row_count,
+                "response_preview_rows": min(
+                    result.execution_result.row_count, self.result_preview_rows
+                ),
+                "columns": result.execution_result.columns,
+                "truncated": result.execution_result.truncated,
+                "elapsed_ms": result.execution_result.elapsed_ms,
+                "error_type": result.execution_result.error_type,
+                "error_message": result.execution_result.error_message,
+                "execution_history": result.execution_history or [],
+            },
+        )
+
+    def _build_result_validation_step(self, result: SQLLoopResult) -> AgentStep:
+        if result.result_validation is None:
+            return AgentStep(
+                name="result_hard_review",
+                status="skipped",
+                summary="Result hard validation was skipped because SQL did not execute.",
+                details={},
+            )
+
+        return AgentStep(
+            name="result_hard_review",
+            status="passed" if result.result_validation.passed else "failed",
+            summary="Ran deterministic result hard validation.",
+            details={
+                "score": result.result_validation.score,
+                "error_type": result.result_validation.error_type,
+                "repair_hint": result.result_validation.repair_hint,
+                "checks": [
+                    check.model_dump() for check in result.result_validation.checks
+                ],
+            },
+        )
+
+    def _build_execution_details(
+        self,
+        repair_attempt: int,
+        execution_result: SQLExecutionResult,
+        result_validation: ResultValidationResult,
+        execution_id: str | None,
+    ) -> dict[str, object]:
+        return {
+            "repair_attempt": repair_attempt,
+            "execution_id": execution_id,
+            "execution_status": execution_result.status,
+            "row_count": execution_result.row_count,
+            "columns": execution_result.columns,
+            "truncated": execution_result.truncated,
+            "elapsed_ms": execution_result.elapsed_ms,
+            "error_type": execution_result.error_type,
+            "error_message": execution_result.error_message,
+            "result_validation_passed": result_validation.passed,
+            "result_validation_error_type": result_validation.error_type,
+            "result_validation_repair_hint": result_validation.repair_hint,
+        }
 
     def _build_actor_details(
         self, result: QueryPlanBuildResult, build_results: list[QueryPlanBuildResult]
