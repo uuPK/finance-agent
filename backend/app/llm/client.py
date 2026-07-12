@@ -22,12 +22,14 @@ class OpenAICompatibleClient(BaseLLMClient):
         base_url: str,
         default_model: str,
         timeout_seconds: int = 30,
+        proxy_url: str | None = None,
     ) -> None:
         self.provider = provider
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
         self.timeout_seconds = timeout_seconds
+        self.proxy_url = proxy_url
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         try:
@@ -50,7 +52,10 @@ class OpenAICompatibleClient(BaseLLMClient):
         if request.response_format is not None:
             payload["response_format"] = request.response_format
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout_seconds,
+            proxy=self.proxy_url,
+        ) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={
@@ -98,6 +103,7 @@ def build_llm_client(settings: Settings | None = None) -> BaseLLMClient:
             base_url=active_settings.llm_base_url,
             default_model=active_settings.llm_model,
             timeout_seconds=active_settings.llm_timeout_seconds,
+            proxy_url=active_settings.llm_proxy_url,
         )
 
     if provider == "openai":
@@ -107,6 +113,7 @@ def build_llm_client(settings: Settings | None = None) -> BaseLLMClient:
             base_url=active_settings.llm_base_url or "https://api.openai.com/v1",
             default_model=active_settings.llm_model,
             timeout_seconds=active_settings.llm_timeout_seconds,
+            proxy_url=active_settings.llm_proxy_url,
         )
 
     raise LLMClientError(f"Unsupported LLM provider: {active_settings.llm_provider}")

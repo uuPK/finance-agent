@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_base_url: str = "https://api.deepseek.com"
     llm_timeout_seconds: int = 30
+    llm_proxy_url: str | None = None
     deepseek_api_key: str = ""
     openai_api_key: str = ""
     model_name: str = "deepseek-chat"
@@ -20,6 +21,8 @@ class Settings(BaseSettings):
     sql_timeout_seconds: int = 30
     max_result_rows: int = 1000
     result_preview_rows: int = 100
+    export_max_rows: int = 100000
+    export_timeout_seconds: int = 60
     backend_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=(".env", "../.env"), extra="ignore")

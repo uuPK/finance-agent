@@ -331,6 +331,9 @@ create table if not exists agent.query_runs (
     elapsed_ms integer,
     error_type varchar(64),
     error_message text,
+    current_stage varchar(64),
+    clarification_context jsonb not null default '{}'::jsonb,
+    final_response jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -342,6 +345,7 @@ create table if not exists agent.query_steps (
     step_id uuid primary key default gen_random_uuid(),
     query_id uuid not null references agent.query_runs(query_id) on delete cascade,
     step_name varchar(64) not null,
+    attempt integer not null default 0,
     step_status varchar(32) not null,
     summary text not null default '',
     payload jsonb not null default '{}'::jsonb,
@@ -351,6 +355,23 @@ create table if not exists agent.query_steps (
 
 create index if not exists idx_query_steps_query on agent.query_steps(query_id);
 create index if not exists idx_query_steps_name on agent.query_steps(step_name);
+create unique index if not exists uq_query_steps_run_stage_attempt
+    on agent.query_steps(query_id, step_name, attempt);
+
+create table if not exists agent.query_events (
+    event_id bigint generated always as identity primary key,
+    query_id uuid not null references agent.query_runs(query_id) on delete cascade,
+    event_type varchar(64) not null,
+    stage_name varchar(64) not null,
+    step_status varchar(32) not null,
+    attempt integer not null default 0,
+    summary text not null default '',
+    payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_query_events_run_event
+    on agent.query_events(query_id, event_id);
 
 create table if not exists agent.guardrail_events (
     event_id uuid primary key default gen_random_uuid(),
@@ -440,6 +461,25 @@ create index if not exists idx_result_validation_logs_query on agent.result_vali
 create index if not exists idx_result_validation_logs_execution on agent.result_validation_logs(execution_id);
 create index if not exists idx_result_validation_logs_passed on agent.result_validation_logs(passed);
 
+create table if not exists agent.query_exports (
+    export_id uuid primary key default gen_random_uuid(),
+    query_id uuid not null references agent.query_runs(query_id) on delete cascade,
+    user_id varchar(128) not null,
+    export_format varchar(16) not null,
+    export_status varchar(32) not null default 'running',
+    row_count integer not null default 0,
+    truncated boolean not null default false,
+    elapsed_ms integer,
+    error_type varchar(64),
+    error_message text,
+    created_at timestamptz not null default now(),
+    finished_at timestamptz
+);
+
+create index if not exists idx_query_exports_query on agent.query_exports(query_id);
+create index if not exists idx_query_exports_user on agent.query_exports(user_id);
+create index if not exists idx_query_exports_created_at on agent.query_exports(created_at);
+
 -- Evaluation tables.
 
 create table if not exists evaluation.eval_cases (
@@ -452,6 +492,10 @@ create table if not exists evaluation.eval_cases (
     expected_sql text,
     expected_result jsonb not null default '{}'::jsonb,
     scoring_config jsonb not null default '{}'::jsonb,
+    dataset_version varchar(64) not null default 'synthetic-v1',
+    source_type varchar(32) not null default 'synthetic',
+    expected_status varchar(32) not null default 'completed',
+    tags jsonb not null default '[]'::jsonb,
     is_active boolean not null default true,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -469,6 +513,11 @@ create table if not exists evaluation.eval_runs (
     total_cases integer not null default 0,
     passed_cases integer not null default 0,
     average_elapsed_ms numeric(12, 2),
+    dataset_version varchar(64),
+    metadata_version varchar(64),
+    prompt_version varchar(64),
+    evaluation_mode varchar(32) not null default 'full',
+    review_queued_cases integer not null default 0,
     started_at timestamptz not null default now(),
     finished_at timestamptz
 );
@@ -492,6 +541,12 @@ create table if not exists evaluation.eval_results (
     failure_reason text,
     generated_sql text,
     generated_query_plan jsonb not null default '{}'::jsonb,
+    generated_response jsonb not null default '{}'::jsonb,
+    auto_decision varchar(32) not null default 'pending',
+    review_priority varchar(16),
+    review_status varchar(32) not null default 'not_required',
+    risk_reasons jsonb not null default '[]'::jsonb,
+    critic_confidence numeric(5, 4),
     created_at timestamptz not null default now(),
     constraint uq_eval_result unique (eval_run_id, case_id)
 );
@@ -499,6 +554,53 @@ create table if not exists evaluation.eval_results (
 create index if not exists idx_eval_results_run on evaluation.eval_results(eval_run_id);
 create index if not exists idx_eval_results_case on evaluation.eval_results(case_id);
 create index if not exists idx_eval_results_passed on evaluation.eval_results(passed);
+create index if not exists idx_eval_results_review_status on evaluation.eval_results(review_status);
+
+create table if not exists evaluation.review_batches (
+    review_batch_id uuid primary key default gen_random_uuid(),
+    batch_name varchar(128) not null,
+    status varchar(32) not null default 'open',
+    dataset_version varchar(64),
+    created_by varchar(128) not null default 'system',
+    exported_at timestamptz,
+    imported_at timestamptz,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create table if not exists evaluation.review_items (
+    review_item_id uuid primary key default gen_random_uuid(),
+    review_batch_id uuid not null references evaluation.review_batches(review_batch_id) on delete cascade,
+    eval_result_id uuid not null references evaluation.eval_results(eval_result_id) on delete cascade,
+    status varchar(32) not null default 'pending',
+    priority varchar(16) not null default 'normal',
+    risk_reasons jsonb not null default '[]'::jsonb,
+    assigned_to varchar(128),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint uq_review_item_per_batch unique (review_batch_id, eval_result_id)
+);
+
+create index if not exists idx_review_items_status on evaluation.review_items(status);
+create index if not exists idx_review_items_result on evaluation.review_items(eval_result_id);
+
+create table if not exists evaluation.review_decisions (
+    review_decision_id uuid primary key default gen_random_uuid(),
+    review_item_id uuid not null references evaluation.review_items(review_item_id) on delete cascade,
+    reviewer_id varchar(128) not null,
+    verdict varchar(32) not null,
+    error_class varchar(64),
+    severity varchar(16) not null default 'minor',
+    corrected_query_plan jsonb not null default '{}'::jsonb,
+    corrected_sql text,
+    corrected_result jsonb not null default '{}'::jsonb,
+    reviewer_note text,
+    confidence numeric(5, 4),
+    source_checksum varchar(128),
+    created_at timestamptz not null default now()
+);
+
+create index if not exists idx_review_decisions_item on evaluation.review_decisions(review_item_id);
 
 -- Useful views for metadata and guardrail introspection.
 

@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import argparse
@@ -6,13 +7,12 @@ import os
 import random
 import uuid
 from datetime import date, time, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import psycopg
 from psycopg import Cursor
 from psycopg.types.json import Jsonb
-
 
 NAMESPACE = uuid.UUID("2f7a1a27-67c7-45aa-9e56-9c8366c3359f")
 DEFAULT_DATABASE_URL = "postgresql://finance_agent:finance_agent@localhost:5432/finance_agent"
@@ -1022,6 +1022,12 @@ def seed_metadata(cur: Cursor[Any]) -> None:
 
     terms = [
         (
+            "有效客户",
+            "客户状态为 active 的客户，用于存量有效客户统计。",
+            Jsonb(["当前有效客户", "存量有效客户"]),
+            Jsonb({"field_code": "customer_status", "operator": "=", "value": "active"}),
+        ),
+        (
             "高净值客户",
             "当前总资产大于等于 500000 的客户。",
             Jsonb(["高资产客户", "高净值", "大客户"]),
@@ -1197,6 +1203,193 @@ def seed_metadata(cur: Cursor[Any]) -> None:
     print("Seeded metadata: tables, columns, metrics, business terms, joins, examples, rules")
 
 
+def _evaluation_jsonable(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+def _expected_result(cur: Cursor[Any], sql: str) -> Jsonb:
+    cur.execute(sql)
+    columns = [item.name for item in cur.description]
+    rows = [
+        {column: _evaluation_jsonable(value) for column, value in zip(columns, row, strict=True)}
+        for row in cur.fetchall()
+    ]
+    return Jsonb({"columns": columns, "rows": rows, "row_count": len(rows), "comparison": "unordered"})
+
+
+def seed_evaluation_cases(cur: Cursor[Any]) -> None:
+    """Create a deterministic, executable benchmark over the seeded business mart."""
+    cases: list[dict[str, Any]] = [
+        {
+            "code": "SYN-001",
+            "question": "当前客户有多少",
+            "difficulty": "simple",
+            "tags": ["customer", "count"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count"]},
+            "sql": "select count(*)::integer as customer_count from mart.customer_info",
+        },
+        {
+            "code": "SYN-002",
+            "question": "当前资产大于100万的客户有多少",
+            "difficulty": "simple",
+            "tags": ["asset", "segmentation"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count", "current_total_asset"], "filters": ["total_asset>1000000"]},
+            "sql": "select count(*)::integer as customer_count from mart.customer_current_asset where total_asset > 1000000",
+        },
+        {
+            "code": "SYN-003",
+            "question": "列出近90天交易次数大于3次的客户，最多20条",
+            "difficulty": "simple",
+            "tags": ["trade", "customer_list"],
+            "plan": {"intent": "customer_segmentation", "metrics": ["trade_count_3m"], "filters": ["trade_count_90d>3"], "limit": 20},
+            "sql": "select c.customer_no, t.trade_count_90d from mart.customer_info c join mart.customer_trade_90d t on t.customer_id = c.customer_id where t.trade_count_90d > 3 order by t.trade_count_90d desc, c.customer_no limit 20",
+        },
+        {
+            "code": "SYN-004",
+            "question": "近90天净流入超过10万的客户数",
+            "difficulty": "simple",
+            "tags": ["asset_flow", "count"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count", "net_asset_inflow_3m"], "filters": ["net_flow_amount_90d>100000"]},
+            "sql": "select count(*)::integer as customer_count from mart.customer_net_flow_90d where net_flow_amount_90d > 100000",
+        },
+        {
+            "code": "SYN-005",
+            "question": "按客户等级统计当前客户数和总资产",
+            "difficulty": "medium",
+            "tags": ["asset", "group_by"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count", "current_total_asset"], "dimensions": ["customer_level"]},
+            "sql": "select c.customer_level, count(*)::integer as customer_count, round(sum(a.total_asset), 2) as total_asset from mart.customer_info c join mart.customer_current_asset a on a.customer_id = c.customer_id group by c.customer_level order by c.customer_level",
+        },
+        {
+            "code": "SYN-006",
+            "question": "筛选当前资产超过50万且近90天交易次数超过3次的客户，最多50条",
+            "difficulty": "medium",
+            "tags": ["asset", "trade", "segmentation"],
+            "plan": {"intent": "customer_segmentation", "metrics": ["current_total_asset", "trade_count_3m"], "filters": ["total_asset>500000", "trade_count_90d>3"], "limit": 50},
+            "sql": "select c.customer_no, a.total_asset, t.trade_count_90d from mart.customer_info c join mart.customer_current_asset a on a.customer_id = c.customer_id join mart.customer_trade_90d t on t.customer_id = c.customer_id where a.total_asset > 500000 and t.trade_count_90d > 3 order by a.total_asset desc, c.customer_no limit 50",
+        },
+        {
+            "code": "SYN-007",
+            "question": "当前资产超过20万且未持有基金的客户数",
+            "difficulty": "medium",
+            "tags": ["asset", "holding", "negative_filter"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count", "fund_holding"], "filters": ["total_asset>200000", "fund_holding=not_exists"]},
+            "sql": "select count(*)::integer as customer_count from mart.customer_current_asset a where a.total_asset > 200000 and not exists (select 1 from mart.customer_position_daily p join mart.product_info pi on pi.product_id = p.product_id where p.customer_id = a.customer_id and pi.product_type = 'fund' and p.as_of_date = a.as_of_date)",
+        },
+        {
+            "code": "SYN-008",
+            "question": "按服务经理统计当前管理客户数和总资产，取前10名",
+            "difficulty": "medium",
+            "tags": ["manager", "asset", "ranking"],
+            "plan": {"intent": "ranking_query", "metrics": ["customer_count", "current_total_asset"], "dimensions": ["manager"], "limit": 10},
+            "sql": "select m.manager_no, count(distinct r.customer_id)::integer as customer_count, round(sum(a.total_asset), 2) as total_asset from mart.service_manager m join mart.service_relationship r on r.manager_id = m.manager_id and r.is_primary = true join mart.customer_current_asset a on a.customer_id = r.customer_id group by m.manager_no order by total_asset desc, m.manager_no limit 10",
+        },
+        {
+            "code": "SYN-009",
+            "question": "近90天净流出金额最高的客户，展示前20名",
+            "difficulty": "medium",
+            "tags": ["asset_flow", "ranking"],
+            "plan": {"intent": "ranking_query", "metrics": ["net_asset_inflow_3m"], "filters": ["net_flow_amount_90d<0"], "limit": 20},
+            "sql": "select c.customer_no, round(f.net_flow_amount_90d, 2) as net_flow_amount_90d from mart.customer_info c join mart.customer_net_flow_90d f on f.customer_id = c.customer_id where f.net_flow_amount_90d < 0 order by f.net_flow_amount_90d asc, c.customer_no limit 20",
+        },
+        {
+            "code": "SYN-010",
+            "question": "统计各风险等级客户的当前总资产和近90天交易金额",
+            "difficulty": "complex",
+            "tags": ["asset", "trade", "cross_domain"],
+            "plan": {"intent": "metric_query", "metrics": ["current_total_asset", "trade_amount_3m"], "dimensions": ["risk_level"]},
+            "sql": "select c.risk_level, round(sum(a.total_asset), 2) as total_asset, round(sum(coalesce(t.trade_amount_90d, 0)), 2) as trade_amount_90d from mart.customer_info c join mart.customer_current_asset a on a.customer_id = c.customer_id left join mart.customer_trade_90d t on t.customer_id = c.customer_id group by c.risk_level order by c.risk_level",
+        },
+        {
+            "code": "SYN-011",
+            "question": "找出当前资产超过50万、近90天净流入超过10万且持有基金的客户，最多30条",
+            "difficulty": "complex",
+            "tags": ["asset", "asset_flow", "holding", "cross_domain"],
+            "plan": {"intent": "customer_segmentation", "metrics": ["current_total_asset", "net_asset_inflow_3m", "fund_holding"], "filters": ["total_asset>500000", "net_flow_amount_90d>100000", "fund_holding=exists"], "limit": 30},
+            "sql": "select distinct c.customer_no, a.total_asset, round(f.net_flow_amount_90d, 2) as net_flow_amount_90d from mart.customer_info c join mart.customer_current_asset a on a.customer_id = c.customer_id join mart.customer_net_flow_90d f on f.customer_id = c.customer_id join mart.customer_position_daily p on p.customer_id = c.customer_id and p.as_of_date = a.as_of_date join mart.product_info pi on pi.product_id = p.product_id and pi.product_type = 'fund' where a.total_asset > 500000 and f.net_flow_amount_90d > 100000 order by a.total_asset desc, c.customer_no limit 30",
+        },
+        {
+            "code": "SYN-012",
+            "question": "按产品类型统计近90天交易客户数和交易金额",
+            "difficulty": "complex",
+            "tags": ["product", "trade", "group_by"],
+            "plan": {"intent": "metric_query", "metrics": ["customer_count", "trade_amount_3m"], "dimensions": ["product_type"]},
+            "sql": "select p.product_type, count(distinct t.customer_id)::integer as customer_count, round(sum(t.trade_amount), 2) as trade_amount from mart.customer_trade t join mart.product_info p on p.product_id = t.product_id where t.trade_date > (select max(as_of_date) - interval '90 days' from mart.customer_asset_daily) group by p.product_type order by p.product_type",
+        },
+        {
+            "code": "SYN-013",
+            "question": "按营销活动统计已响应客户数和响应率",
+            "difficulty": "complex",
+            "tags": ["marketing", "campaign", "ratio"],
+            "plan": {"intent": "marketing_effect_analysis", "metrics": ["response_customer_count", "response_rate"], "dimensions": ["campaign"]},
+            "sql": "select c.campaign_code, count(*)::integer as touch_count, count(*) filter (where t.response_status = 'responded')::integer as responded_count, round((count(*) filter (where t.response_status = 'responded'))::numeric / nullif(count(*), 0), 4) as response_rate from mart.marketing_campaign c left join mart.marketing_touch t on t.campaign_id = c.campaign_id group by c.campaign_code order by c.campaign_code",
+        },
+        {
+            "code": "SYN-014",
+            "question": "高净值客户有多少",
+            "difficulty": "simple",
+            "tags": ["clarification", "asset_definition"],
+            "plan": {"intent": "metric_query", "clarification_fields": ["高净值客户"]},
+            "expected_status": "needs_clarification",
+        },
+        {
+            "code": "SYN-015",
+            "question": "给我活跃客户名单",
+            "difficulty": "medium",
+            "tags": ["clarification", "activity_definition"],
+            "plan": {"intent": "customer_segmentation", "clarification_fields": ["活跃客户"]},
+            "expected_status": "needs_clarification",
+        },
+    ]
+    for case in cases:
+        expected_status = case.get("expected_status", "completed")
+        expected_result = (
+            _expected_result(cur, case["sql"])
+            if expected_status == "completed"
+            else Jsonb({"clarification_fields": case["plan"]["clarification_fields"]})
+        )
+        cur.execute(
+            """
+            insert into evaluation.eval_cases
+                (case_code, question, difficulty, scenario, expected_query_plan, expected_sql,
+                 expected_result, scoring_config, dataset_version, source_type, expected_status, tags)
+            values
+                (%s, %s, %s, 'customer_marketing', %s, %s, %s, %s,
+                 'synthetic-v1', 'synthetic', %s, %s)
+            on conflict (case_code) do update set
+                question = excluded.question,
+                difficulty = excluded.difficulty,
+                expected_query_plan = excluded.expected_query_plan,
+                expected_sql = excluded.expected_sql,
+                expected_result = excluded.expected_result,
+                scoring_config = excluded.scoring_config,
+                dataset_version = excluded.dataset_version,
+                source_type = excluded.source_type,
+                expected_status = excluded.expected_status,
+                tags = excluded.tags,
+                updated_at = now()
+            """,
+            (
+                case["code"],
+                case["question"],
+                case["difficulty"],
+                Jsonb(case["plan"]),
+                case.get("sql"),
+                expected_result,
+                Jsonb({"result_comparison": "unordered", "numeric_tolerance": 0.01}),
+                expected_status,
+                Jsonb(case["tags"]),
+            ),
+        )
+    print(f"Seeded {len(cases)} deterministic evaluation cases with expected results.")
+
+
 def verify_seed(cur: Cursor[Any]) -> None:
     checks = [
         ("mart.customer_info", "select count(*) from mart.customer_info"),
@@ -1234,6 +1427,7 @@ def main() -> None:
                 print("Reset existing synthetic mart and metadata data.")
             seed_business_data(cur, args.customers, args.days, anchor_date)
             seed_metadata(cur)
+            seed_evaluation_cases(cur)
             verify_seed(cur)
         conn.commit()
 

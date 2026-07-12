@@ -1,5 +1,7 @@
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import perf_counter
+from typing import Any
 from uuid import UUID, uuid4
 
 from app.agents.answer_actor import AnswerActor, AnswerRenderResult
@@ -21,6 +23,8 @@ from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
 from app.services.audit_logger import QueryAuditLogger
 from app.services.sql_executor import SQLExecutionResult, SQLExecutor
+
+EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -53,6 +57,8 @@ class QueryService:
         result_validator: ResultHardValidator | None = None,
         audit_logger: QueryAuditLogger | None = None,
         result_preview_rows: int | None = None,
+        event_sink: EventSink | None = None,
+        event_attempt: int = 0,
     ) -> None:
         self.settings = get_settings()
         self.rule_based_actor = RuleBasedQueryPlanActor()
@@ -83,9 +89,9 @@ class QueryService:
         self.sql_executor = sql_executor or SQLExecutor()
         self.result_validator = result_validator
         self.audit_logger = audit_logger or QueryAuditLogger()
-        self.result_preview_rows = max(
-            1, result_preview_rows or self.settings.result_preview_rows
-        )
+        self.event_sink = event_sink
+        self.event_attempt = max(0, event_attempt)
+        self.result_preview_rows = max(1, result_preview_rows or self.settings.result_preview_rows)
         self.default_sensitive_columns = {
             "phone",
             "mobile",
@@ -97,25 +103,78 @@ class QueryService:
             "address",
         }
 
-    async def run(self, request: QueryRequest) -> QueryResponse:
+    async def run(
+        self,
+        request: QueryRequest,
+        *,
+        query_id: UUID | None = None,
+        start_audit: bool = True,
+        previous_plan: QueryPlan | None = None,
+    ) -> QueryResponse:
         started_at = perf_counter()
-        query_id = uuid4()
-        self.audit_logger.start_query_run(
-            query_id=query_id,
-            question=request.question,
-            user_id=request.user_id,
+        query_id = query_id or uuid4()
+        if start_audit:
+            self.audit_logger.start_query_run(
+                query_id=query_id,
+                question=request.question,
+                user_id=request.user_id,
+            )
+
+        await self._emit(
+            "receive_question",
+            "passed",
+            "已接收业务问题",
+            {"question": request.question},
         )
 
+        await self._emit("retrieve_metadata", "running", "正在检索相关元数据")
         metadata_context = self._load_metadata_context(request.question)
+        await self._emit(
+            "retrieve_metadata",
+            "passed" if metadata_context.get("source") == "database" else "failed",
+            "已完成元数据检索",
+            self._metadata_context_summary(metadata_context),
+        )
+        await self._emit("build_query_plan", "running", "正在生成结构化查询计划")
         build_result = await self.query_plan_actor.build(
             request.question,
+            fallback_plan=previous_plan,
+            previous_plan=previous_plan,
             metadata_context=metadata_context,
         )
+        deterministic_plan = self.rule_based_actor.build(request.question)
+        if (
+            previous_plan is None
+            and deterministic_plan.plan_status == "needs_clarification"
+            and deterministic_plan.clarifications
+            and build_result.plan.plan_status == "ready"
+            and not build_result.plan.metrics
+        ):
+            build_result = QueryPlanBuildResult(
+                plan=deterministic_plan,
+                source="rule_fallback",
+                repair_attempt=build_result.repair_attempt,
+                llm_error=(
+                    "LLM plan omitted the metric required to resolve an ambiguous business term; "
+                    "deterministic clarification policy applied."
+                ),
+                llm_model=build_result.llm_model,
+                llm_provider=build_result.llm_provider,
+            )
         query_plan = build_result.plan
         build_results = [build_result]
+        await self._emit(
+            "build_query_plan",
+            "passed",
+            "查询计划已生成",
+            {
+                "query_plan": query_plan.model_dump(mode="json", exclude_none=True),
+                **self._build_actor_details(build_result, build_results),
+            },
+        )
         metadata_context = self._load_metadata_context(request.question, query_plan)
         review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-            query_plan, metadata_context
+            query_plan, metadata_context, attempt=0
         )
         review_history = [
             self._build_review_details(
@@ -130,6 +189,13 @@ class QueryService:
         while self._should_repair(query_plan, review_bundle, repair_count):
             repair_feedback = self._failed_review_feedback(review_bundle)
             repair_count += 1
+            await self._emit(
+                "repair_query_plan",
+                "running",
+                f"正在进行第 {repair_count} 次查询计划修复",
+                {"feedback": [item.model_dump(mode="json") for item in repair_feedback]},
+                attempt=repair_count,
+            )
             build_result = await self.query_plan_actor.build(
                 request.question,
                 fallback_plan=query_plan,
@@ -140,13 +206,25 @@ class QueryService:
             )
             build_results.append(build_result)
 
+            await self._emit(
+                "repair_query_plan",
+                "passed" if build_result.source == "llm" else "failed",
+                f"第 {repair_count} 次查询计划修复已完成",
+                {
+                    "query_plan": build_result.plan.model_dump(mode="json", exclude_none=True),
+                    "actor_source": build_result.source,
+                    "llm_error": build_result.llm_error,
+                },
+                attempt=repair_count,
+            )
+
             if build_result.source != "llm":
                 break
 
             query_plan = build_result.plan
             metadata_context = self._load_metadata_context(request.question, query_plan)
             review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                query_plan, metadata_context
+                query_plan, metadata_context, attempt=repair_count
             )
             review_history.append(
                 self._build_review_details(
@@ -169,7 +247,7 @@ class QueryService:
             answer = "QueryPlan failed review and needs repair before SQL generation."
         elif query_plan.plan_status == "needs_clarification":
             status = "needs_clarification"
-            answer = "The request needs clarification before SQL generation."
+            answer = "当前问题需要进一步明确后才能生成可靠查询。"
         else:
             sql_loop_result = await self._run_sql_loop(query_id, request.question, query_plan)
             if sql_loop_result.passed:
@@ -182,11 +260,20 @@ class QueryService:
                         question=request.question,
                         query_plan=query_plan,
                         execution_result=sql_loop_result.execution_result,
-                        preview_rows=self._response_preview_rows(
-                            sql_loop_result.execution_result
-                        ),
+                        preview_rows=self._response_preview_rows(sql_loop_result.execution_result),
                     )
                     answer = answer_result.answer
+                    await self._emit(
+                        "render_answer",
+                        "passed",
+                        "已根据查询结果生成回答",
+                        {
+                            "answer": answer,
+                            "result_preview": self._response_preview_rows(
+                                sql_loop_result.execution_result
+                            ),
+                        },
+                    )
             else:
                 status = "failed"
                 answer = sql_loop_result.failure_reason or (
@@ -203,9 +290,7 @@ class QueryService:
             if sql_loop_result is not None and sql_loop_result.result_validation is not None
             else []
         )
-        sql_steps = (
-            self._build_sql_steps(sql_loop_result) if sql_loop_result is not None else []
-        )
+        sql_steps = self._build_sql_steps(sql_loop_result) if sql_loop_result is not None else []
         sql = sql_loop_result.sql if sql_loop_result and sql_loop_result.passed else None
         result_preview = (
             self._response_preview_rows(sql_loop_result.execution_result)
@@ -253,9 +338,7 @@ class QueryService:
                     status="passed" if hard_review_passed else "failed",
                     summary="Ran deterministic QueryPlan hard checks.",
                     details={
-                        "checks": [
-                            check.model_dump() for check in review_bundle.hard_checks
-                        ],
+                        "checks": [check.model_dump() for check in review_bundle.hard_checks],
                         "review_history": review_history,
                     },
                 ),
@@ -301,9 +384,23 @@ class QueryService:
         self,
         query_plan: QueryPlan,
         metadata_context: dict[str, object] | None = None,
+        attempt: int = 0,
     ) -> tuple[ReviewBundle, bool, LLMPlanCriticResult]:
+        await self._emit(
+            "query_plan_hard_review",
+            "running",
+            "正在检查查询计划结构与安全约束",
+            attempt=attempt,
+        )
         review_bundle = self.plan_validator.review(query_plan)
         hard_review_passed = all(check.passed for check in review_bundle.hard_checks)
+        await self._emit(
+            "query_plan_hard_review",
+            "passed" if hard_review_passed else "failed",
+            "查询计划硬规则检查已完成",
+            {"checks": [check.model_dump(mode="json") for check in review_bundle.hard_checks]},
+            attempt=attempt,
+        )
 
         critic_result = LLMPlanCriticResult(
             status="skipped",
@@ -315,6 +412,12 @@ class QueryService:
                 llm_error="Plan status is invalid; semantic critic skipped.",
             )
         elif hard_review_passed:
+            await self._emit(
+                "query_plan_llm_review",
+                "running",
+                "正在核对查询计划是否完整表达业务意图",
+                attempt=attempt,
+            )
             critic_result = await self.plan_critic.review(
                 query_plan,
                 review_bundle.hard_checks,
@@ -323,7 +426,62 @@ class QueryService:
             if critic_result.decision is not None:
                 review_bundle.llm_checks.append(critic_result.decision)
 
+        critic_status = (
+            "passed"
+            if critic_result.decision is not None and critic_result.decision.passed
+            else "skipped"
+            if critic_result.status == "skipped"
+            else "failed"
+        )
+        await self._emit(
+            "query_plan_llm_review",
+            critic_status,
+            "查询计划语义审核已完成",
+            {
+                "decision": critic_result.decision.model_dump(mode="json")
+                if critic_result.decision is not None
+                else None,
+                "llm_error": critic_result.llm_error,
+                "llm_model": critic_result.llm_model,
+                "llm_provider": critic_result.llm_provider,
+            },
+            attempt=attempt,
+        )
+
         return review_bundle, hard_review_passed, critic_result
+
+    async def _emit(
+        self,
+        stage: str,
+        status: str,
+        summary: str,
+        output: dict[str, Any] | None = None,
+        *,
+        attempt: int | None = None,
+        event_type: str | None = None,
+    ) -> None:
+        if self.event_sink is None:
+            return
+        resolved_attempt = self.event_attempt + (attempt or 0)
+        resolved_type = event_type
+        if resolved_type is None:
+            resolved_type = (
+                "stage.started"
+                if status == "running"
+                else "stage.failed"
+                if status == "failed"
+                else "stage.completed"
+            )
+        await self.event_sink(
+            {
+                "type": resolved_type,
+                "stage": stage,
+                "status": status,
+                "attempt": resolved_attempt,
+                "summary": summary,
+                "output": output or {},
+            }
+        )
 
     def _should_repair(
         self,
@@ -353,13 +511,36 @@ class QueryService:
     async def _run_sql_loop(
         self, query_id: UUID, question: str, query_plan: QueryPlan
     ) -> SQLLoopResult:
+        await self._emit("load_schema_context", "running", "正在加载 SQL 生成所需的数据结构")
         metadata_context = self._load_metadata_context(question, query_plan)
+        await self._emit(
+            "load_schema_context",
+            "passed" if metadata_context.get("source") == "database" else "failed",
+            "SQL 数据结构上下文已加载",
+            self._metadata_context_summary(metadata_context),
+        )
+        await self._emit("generate_sql", "running", "正在根据已审核的查询计划生成 SQL")
         build_result = await self.sql_actor.build(
             question=question,
             query_plan=query_plan,
             metadata_context=metadata_context,
         )
         build_results = [build_result]
+        await self._emit(
+            "generate_sql",
+            "passed" if build_result.draft is not None else "failed",
+            "SQL 生成已完成" if build_result.draft is not None else "SQL 生成失败",
+            {
+                "sql": build_result.draft.sql if build_result.draft else None,
+                "tables": build_result.draft.tables if build_result.draft else [],
+                "columns": build_result.draft.columns if build_result.draft else [],
+                "assumptions": build_result.draft.assumptions if build_result.draft else [],
+                "confidence": build_result.draft.confidence if build_result.draft else None,
+                "llm_error": build_result.llm_error,
+                "llm_model": build_result.llm_model,
+                "llm_provider": build_result.llm_provider,
+            },
+        )
 
         if build_result.draft is None:
             review_bundle = ReviewBundle(
@@ -405,7 +586,10 @@ class QueryService:
 
         while True:
             review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-                query_plan, build_result.draft, metadata_context
+                query_plan,
+                build_result.draft,
+                metadata_context,
+                attempt=build_result.repair_attempt,
             )
             review_history.append(
                 self._build_sql_review_details(
@@ -424,6 +608,13 @@ class QueryService:
                 llm_error="Result review skipped before SQL execution.",
             )
             if review_bundle.passed and build_result.draft is not None:
+                await self._emit(
+                    "execute_sql",
+                    "running",
+                    "正在只读事务中执行已审核的 SQL",
+                    {"sql": build_result.draft.sql},
+                    attempt=build_result.repair_attempt,
+                )
                 execution_result = self.sql_executor.execute(build_result.draft.sql)
                 execution_id = self.audit_logger.log_sql_execution(
                     query_id=query_id,
@@ -435,6 +626,44 @@ class QueryService:
                     execution_result=execution_result,
                     metadata_context=metadata_context,
                 )
+                await self._emit(
+                    "execute_sql",
+                    "passed" if execution_result.status == "success" else "failed",
+                    "SQL 执行已完成",
+                    {
+                        "status": execution_result.status,
+                        "row_count": execution_result.row_count,
+                        "columns": execution_result.columns,
+                        "truncated": execution_result.truncated,
+                        "elapsed_ms": execution_result.elapsed_ms,
+                        "error_type": execution_result.error_type,
+                        "error_message": execution_result.error_message,
+                        "result_preview": execution_result.rows[: self.result_preview_rows],
+                    },
+                    attempt=build_result.repair_attempt,
+                )
+                await self._emit(
+                    "result_hard_review",
+                    "passed" if result_hard_validation.passed else "failed",
+                    "查询结果硬规则检查已完成",
+                    {
+                        "score": result_hard_validation.score,
+                        "checks": [
+                            check.model_dump(mode="json") for check in result_hard_validation.checks
+                        ],
+                        "error_type": result_hard_validation.error_type,
+                        "repair_hint": result_hard_validation.repair_hint,
+                    },
+                    attempt=build_result.repair_attempt,
+                )
+                await self._emit(
+                    "result_llm_review",
+                    "running" if result_hard_validation.passed else "skipped",
+                    "正在核对查询结果与用户问题是否一致"
+                    if result_hard_validation.passed
+                    else "结果硬规则未通过，语义审核已跳过",
+                    attempt=build_result.repair_attempt,
+                )
                 result_validation, result_critic_result = await self._review_result(
                     question=question,
                     query_plan=query_plan,
@@ -442,6 +671,21 @@ class QueryService:
                     execution_result=execution_result,
                     hard_validation=result_hard_validation,
                     metadata_context=metadata_context,
+                )
+                result_critic_status = (
+                    "passed"
+                    if result_critic_result.decision is not None
+                    and result_critic_result.decision.passed
+                    else "skipped"
+                    if result_critic_result.status == "skipped"
+                    else "failed"
+                )
+                await self._emit(
+                    "result_llm_review",
+                    result_critic_status,
+                    "查询结果语义审核已完成",
+                    self._result_critic_log_payload(result_critic_result),
+                    attempt=build_result.repair_attempt,
                 )
                 self.audit_logger.log_result_validation(
                     query_id=query_id,
@@ -461,16 +705,19 @@ class QueryService:
                     )
                 )
 
-            if not self._should_repair_sql_attempt(
-                review_bundle, result_validation, repair_count
-            ):
+            if not self._should_repair_sql_attempt(review_bundle, result_validation, repair_count):
                 break
 
-            repair_feedback = self._failed_sql_attempt_feedback(
-                review_bundle, result_validation
-            )
+            repair_feedback = self._failed_sql_attempt_feedback(review_bundle, result_validation)
             previous_sql = build_result.draft.sql
             repair_count += 1
+            await self._emit(
+                "repair_sql",
+                "running",
+                f"正在进行第 {repair_count} 次 SQL 修复",
+                {"feedback": [item.model_dump(mode="json") for item in repair_feedback]},
+                attempt=repair_count,
+            )
             build_result = await self.sql_actor.build(
                 question=question,
                 query_plan=query_plan,
@@ -480,6 +727,18 @@ class QueryService:
                 repair_attempt=repair_count,
             )
             build_results.append(build_result)
+            await self._emit(
+                "repair_sql",
+                "passed" if build_result.draft is not None else "failed",
+                f"第 {repair_count} 次 SQL 修复已完成",
+                {
+                    "sql": build_result.draft.sql if build_result.draft else None,
+                    "llm_error": build_result.llm_error,
+                    "llm_model": build_result.llm_model,
+                    "llm_provider": build_result.llm_provider,
+                },
+                attempt=repair_count,
+            )
 
             if build_result.draft is None:
                 review_bundle = ReviewBundle(
@@ -544,22 +803,39 @@ class QueryService:
         query_plan: QueryPlan,
         sql_draft: SQLDraft,
         metadata_context: dict[str, object],
+        attempt: int = 0,
     ) -> tuple[ReviewBundle, bool, LLMSQLCriticResult]:
-        guardrail_findings = self._build_sql_guardrail(metadata_context).validate(
-            sql_draft.sql
+        await self._emit(
+            "sql_hard_review",
+            "running",
+            "正在检查 SQL 安全性、表字段和结果行数限制",
+            attempt=attempt,
         )
+        guardrail_findings = self._build_sql_guardrail(metadata_context).validate(sql_draft.sql)
         hard_checks = [
-            self._guardrail_finding_to_review_decision(finding)
-            for finding in guardrail_findings
+            self._guardrail_finding_to_review_decision(finding) for finding in guardrail_findings
         ]
         review_bundle = ReviewBundle(hard_checks=hard_checks)
         hard_review_passed = all(check.passed for check in hard_checks)
+        await self._emit(
+            "sql_hard_review",
+            "passed" if hard_review_passed else "failed",
+            "SQL 硬规则检查已完成",
+            {"checks": [check.model_dump(mode="json") for check in hard_checks]},
+            attempt=attempt,
+        )
 
         critic_result = LLMSQLCriticResult(
             status="failed",
             llm_error="Hard SQL review failed; SQLCritic skipped.",
         )
         if hard_review_passed:
+            await self._emit(
+                "sql_llm_review",
+                "running",
+                "正在核对 SQL 是否完整实现查询计划",
+                attempt=attempt,
+            )
             critic_result = await self.sql_critic.review(
                 query_plan=query_plan,
                 sql_draft=sql_draft,
@@ -569,9 +845,29 @@ class QueryService:
                 decision = self._enforce_sql_critic_confidence(critic_result.decision)
                 review_bundle.llm_checks.append(decision)
             else:
-                review_bundle.llm_checks.append(
-                    self._sql_critic_failure_decision(critic_result)
-                )
+                review_bundle.llm_checks.append(self._sql_critic_failure_decision(critic_result))
+
+        critic_status = (
+            "passed"
+            if critic_result.decision is not None and critic_result.decision.passed
+            else "skipped"
+            if not hard_review_passed
+            else "failed"
+        )
+        await self._emit(
+            "sql_llm_review",
+            critic_status,
+            "SQL 语义审核已完成",
+            {
+                "decision": critic_result.decision.model_dump(mode="json")
+                if critic_result.decision is not None
+                else None,
+                "llm_error": critic_result.llm_error,
+                "llm_model": critic_result.llm_model,
+                "llm_provider": critic_result.llm_provider,
+            },
+            attempt=attempt,
+        )
 
         return review_bundle, hard_review_passed, critic_result
 
@@ -637,9 +933,7 @@ class QueryService:
             repair_hint=failed_check.repair_hint if failed_check else None,
         )
 
-    def _result_critic_failure_decision(
-        self, result: LLMResultCriticResult
-    ) -> ReviewDecision:
+    def _result_critic_failure_decision(self, result: LLMResultCriticResult) -> ReviewDecision:
         return ReviewDecision(
             passed=False,
             score=0,
@@ -651,9 +945,7 @@ class QueryService:
             confidence=1.0,
         )
 
-    def _enforce_result_critic_confidence(
-        self, decision: ReviewDecision
-    ) -> ReviewDecision:
+    def _enforce_result_critic_confidence(self, decision: ReviewDecision) -> ReviewDecision:
         if decision.passed and decision.confidence < 0.7:
             return decision.model_copy(
                 update={
@@ -668,9 +960,7 @@ class QueryService:
             )
         return decision
 
-    def _result_critic_log_payload(
-        self, result: LLMResultCriticResult | None
-    ) -> dict[str, object]:
+    def _result_critic_log_payload(self, result: LLMResultCriticResult | None) -> dict[str, object]:
         if result is None:
             return {}
         return {
@@ -780,9 +1070,7 @@ class QueryService:
             return result_validation.repair_hint or "SQL result failed hard validation."
         return None
 
-    def _guardrail_finding_to_review_decision(
-        self, finding: GuardrailFinding
-    ) -> ReviewDecision:
+    def _guardrail_finding_to_review_decision(self, finding: GuardrailFinding) -> ReviewDecision:
         return ReviewDecision(
             passed=finding.passed,
             score=100 if finding.passed else 0,
@@ -873,9 +1161,7 @@ class QueryService:
                 status="passed" if result.hard_review_passed else "failed",
                 summary="Ran deterministic SQL hard guardrail checks.",
                 details={
-                    "checks": [
-                        check.model_dump() for check in result.review_bundle.hard_checks
-                    ],
+                    "checks": [check.model_dump() for check in result.review_bundle.hard_checks],
                     "review_history": result.review_history,
                 },
             ),
@@ -913,9 +1199,7 @@ class QueryService:
             ],
         }
 
-    def _metadata_context_summary(
-        self, metadata_context: dict[str, object]
-    ) -> dict[str, object]:
+    def _metadata_context_summary(self, metadata_context: dict[str, object]) -> dict[str, object]:
         table_allowlist = self._string_list(metadata_context.get("table_allowlist"))
         metrics = metadata_context.get("metrics")
         metric_codes = []
@@ -974,9 +1258,7 @@ class QueryService:
         return {
             "repair_attempt": repair_attempt,
             "hard_review_passed": hard_review_passed,
-            "hard_checks": [
-                check.model_dump() for check in review_bundle.hard_checks
-            ],
+            "hard_checks": [check.model_dump() for check in review_bundle.hard_checks],
             "llm_decision": critic_result.decision.model_dump()
             if critic_result and critic_result.decision is not None
             else None,
@@ -1055,9 +1337,7 @@ class QueryService:
                 "score": result.result_hard_validation.score,
                 "error_type": result.result_hard_validation.error_type,
                 "repair_hint": result.result_hard_validation.repair_hint,
-                "checks": [
-                    check.model_dump() for check in result.result_hard_validation.checks
-                ],
+                "checks": [check.model_dump() for check in result.result_hard_validation.checks],
             },
         )
 
@@ -1132,8 +1412,7 @@ class QueryService:
             if result_critic_result is not None
             else None,
             "result_critic_passed": result_critic_result.decision.passed
-            if result_critic_result is not None
-            and result_critic_result.decision is not None
+            if result_critic_result is not None and result_critic_result.decision is not None
             else None,
             "result_validation_passed": result_validation.passed,
             "result_validation_error_type": result_validation.error_type,
@@ -1202,9 +1481,7 @@ class QueryService:
         return {
             "repair_attempt": repair_attempt,
             "hard_review_passed": hard_review_passed,
-            "hard_checks": [
-                check.model_dump() for check in review_bundle.hard_checks
-            ],
+            "hard_checks": [check.model_dump() for check in review_bundle.hard_checks],
             "llm_decision": critic_result.decision.model_dump()
             if critic_result.decision is not None
             else None,

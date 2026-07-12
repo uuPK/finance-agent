@@ -137,3 +137,148 @@ export interface QueryResponse {
   retry_count: number;
   elapsed_ms: number;
 }
+
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "needs_clarification"
+  | "interrupted";
+
+export interface QueryEvent {
+  event_id: number;
+  query_id: string;
+  type: string;
+  stage: string;
+  status: AgentStep["status"];
+  attempt: number;
+  summary: string;
+  output: Record<string, unknown>;
+  occurred_at: string;
+}
+
+export interface QueryRunSnapshot {
+  query_id: string;
+  user_id?: string;
+  question: string;
+  status: RunStatus;
+  current_stage?: string;
+  retry_count: number;
+  elapsed_ms?: number;
+  error_type?: string;
+  error_message?: string;
+  clarification_context: Record<string, unknown>;
+  response?: QueryResponse;
+  events: QueryEvent[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface QueryRunList {
+  items: QueryRunSnapshot[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export type QueryExportFormat = "xlsx" | "csv" | "json";
+
+export type EvaluationDifficulty = "simple" | "medium" | "complex";
+
+export interface EvaluationRunSummary {
+  eval_run_id: string;
+  run_name: string;
+  status: string;
+  total_cases: number;
+  passed_cases: number;
+  review_queued_cases: number;
+  average_elapsed_ms?: number;
+  dataset_version?: string;
+  started_at: string;
+  finished_at?: string;
+}
+
+export interface EvaluationResultSummary {
+  eval_result_id: string;
+  case_id: string;
+  case_code: string;
+  question: string;
+  difficulty: EvaluationDifficulty;
+  expected_status: string;
+  passed: boolean;
+  executable: boolean;
+  result_correct?: boolean;
+  plan_score?: number;
+  sql_score?: number;
+  result_score?: number;
+  elapsed_ms?: number;
+  failure_type?: string;
+  failure_reason?: string;
+  auto_decision: string;
+  review_priority?: string;
+  review_status: string;
+  risk_reasons: string[];
+}
+
+export interface EvaluationRunDetail extends EvaluationRunSummary {
+  results: EvaluationResultSummary[];
+}
+
+export interface EvaluationDashboard {
+  total_cases: number;
+  active_cases: number;
+  executable_rate: number;
+  result_accuracy: number;
+  first_pass_rate: number;
+  repaired_pass_rate: number;
+  average_elapsed_ms?: number;
+  pending_review_count: number;
+  reviewed_count: number;
+  latest_run?: EvaluationRunSummary;
+}
+
+export interface ReviewBatchSummary {
+  review_batch_id: string;
+  batch_name: string;
+  status: string;
+  item_count: number;
+  dataset_version?: string;
+  created_at: string;
+}
+
+export interface ReviewItemDetail {
+  review_item_id: string;
+  review_batch_id: string;
+  status: string;
+  priority: string;
+  risk_reasons: string[];
+  case_code: string;
+  question: string;
+  difficulty: EvaluationDifficulty;
+  expected_status: string;
+  expected_query_plan: Record<string, unknown>;
+  expected_sql?: string;
+  expected_result: Record<string, unknown>;
+  generated_query_plan: Record<string, unknown>;
+  generated_sql?: string;
+  generated_response: Record<string, unknown>;
+  auto_decision: string;
+  failure_type?: string;
+  failure_reason?: string;
+  elapsed_ms?: number;
+}
+
+export interface ReviewDecisionPayload {
+  review_item_id: string;
+  reviewer_id: string;
+  verdict: "correct" | "incorrect" | "needs_clarification" | "insufficient_data";
+  error_class?: string;
+  severity: "minor" | "major" | "blocking";
+  corrected_query_plan?: Record<string, unknown>;
+  corrected_sql?: string;
+  corrected_result?: Record<string, unknown>;
+  reviewer_note?: string;
+  confidence?: number;
+  source_checksum?: string;
+}

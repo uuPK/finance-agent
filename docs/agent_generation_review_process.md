@@ -752,3 +752,33 @@ Development should proceed in this order:
 9. Clarification Agent
 10. Evaluation runner
 11. Frontend review-process display
+
+## 12. Real-Time Process Display
+
+The frontend review-process display uses an asynchronous query run and an SSE event stream.
+
+```text
+POST query run
+  -> return query_id immediately
+  -> execute QueryService in background
+  -> persist each event
+  -> publish event over SSE
+  -> restore persisted events after reconnect
+```
+
+Each stage publishes a running event and a terminal event. The terminal event includes only
+the structured artifact needed to explain the stage, such as retrieved metadata, QueryPlan,
+review evidence, SQL, execution summary, result preview, or repair hint.
+
+The event stream must never expose:
+
+- API keys or authorization headers.
+- Database connection strings.
+- Raw system or user prompts.
+- Hidden model reasoning.
+- Unmasked sensitive customer fields.
+
+When clarification is required, the stream ends with `clarification.required`. The frontend
+collects the user's answer and submits it against the same `query_id`. The original question,
+approved parts of the previous QueryPlan, clarification answers, and prior event history are
+retained when execution resumes.

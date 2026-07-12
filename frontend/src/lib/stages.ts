@@ -1,0 +1,21 @@
+export const stageLabels: Record<string, string> = {
+  receive_question: "接收问题",
+  retrieve_metadata: "检索元数据",
+  build_query_plan: "生成查询计划",
+  query_plan_hard_review: "计划硬规则检查",
+  query_plan_llm_review: "计划语义审核",
+  repair_query_plan: "修复查询计划",
+  load_schema_context: "加载数据结构",
+  generate_sql: "生成 SQL",
+  sql_hard_review: "SQL 硬规则检查",
+  sql_llm_review: "SQL 语义审核",
+  repair_sql: "修复 SQL",
+  execute_sql: "执行 SQL",
+  result_hard_review: "结果硬规则检查",
+  result_llm_review: "结果语义审核",
+  render_answer: "生成回答",
+  clarification: "补充业务口径",
+  clarification_received: "已接收补充信息",
+  final_response: "最终结果",
+  runtime: "运行状态"
+};

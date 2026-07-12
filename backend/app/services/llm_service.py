@@ -15,6 +15,7 @@ class LLMService:
             "base_url": self.settings.llm_base_url,
             "timeout_seconds": self.settings.llm_timeout_seconds,
             "api_key_configured": bool(self.settings.active_llm_api_key),
+            "proxy_configured": bool(self.settings.llm_proxy_url),
         }
 
     async def complete(
