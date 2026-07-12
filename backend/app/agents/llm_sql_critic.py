@@ -144,13 +144,13 @@ _SQL_CRITIC_SYSTEM_PROMPT = dedent(
     - 0-49：安全失败、SQL 与 QueryPlan 不一致、错误粒度，passed=false。
 
     正例：
-    QueryPlan 要求 current_total_asset > 500000、trade_count_3m > 3、last_3_months、
+    QueryPlan 要求 current_total_asset > 500000、trade_count_90d > 3、last_90_days、
     customer 粒度。SQL 包含资产 WHERE、交易日期 WHERE、GROUP BY customer_id、
     HAVING COUNT(trade_id) > 3、LIMIT。
     应输出 passed=true，evidence 包含 filters_covered、time_window_covered、grain_covered。
 
     反例：
-    QueryPlan 要求 trade_count_3m > 3，但 SQL 统计所有历史交易，没有 trade_date 条件。
+    QueryPlan 要求 trade_count_90d > 3，但 SQL 统计所有历史交易，没有 trade_date 条件。
     应输出：
     {
       "passed": false,
@@ -158,7 +158,7 @@ _SQL_CRITIC_SYSTEM_PROMPT = dedent(
       "stage": "sql_review",
       "error_type": "missing_time_filter",
       "reason": "SQL 未实现 QueryPlan 要求的近三个月交易窗口。",
-      "evidence": ["QueryPlan metric: trade_count_3m", "SQL has no trade_date time filter"],
+      "evidence": ["QueryPlan metric: trade_count_90d", "SQL has no trade_date time filter"],
       "repair_hint": "为交易表增加近三个月时间条件，例如 trade_date >= CURRENT_DATE - INTERVAL '3 months'。",
       "clarification_questions": [],
       "confidence": 0.9

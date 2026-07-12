@@ -1,0 +1,28 @@
+{
+  "dataset_version": "competition-v1",
+  "source_type": "competition",
+  "anchor_date": "2026-06-30",
+  "tables": [
+    {
+      "source_file": "customer_info.csv",
+      "target_table": "mart.customer_info",
+      "columns": {
+        "customer_no": "customer_no",
+        "customer_level": "customer_level",
+        "risk_level": "risk_level",
+        "customer_status": "customer_status"
+      },
+      "required_source_columns": ["customer_no", "customer_level", "customer_status"]
+    },
+    {
+      "source_file": "customer_asset_daily.csv",
+      "target_table": "mart.customer_asset_daily",
+      "columns": {
+        "customer_id": "customer_id",
+        "as_of_date": "as_of_date",
+        "total_asset": "total_asset"
+      },
+      "required_source_columns": ["customer_id", "as_of_date", "total_asset"]
+    }
+  ]
+}

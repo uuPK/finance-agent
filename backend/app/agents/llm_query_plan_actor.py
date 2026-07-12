@@ -262,7 +262,7 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
           "term": "交易次数",
           "operator": ">",
           "value": {"raw": 3, "normalized": 3, "value_type": "number"},
-          "metric_code": "trade_count_3m",
+          "metric_code": "trade_count_90d",
           "source": "user",
           "is_resolved": true
         },

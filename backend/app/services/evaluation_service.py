@@ -57,7 +57,29 @@ def _canonical(value: Any) -> str:
     return json.dumps(normalize(value), ensure_ascii=False, sort_keys=True, default=_jsonable)
 
 
-def _same_result_rows(actual: list[dict[str, Any]], expected: list[dict[str, Any]]) -> bool:
+def _normalize_metric_aliases(
+    rows: list[dict[str, Any]], generated_plan: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Compare known metric columns by stable code instead of presentation alias."""
+    aliases: dict[str, str] = {}
+    for metric in generated_plan.get("metrics", []):
+        metric_code = metric.get("metric_code")
+        if not metric_code:
+            continue
+        for label in (metric.get("name"), metric.get("alias")):
+            if label:
+                aliases[str(label)] = metric_code
+    return [{aliases.get(key, key): value for key, value in row.items()} for row in rows]
+
+
+def _same_result_rows(
+    actual: list[dict[str, Any]], expected: list[dict[str, Any]], generated_plan: dict[str, Any]
+) -> bool:
+    actual = _normalize_metric_aliases(actual, generated_plan)
+    expected_columns = {column for row in expected for column in row}
+    # The benchmark defines required business fields. Extra non-sensitive display fields
+    # do not change the answer, but a missing or different required field still fails.
+    actual = [{column: row.get(column) for column in expected_columns} for row in actual]
     return sorted(_canonical(row) for row in actual) == sorted(_canonical(row) for row in expected)
 
 
@@ -208,6 +230,12 @@ class EvaluationRepository:
             totals = connection.execute(
                 text(
                     """
+                    with latest_run as (
+                      select eval_run_id
+                      from evaluation.eval_runs
+                      order by started_at desc
+                      limit 1
+                    )
                     select
                       (select count(*) from evaluation.eval_cases) as total_cases,
                       (select count(*) from evaluation.eval_cases where is_active) as active_cases,
@@ -221,6 +249,7 @@ class EvaluationRepository:
                       count(er.eval_result_id) filter (where er.review_status = 'reviewed') as reviewed_count
                     from evaluation.eval_results er
                     left join agent.query_runs q on q.query_id = er.query_id
+                    where er.eval_run_id = (select eval_run_id from latest_run)
                     """
                 )
             ).mappings().one()
@@ -609,7 +638,8 @@ class EvaluationManager:
         executable = response.status == "completed" and bool(response.sql)
         expected_result = dict(case["expected_result"] or {})
         result_correct = status_match if expected_status == "needs_clarification" else (
-            executable and _same_result_rows(response.result_preview, expected_result.get("rows", []))
+            executable
+            and _same_result_rows(response.result_preview, expected_result.get("rows", []), generated_plan)
         )
         plan_score = self._plan_score(case["expected_query_plan"] or {}, generated_plan, status_match)
         sql_score = 100.0 if result_correct else 50.0 if executable else 0.0

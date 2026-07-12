@@ -1,5 +1,5 @@
 from app.schemas.query import QueryResponse
-from app.schemas.query_plan import ClarificationQuestion, QueryPlan
+from app.schemas.query_plan import ClarificationQuestion, QueryMetric, QueryPlan
 from app.services.evaluation_service import EvaluationManager
 
 
@@ -32,6 +32,59 @@ def test_completed_case_scores_result_by_unordered_business_rows() -> None:
     assert scored["passed"] is True
     assert scored["result_score"] == 100.0
     assert scored["review_status"] == "not_required"
+
+
+def test_completed_case_matches_metric_code_when_presentation_alias_differs() -> None:
+    manager = EvaluationManager()
+    case = {
+        "expected_status": "completed",
+        "expected_query_plan": {"metrics": ["customer_count"]},
+        "expected_result": {"rows": [{"customer_count": 500}]},
+        "difficulty": "simple",
+    }
+    response = QueryResponse(
+        status="completed",
+        answer="ok",
+        sql="select count(*) as display_count from benchmark limit 1",
+        query_plan=QueryPlan(
+            plan_status="ready",
+            confidence=0.9,
+            metrics=[
+                QueryMetric(
+                    name="display_count",
+                    alias="display_count",
+                    metric_code="customer_count",
+                )
+            ],
+        ),
+        result_preview=[{"display_count": 500}],
+    )
+
+    scored = manager._score(case, response, None, 12)
+
+    assert scored["passed"] is True
+    assert scored["result_correct"] is True
+
+
+def test_completed_case_allows_extra_display_fields_but_requires_expected_fields() -> None:
+    manager = EvaluationManager()
+    case = {
+        "expected_status": "completed",
+        "expected_query_plan": {},
+        "expected_result": {"rows": [{"customer_no": "C001", "customer_count": 8}]},
+        "difficulty": "simple",
+    }
+    response = QueryResponse(
+        status="completed",
+        answer="ok",
+        sql="select customer_no, customer_count, customer_level from benchmark limit 1",
+        query_plan=QueryPlan(plan_status="ready", confidence=0.9),
+        result_preview=[{"customer_no": "C001", "customer_count": 8, "customer_level": "gold"}],
+    )
+
+    scored = manager._score(case, response, None, 12)
+
+    assert scored["passed"] is True
 
 
 def test_clarification_case_requires_the_expected_terminal_state() -> None:

@@ -91,12 +91,12 @@ class RuleBasedQueryPlanActor:
             metrics.append(
                 QueryMetric(
                     name="近三个月交易次数" if time_range else "交易次数",
-                    metric_code="trade_count_3m" if time_range else "trade_count",
-                    definition_id="metric:trade_count_3m" if time_range else None,
+                    metric_code="trade_count_90d" if time_range else "trade_count",
+                    definition_id="metric:trade_count_90d" if time_range else None,
                     aggregation="count",
                     alias="交易次数",
                     time_window=time_range,
-                    metadata_ref=self._metric_ref("trade_count_3m", "近三个月交易次数")
+                    metadata_ref=self._metric_ref("trade_count_90d", "近90天交易次数")
                     if time_range
                     else None,
                     is_resolved=time_range is not None,
@@ -121,12 +121,12 @@ class RuleBasedQueryPlanActor:
             metrics.append(
                 QueryMetric(
                     name="近三个月资产净流入" if time_range else "资产净流入",
-                    metric_code="net_asset_inflow_3m" if time_range else "net_asset_inflow",
-                    definition_id="metric:net_asset_inflow_3m" if time_range else None,
+                    metric_code="net_asset_inflow_90d" if time_range else "net_asset_inflow",
+                    definition_id="metric:net_asset_inflow_90d" if time_range else None,
                     aggregation="sum",
                     alias="资产净流入",
                     time_window=time_range,
-                    metadata_ref=self._metric_ref("net_asset_inflow_3m", "近三个月资产净流入")
+                    metadata_ref=self._metric_ref("net_asset_inflow_90d", "近90天资产净流入")
                     if time_range
                     else None,
                     is_resolved=time_range is not None,
@@ -138,11 +138,11 @@ class RuleBasedQueryPlanActor:
             metrics.append(
                 QueryMetric(
                     name="基金持仓",
-                    metric_code="fund_holding",
-                    definition_id="metric:fund_holding",
+                    metric_code="fund_holding_amount",
+                    definition_id="metric:fund_holding_amount",
                     aggregation="latest",
                     alias="基金持仓",
-                    metadata_ref=self._metric_ref("fund_holding", "基金持仓"),
+                    metadata_ref=self._metric_ref("fund_holding_amount", "基金持仓金额"),
                     is_resolved=True,
                 )
             )
@@ -194,7 +194,7 @@ class RuleBasedQueryPlanActor:
                         normalized=trade_count_threshold,
                         value_type="number",
                     ),
-                    metric_code="trade_count_3m" if time_range else "trade_count",
+                    metric_code="trade_count_90d" if time_range else "trade_count",
                     source="user",
                     is_resolved=time_range is not None,
                     requires_clarification=time_range is None,
@@ -207,9 +207,9 @@ class RuleBasedQueryPlanActor:
                     term="基金持仓",
                     operator="not_exists",
                     value=QueryValue(raw="未持有基金", normalized=False, value_type="boolean"),
-                    metric_code="fund_holding",
+                    metric_code="fund_holding_amount",
                     source="user",
-                    metadata_ref=self._metric_ref("fund_holding", "基金持仓"),
+                    metadata_ref=self._metric_ref("fund_holding_amount", "基金持仓金额"),
                     is_resolved=True,
                 )
             )
@@ -307,15 +307,15 @@ class RuleBasedQueryPlanActor:
         filter_codes = {query_filter.metric_code for query_filter in filters}
         all_codes = metric_codes | filter_codes
 
-        if {"current_total_asset", "net_asset_inflow_3m", "net_asset_inflow"} & all_codes:
+        if {"current_total_asset", "net_asset_inflow_90d", "net_asset_inflow"} & all_codes:
             domains.add("asset")
-            candidate_tables.add("customer_asset")
-        if {"trade_count_3m", "trade_count"} & all_codes:
+            candidate_tables.add("customer_current_asset")
+        if {"trade_count_90d", "trade_count"} & all_codes:
             domains.add("trade")
-            candidate_tables.add("customer_trade")
-        if "fund_holding" in all_codes:
+            candidate_tables.add("customer_trade_90d")
+        if "fund_holding_amount" in all_codes:
             domains.add("holding")
-            candidate_tables.add("customer_position")
+            candidate_tables.add("customer_position_daily")
 
         return DataRequirement(
             domains=sorted(domains),

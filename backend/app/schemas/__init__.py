@@ -12,6 +12,16 @@ from app.schemas.evaluation import (
     ReviewImportResult,
     ReviewItemDetail,
 )
+from app.schemas.metadata import (
+    MetadataBusinessTerm,
+    MetadataColumn,
+    MetadataJoin,
+    MetadataMetric,
+    MetadataOverview,
+    MetadataQuestionExample,
+    MetadataTable,
+    MetadataTableDetail,
+)
 
 __all__ = [
     "EvaluationDashboard",
@@ -25,4 +35,12 @@ __all__ = [
     "ReviewImportRequest",
     "ReviewImportResult",
     "ReviewItemDetail",
+    "MetadataBusinessTerm",
+    "MetadataColumn",
+    "MetadataJoin",
+    "MetadataMetric",
+    "MetadataOverview",
+    "MetadataQuestionExample",
+    "MetadataTable",
+    "MetadataTableDetail",
 ]

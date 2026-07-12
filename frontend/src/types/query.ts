@@ -184,6 +184,82 @@ export interface QueryRunList {
 
 export type QueryExportFormat = "xlsx" | "csv" | "json";
 
+export interface MetadataOverview {
+  table_count: number;
+  column_count: number;
+  metric_count: number;
+  term_count: number;
+  join_count: number;
+  example_count: number;
+}
+
+export interface MetadataColumn {
+  schema_name: string;
+  table_name: string;
+  column_name: string;
+  display_name: string;
+  data_type: string;
+  description: string;
+  semantic_type?: string;
+  is_dimension: boolean;
+  is_metric_source: boolean;
+  is_sensitive: boolean;
+}
+
+export interface MetadataTable {
+  schema_name: string;
+  table_name: string;
+  display_name: string;
+  domain: string;
+  description: string;
+  grain?: string;
+  refresh_frequency?: string;
+  column_count: number;
+}
+
+export interface MetadataTableDetail extends MetadataTable {
+  columns: MetadataColumn[];
+}
+
+export interface MetadataMetric {
+  metric_code: string;
+  metric_name: string;
+  description: string;
+  formula: string;
+  default_aggregation?: string;
+  grain?: string;
+  source_tables: string[];
+  required_filters: Array<Record<string, unknown>>;
+}
+
+export interface MetadataBusinessTerm {
+  term: string;
+  definition: string;
+  synonyms: string[];
+  default_plan_fragment: Record<string, unknown>;
+  clarification_required: boolean;
+}
+
+export interface MetadataJoin {
+  left_schema: string;
+  left_table: string;
+  left_column: string;
+  right_schema: string;
+  right_table: string;
+  right_column: string;
+  relationship_type: string;
+  description: string;
+}
+
+export interface MetadataQuestionExample {
+  question: string;
+  difficulty: string;
+  scenario: string;
+  expected_query_plan: Record<string, unknown>;
+  expected_sql?: string;
+  tags: string[];
+}
+
 export type EvaluationDifficulty = "simple" | "medium" | "complex";
 
 export interface EvaluationRunSummary {

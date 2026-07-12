@@ -224,7 +224,7 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
 
     正例 2：
     用户问“查询近三个月交易次数超过3次且当前资产大于50万的客户列表”，计划包含
-    trade_count_3m > 3、current_total_asset > 500000、grain=customer。
+    trade_count_90d > 3、current_total_asset > 500000、grain=customer。
     审核应 passed=true，evidence 包含 explicit_filters_preserved。
 
     反例 2：

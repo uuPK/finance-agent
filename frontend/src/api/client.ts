@@ -8,6 +8,13 @@ import type {
   QueryResponse,
   QueryRunList,
   QueryRunSnapshot,
+  MetadataBusinessTerm,
+  MetadataJoin,
+  MetadataMetric,
+  MetadataOverview,
+  MetadataQuestionExample,
+  MetadataTable,
+  MetadataTableDetail,
   ReviewBatchSummary,
   ReviewDecisionPayload,
   ReviewItemDetail
@@ -92,6 +99,37 @@ export async function downloadQueryExport(
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+export async function getMetadataOverview(): Promise<MetadataOverview> {
+  return parseResponse(await fetch("/api/metadata/overview"));
+}
+
+export async function listMetadataTables(search = ""): Promise<MetadataTable[]> {
+  const suffix = search ? `?search=${encodeURIComponent(search)}` : "";
+  return parseResponse(await fetch(`/api/metadata/tables${suffix}`));
+}
+
+export async function getMetadataTable(tableName: string): Promise<MetadataTableDetail> {
+  return parseResponse(await fetch(`/api/metadata/tables/${encodeURIComponent(tableName)}`));
+}
+
+export async function listMetadataMetrics(search = ""): Promise<MetadataMetric[]> {
+  const suffix = search ? `?search=${encodeURIComponent(search)}` : "";
+  return parseResponse(await fetch(`/api/metadata/metrics${suffix}`));
+}
+
+export async function listMetadataTerms(search = ""): Promise<MetadataBusinessTerm[]> {
+  const suffix = search ? `?search=${encodeURIComponent(search)}` : "";
+  return parseResponse(await fetch(`/api/metadata/terms${suffix}`));
+}
+
+export async function listMetadataJoins(): Promise<MetadataJoin[]> {
+  return parseResponse(await fetch("/api/metadata/joins"));
+}
+
+export async function listMetadataExamples(): Promise<MetadataQuestionExample[]> {
+  return parseResponse(await fetch("/api/metadata/examples"));
 }
 
 const eventTypes = [

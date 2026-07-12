@@ -101,6 +101,17 @@ JSONL 导入项格式如下：
 
 业务数据、元数据与评测案例采用分层设计：业务事实表位于 `mart`，语义定义位于 `metadata`，运行审计位于 `agent`，基准案例与人工决策位于 `evaluation`。每条评测案例和评测批次均保留数据集版本、来源类型与标准结果；新增数据可通过字段映射、质量校验和版本登记接入，而工作台和审核链路保持使用统一的业务视图与元数据接口。
 
+### 元数据中心与数据集接入
+
+元数据中心提供可检索的表、字段、指标、业务术语、受控关联关系和问法样例，并直接读取 `metadata` 目录作为 Agent 生成、审核和业务调试的共同证据源。页面支持按表、指标和术语检索，点击表可查看字段语义、粒度和敏感标记。
+
+外部数据集通过版本化 CSV 映射清单接入。清单以“`mart` 目标字段 -> 外部 CSV 源字段”声明字段对应关系，校验器会在装载前检查文件存在性、CSV 表头、必填字段和重复目标表，隔离映射问题。模板位于 `data/sample/competition_dataset_manifest.example.json`，接入说明见 `docs/dataset_integration.md`：
+
+```powershell
+cd backend
+uv run python db/validate_dataset_manifest.py --manifest ../data/sample/competition_dataset_manifest.example.json
+```
+
 合成基准数据使用固定随机种子与锚点日期生成，确保同一配置可重复得到相同的业务事实和标准答案。`backend/db/seed_synthetic_data.py` 同时生成业务数据、元数据和评测案例，是本地演示、回归调试和端到端验证的统一入口。
 
 ## 架构概览
@@ -187,6 +198,9 @@ npm run dev -- --host 127.0.0.1 --port 5173
 | `GET /api/chat/runs/{query_id}` | 恢复查询快照与事件历史 |
 | `POST /api/chat/runs/{query_id}/clarifications` | 提交澄清信息并续跑原查询 |
 | `GET /api/chat/runs/{query_id}/export` | 将完整查询结果导出为 Excel、CSV 或 JSON |
+| `GET /api/metadata/overview` | 获取元数据中心的表、字段、指标、术语、关联和样例统计 |
+| `GET /api/metadata/tables` | 检索业务表目录；`GET /api/metadata/tables/{name}` 返回字段详情 |
+| `GET /api/metadata/metrics`、`/terms`、`/joins`、`/examples` | 获取指标口径、业务术语、受控关联和高质量问法样例 |
 | `POST /api/evaluation/runs` | 创建异步评测批次 |
 | `GET /api/evaluation/dashboard` | 获取评测核心指标与人工复核统计 |
 | `GET /api/evaluation/runs/{eval_run_id}` | 获取案例级评分与风险路由结果 |
