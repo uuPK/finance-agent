@@ -42,10 +42,12 @@ class SchemaContextProvider:
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
         examples = self._load_question_examples(connection)
+        reference_date = self._load_reference_date(connection)
         retrieval = MetadataRetriever(connection).retrieve(
             question=question, query_plan=query_plan
         )
         selected_table_names = set(retrieval.table_names)
+        selected_table_names.update(self._required_semantic_tables(question, query_plan))
         selected_metric_codes = set(retrieval.metric_codes)
         selected_terms = set(retrieval.business_terms)
         selected_examples = {
@@ -154,6 +156,9 @@ class SchemaContextProvider:
             "table_allowlist": sorted(table_allowlist),
             "sensitive_columns": sorted(sensitive_columns),
             "allowed_columns_by_table": allowed_columns_by_table,
+            "semantic_contract": self._semantic_contract(
+                table_allowlist, selected_metrics, sensitive_columns, reference_date
+            ),
             "notes": [
                 "Use only retrieved tables/views and columns listed in this context.",
                 "The retrieval field explains why this metadata context was selected.",
@@ -162,6 +167,23 @@ class SchemaContextProvider:
                 "Prefer mart.customer_net_flow_90d for recent net-flow queries.",
             ],
         }
+
+    @staticmethod
+    def _required_semantic_tables(
+        question: str | None, query_plan: QueryPlan | None
+    ) -> set[str]:
+        """Add the verified physical grain required by unambiguous business semantics."""
+        if query_plan is None:
+            return set()
+
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        dimension_codes = {dimension.dimension_code for dimension in query_plan.dimensions}
+        required: set[str] = set()
+        if "product_type" in dimension_codes and "trade_amount_90d" in metric_codes:
+            required.update({"customer_trade", "product_info"})
+        if question and "净流出" in question:
+            required.update({"customer_info", "customer_net_flow_90d"})
+        return required
 
     def _load_physical_tables(self, connection: Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
@@ -294,7 +316,7 @@ class SchemaContextProvider:
         rows = self._safe_metadata_rows(
             connection,
             """
-            select question, difficulty, expected_sql, tags
+            select question, difficulty, expected_query_plan, expected_sql, tags
             from metadata.question_examples
             where is_active = true
             order by id
@@ -302,6 +324,84 @@ class SchemaContextProvider:
             """,
         )
         return [dict(row) for row in rows]
+
+    def _load_reference_date(self, connection: Connection) -> str | None:
+        row = connection.execute(
+            text("select max(as_of_date)::text as reference_date from mart.customer_asset_daily")
+        ).mappings().first()
+        return row["reference_date"] if row and row["reference_date"] else None
+
+    @staticmethod
+    def _semantic_contract(
+        table_allowlist: set[str],
+        metrics: list[dict[str, Any]],
+        sensitive_columns: set[str],
+        reference_date: str | None,
+    ) -> dict[str, Any]:
+        """Explicit execution rules that prevent an LLM from guessing table semantics."""
+        rules: list[str] = []
+        if "customer_trade_90d" in table_allowlist:
+            rules.append(
+                "customer_trade_90d is already aggregated by customer for the latest 90-day "
+                "window; "
+                "do not add a raw trade_date filter to this view."
+            )
+        if "customer_net_flow_90d" in table_allowlist:
+            rules.append(
+                "customer_net_flow_90d is already aggregated by customer for the latest 90-day "
+                "window; "
+                "net_flow_amount_90d is positive for inflow and negative for outflow."
+            )
+            rules.append(
+                "For a net-outflow ranking, filter net_flow_amount_90d < 0, return "
+                "-net_flow_amount_90d, and order that positive outflow amount descending."
+            )
+        if {"customer_position_daily", "product_info"} <= table_allowlist:
+            rules.append(
+                "For customers without a product type, use NOT EXISTS with customer, product-type, "
+                "and same-snapshot predicates. Do not infer absence from a LEFT JOIN null check."
+            )
+        if "customer_trade" in table_allowlist:
+            rules.append(
+                "Use customer_trade, not customer_trade_90d, for product-level trade amount or "
+                "product-level customer counts because product_id and trade_date are required."
+            )
+        if {"marketing_campaign", "marketing_touch"} <= table_allowlist:
+            rules.append(
+                "For campaign response_rate, use responded touch count divided by all touch count "
+                "unless the QueryPlan explicitly requests a customer-based denominator."
+            )
+            rules.append(
+                "For campaign benchmark output, use campaign_code as the stable campaign "
+                "dimension, "
+                "not campaign_name."
+            )
+            rules.append(
+                "For response_rate, use COUNT(*) FILTER (WHERE response_status = 'responded') "
+                "/ COUNT(*) over campaign touches. Do not reuse the distinct-customer denominator."
+            )
+        if reference_date:
+            rules.append(
+                "For relative-time SQL over this dataset, use the reference_date value below "
+                "instead "
+                "of CURRENT_DATE so results align with the latest loaded snapshot."
+            )
+        return {
+            "rules": rules,
+            "metric_formulas": {
+                metric["metric_code"]: metric.get("formula")
+                for metric in metrics
+                if metric.get("metric_code") and metric.get("formula")
+            },
+            "metric_output_aliases": {
+                "current_total_asset": ["current_total_asset", "total_asset"],
+                "net_asset_inflow_90d": ["net_asset_inflow_90d", "net_flow_amount_90d"],
+                "trade_amount_90d": ["trade_amount_90d", "trade_amount"],
+                "fund_holding_amount": ["fund_holding_amount", "market_value"],
+            },
+            "reference_date": reference_date,
+            "sensitive_columns_never_select": sorted(sensitive_columns),
+        }
 
     def _safe_metadata_rows(
         self, connection: Connection, sql: str

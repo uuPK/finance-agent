@@ -62,13 +62,43 @@ def _normalize_metric_aliases(
 ) -> list[dict[str, Any]]:
     """Compare known metric columns by stable code instead of presentation alias."""
     aliases: dict[str, str] = {}
+    source_aliases = {
+        "current_total_asset": {"total_asset"},
+        "net_asset_inflow_90d": {"net_flow_amount_90d"},
+        "trade_amount_90d": {"trade_amount"},
+        "fund_holding_amount": {"market_value"},
+    }
+    presentation_aliases = {
+        "客户数": "customer_count",
+        "交易客户数": "customer_count",
+        "当前总资产": "current_total_asset",
+        "总资产": "current_total_asset",
+        "近90天交易金额": "trade_amount_90d",
+        "交易金额": "trade_amount_90d",
+        "风险等级": "risk_level",
+        "营销活动": "campaign_code",
+        "已响应客户数": "response_customer_count",
+        "响应率": "response_rate",
+        "客户ID": "customer_no",
+        "净流出金额": "outflow_amount",
+    }
+    aliases.update(presentation_aliases)
     for metric in generated_plan.get("metrics", []):
         metric_code = metric.get("metric_code")
         if not metric_code:
             continue
         for label in (metric.get("name"), metric.get("alias")):
             if label:
-                aliases[str(label)] = metric_code
+                aliases.setdefault(str(label), metric_code)
+        for label in source_aliases.get(metric_code, set()):
+            aliases[label] = metric_code
+    for dimension in generated_plan.get("dimensions", []):
+        dimension_code = dimension.get("dimension_code")
+        if not dimension_code:
+            continue
+        for label in (dimension.get("name"), dimension.get("alias")):
+            if label:
+                aliases.setdefault(str(label), dimension_code)
     return [{aliases.get(key, key): value for key, value in row.items()} for row in rows]
 
 

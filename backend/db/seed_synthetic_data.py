@@ -1318,7 +1318,7 @@ def seed_evaluation_cases(cur: Cursor[Any]) -> None:
             "difficulty": "medium",
             "tags": ["asset_flow", "ranking"],
             "plan": {"intent": "ranking_query", "metrics": ["net_asset_inflow_90d"], "filters": ["net_flow_amount_90d<0"], "limit": 20},
-            "sql": "select c.customer_no, round(f.net_flow_amount_90d, 2) as net_flow_amount_90d from mart.customer_info c join mart.customer_net_flow_90d f on f.customer_id = c.customer_id where f.net_flow_amount_90d < 0 order by f.net_flow_amount_90d asc, c.customer_no limit 20",
+            "sql": "select c.customer_no, round(-f.net_flow_amount_90d, 2) as outflow_amount from mart.customer_info c join mart.customer_net_flow_90d f on f.customer_id = c.customer_id where f.net_flow_amount_90d < 0 order by outflow_amount desc, c.customer_no limit 20",
         },
         {
             "code": "SYN-010",

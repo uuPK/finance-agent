@@ -10,7 +10,6 @@ from app.llm.schemas import LLMMessage
 from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 
-
 ActorSource = Literal["llm", "rule_fallback"]
 
 
@@ -176,14 +175,28 @@ class LLMQueryPlanActor:
             "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
             "metrics": self._compact_items(
                 metrics,
-                ("metric_code", "metric_name", "description", "grain", "required_filters"),
+                (
+                    "metric_code",
+                    "metric_name",
+                    "description",
+                    "formula",
+                    "grain",
+                    "source_tables",
+                    "required_filters",
+                ),
             ),
             "business_terms": self._compact_items(
                 business_terms,
-                ("term", "definition", "synonyms", "default_plan_fragment", "clarification_required"),
+                (
+                    "term",
+                    "definition",
+                    "synonyms",
+                    "default_plan_fragment",
+                    "clarification_required",
+                ),
             ),
             "question_examples": self._compact_items(
-                examples, ("question", "difficulty", "tags")
+                examples, ("question", "difficulty", "expected_query_plan", "tags")
             ),
         }
 
@@ -202,6 +215,13 @@ class LLMQueryPlanActor:
 
 _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     """
+    Structured invariants (apply before returning ready):
+    - A ready metric_query, customer_segmentation, or ranking_query must include at least one metric.
+    - "by X", "per X", or "grouped by X" means X is the result grain/dimension; never default it to customer grain.
+    - Preserve every explicit threshold, comparison, time window, ranking direction, and requested limit.
+    - Use only metric_code values supplied in Retrieved metadata context. Never invent a legacy code.
+    - For a multi-condition customer segment, include a metric or filter representation for every condition.
+
     你是证券客户营销场景的 QueryPlanActor。你的任务是把用户自然语言问题转换成
     后续 SQL agent 可以消费的标准 QueryPlan。你只负责规划，不生成 SQL，不执行查询。
 

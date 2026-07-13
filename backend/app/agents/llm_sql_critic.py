@@ -10,7 +10,6 @@ from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 from app.schemas.sql import SQLDraft
 
-
 SQLCriticStatus = Literal["reviewed", "failed"]
 
 
@@ -119,6 +118,14 @@ class LLMSQLCritic:
 
 _SQL_CRITIC_SYSTEM_PROMPT = dedent(
     """
+    Semantic contract exception rules:
+    - Treat a *_90d view declared in Metadata context as satisfying a 90-day time requirement.
+      Do not require a duplicate raw-date filter on that pre-aggregated view.
+    - Never propose a sensitive column as a repair. The SQL hard guardrail's sensitive-column
+      conclusion is final.
+    - Do not reject harmless presentation aliases when the selected expression and metric semantics
+      are correct. Reject only a material metric, filter, grain, time-window, or safety mismatch.
+
     你是 SQLCritic，负责审核 SQLDraft 是否忠实实现已通过审核的 QueryPlan。
     你只审核，不重写完整 SQL，不执行 SQL。
 

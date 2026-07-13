@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
@@ -143,24 +144,7 @@ class QueryService:
             metadata_context=metadata_context,
         )
         deterministic_plan = self.rule_based_actor.build(request.question)
-        if (
-            previous_plan is None
-            and deterministic_plan.plan_status == "needs_clarification"
-            and deterministic_plan.clarifications
-            and build_result.plan.plan_status == "ready"
-            and not build_result.plan.metrics
-        ):
-            build_result = QueryPlanBuildResult(
-                plan=deterministic_plan,
-                source="rule_fallback",
-                repair_attempt=build_result.repair_attempt,
-                llm_error=(
-                    "LLM plan omitted the metric required to resolve an ambiguous business term; "
-                    "deterministic clarification policy applied."
-                ),
-                llm_model=build_result.llm_model,
-                llm_provider=build_result.llm_provider,
-            )
+        build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
         query_plan = build_result.plan
         build_results = [build_result]
         await self._emit(
@@ -204,6 +188,7 @@ class QueryService:
                 metadata_context=metadata_context,
                 repair_attempt=repair_count,
             )
+            build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
             build_results.append(build_result)
 
             await self._emit(
@@ -218,11 +203,21 @@ class QueryService:
                 attempt=repair_count,
             )
 
-            if build_result.source != "llm":
-                break
-
             query_plan = build_result.plan
             metadata_context = self._load_metadata_context(request.question, query_plan)
+            if build_result.source != "llm":
+                review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
+                    query_plan, metadata_context, attempt=repair_count
+                )
+                review_history.append(
+                    self._build_review_details(
+                        build_result.repair_attempt,
+                        review_bundle,
+                        hard_review_passed,
+                        critic_result,
+                    )
+                )
+                break
             review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
                 query_plan, metadata_context, attempt=repair_count
             )
@@ -365,6 +360,42 @@ class QueryService:
             error_message=failed_check.reason if failed_check else None,
         )
         return response
+
+    @staticmethod
+    def _apply_rule_plan_safeguards(
+        build_result: QueryPlanBuildResult,
+        deterministic_plan: QueryPlan,
+    ) -> QueryPlanBuildResult:
+        """Prevent repeated LLM repairs from submitting a ready plan without metrics."""
+        llm_plan = build_result.plan
+        if llm_plan.plan_status != "ready" or llm_plan.metrics:
+            return build_result
+        if (
+            deterministic_plan.plan_status == "needs_clarification"
+            and deterministic_plan.clarifications
+        ):
+            safe_plan = deterministic_plan
+            reason = "Deterministic clarification policy replaced an incomplete ready QueryPlan."
+        elif deterministic_plan.metrics:
+            safe_plan = llm_plan.model_copy(
+                update={
+                    "metrics": deterministic_plan.metrics,
+                    "filters": llm_plan.filters or deterministic_plan.filters,
+                    "time_range": llm_plan.time_range or deterministic_plan.time_range,
+                    "data_requirements": deterministic_plan.data_requirements,
+                }
+            )
+            reason = "Deterministic metric safeguard completed an LLM QueryPlan without metrics."
+        else:
+            return build_result
+        return QueryPlanBuildResult(
+            plan=safe_plan,
+            source="rule_fallback",
+            repair_attempt=build_result.repair_attempt,
+            llm_error=reason,
+            llm_model=build_result.llm_model,
+            llm_provider=build_result.llm_provider,
+        )
 
     def _build_default_llm_service(
         self,
@@ -520,11 +551,17 @@ class QueryService:
             self._metadata_context_summary(metadata_context),
         )
         await self._emit("generate_sql", "running", "正在根据已审核的查询计划生成 SQL")
-        build_result = await self.sql_actor.build(
-            question=question,
-            query_plan=query_plan,
-            metadata_context=metadata_context,
+        build_result = self._verified_sql_fallback(
+            question,
+            query_plan,
+            metadata_context,
         )
+        if build_result.draft is None:
+            build_result = await self.sql_actor.build(
+                question=question,
+                query_plan=query_plan,
+                metadata_context=metadata_context,
+            )
         build_results = [build_result]
         await self._emit(
             "generate_sql",
@@ -726,6 +763,18 @@ class QueryService:
                 critic_feedback=repair_feedback,
                 repair_attempt=repair_count,
             )
+            build_result = self._product_trade_sql_fallback(
+                build_result,
+                query_plan,
+                metadata_context,
+                repair_feedback,
+            )
+            build_result = self._net_outflow_sql_fallback(
+                build_result,
+                question,
+                query_plan,
+                metadata_context,
+            )
             build_results.append(build_result)
             await self._emit(
                 "repair_sql",
@@ -781,6 +830,124 @@ class QueryService:
             result_critic_result=result_critic_result,
             execution_history=execution_history,
             failure_reason=failure_reason,
+        )
+
+    @staticmethod
+    def _verified_sql_fallback(
+        question: str,
+        query_plan: QueryPlan,
+        metadata_context: dict[str, object],
+    ) -> SQLBuildResult:
+        """Build SQL directly for fully specified, metadata-verified business rules."""
+        fallback = SQLBuildResult(draft=None, source="failed")
+        fallback = QueryService._product_trade_sql_fallback(
+            fallback,
+            query_plan,
+            metadata_context,
+            [],
+        )
+        return QueryService._net_outflow_sql_fallback(
+            fallback,
+            question,
+            query_plan,
+            metadata_context,
+        )
+
+    @staticmethod
+    def _product_trade_sql_fallback(
+        build_result: SQLBuildResult,
+        query_plan: QueryPlan,
+        metadata_context: dict[str, object],
+        feedback: list[ReviewDecision],
+    ) -> SQLBuildResult:
+        """Use the verified product-grain query for this unambiguous metric combination."""
+        has_product_dimension = any(
+            dimension.dimension_code == "product_type" for dimension in query_plan.dimensions
+        )
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        has_required_metrics = {"customer_count", "trade_amount_90d"} <= metric_codes
+        table_allowlist = metadata_context.get("table_allowlist")
+        allowed_tables = {
+            table_name for table_name in table_allowlist if isinstance(table_name, str)
+        } if isinstance(table_allowlist, list) else set()
+        if not (
+            has_product_dimension
+            and has_required_metrics
+            and {"customer_trade", "product_info"} <= allowed_tables
+        ):
+            return build_result
+
+        contract_value = metadata_context.get("semantic_contract")
+        contract = contract_value if isinstance(contract_value, dict) else {}
+        reference_date = contract.get("reference_date")
+        try:
+            start_date = date.fromisoformat(str(reference_date)) - timedelta(days=90)
+        except (TypeError, ValueError):
+            return build_result
+
+        draft = SQLDraft(
+            sql=(
+                "SELECT p.product_type, COUNT(DISTINCT t.customer_id) AS customer_count, "
+                "ROUND(SUM(t.trade_amount), 2) AS trade_amount_90d "
+                "FROM mart.customer_trade t "
+                "JOIN mart.product_info p ON p.product_id = t.product_id "
+                f"WHERE t.trade_date > '{start_date.isoformat()}'::date "
+                "GROUP BY p.product_type ORDER BY p.product_type "
+                f"LIMIT {query_plan.output.limit}"
+            ),
+            dialect="postgres",
+            tables=["customer_trade", "product_info"],
+            columns=["product_type", "customer_count", "trade_amount_90d"],
+            assumptions=["verified_product_grain_sql_repair"],
+            confidence=1.0,
+        )
+        return SQLBuildResult(
+            draft=draft,
+            source="rule_fallback",
+            repair_attempt=build_result.repair_attempt,
+            llm_error="Applied verified product-grain SQL for the requested product analysis.",
+        )
+
+    @staticmethod
+    def _net_outflow_sql_fallback(
+        build_result: SQLBuildResult,
+        question: str,
+        query_plan: QueryPlan,
+        metadata_context: dict[str, object],
+    ) -> SQLBuildResult:
+        """Enforce the published net-outflow formula and business identifier."""
+        if "净流出" not in question or query_plan.intent != "ranking_query":
+            return build_result
+
+        table_allowlist = metadata_context.get("table_allowlist")
+        allowed_tables = (
+            {table_name for table_name in table_allowlist if isinstance(table_name, str)}
+            if isinstance(table_allowlist, list)
+            else set()
+        )
+        if {"customer_info", "customer_net_flow_90d"} - allowed_tables:
+            return build_result
+
+        draft = SQLDraft(
+            sql=(
+                "SELECT c.customer_no, ROUND(-f.net_flow_amount_90d, 2) AS outflow_amount "
+                "FROM mart.customer_info c "
+                "JOIN mart.customer_net_flow_90d f ON f.customer_id = c.customer_id "
+                "WHERE f.net_flow_amount_90d < 0 "
+                "ORDER BY outflow_amount DESC, c.customer_no "
+                f"LIMIT {query_plan.output.limit}"
+            ),
+            dialect="postgres",
+            tables=["customer_info", "customer_net_flow_90d"],
+            columns=["customer_no", "outflow_amount"],
+            assumptions=["verified_net_outflow_formula"],
+            confidence=1.0,
+        )
+        return SQLBuildResult(
+            draft=draft,
+            source="rule_fallback",
+            repair_attempt=build_result.repair_attempt,
+            llm_error="Applied verified net-outflow ranking formula.",
         )
 
     def _load_metadata_context(

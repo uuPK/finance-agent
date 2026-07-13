@@ -1,6 +1,11 @@
 import asyncio
 
+from app.agents.llm_query_plan_actor import QueryPlanBuildResult
+from app.agents.llm_sql_actor import SQLBuildResult
 from app.schemas.query import QueryRequest
+from app.schemas.query_plan import QueryDimension, QueryMetric, QueryOutput, QueryPlan
+from app.schemas.review import ReviewDecision
+from app.schemas.sql import SQLDraft
 from app.services.query_service import QueryService
 
 
@@ -99,3 +104,124 @@ def test_rule_fallback_plans_count_questions_as_aggregate() -> None:
     assert response.query_plan.grain.level == "aggregate"
     assert response.query_plan.metrics
     assert response.query_plan.metrics[-1].metric_code == "customer_count"
+
+
+def test_rule_safeguard_completes_ready_plan_that_lost_its_metrics() -> None:
+    incomplete = QueryPlan(
+        plan_status="ready",
+        intent="customer_segmentation",
+        confidence=0.9,
+    )
+    deterministic = QueryPlan(
+        plan_status="ready",
+        intent="customer_segmentation",
+        confidence=0.82,
+        metrics=[
+            QueryMetric(
+                name="trade count",
+                metric_code="trade_count_90d",
+                aggregation="count",
+                is_resolved=True,
+            )
+        ],
+    )
+
+    result = QueryService._apply_rule_plan_safeguards(
+        QueryPlanBuildResult(plan=incomplete, source="llm"), deterministic
+    )
+
+    assert result.source == "rule_fallback"
+    assert result.plan.metrics[0].metric_code == "trade_count_90d"
+
+
+def test_product_trade_fallback_uses_product_grain_table_after_column_rejection() -> None:
+    plan = QueryPlan(
+        plan_status="ready",
+        intent="metric_query",
+        confidence=0.9,
+        dimensions=[QueryDimension(name="product", dimension_code="product_type")],
+        metrics=[
+            QueryMetric(name="customers", metric_code="customer_count"),
+            QueryMetric(name="amount", metric_code="trade_amount_90d"),
+        ],
+        output=QueryOutput(limit=100),
+    )
+    fallback = QueryService._product_trade_sql_fallback(
+        SQLBuildResult(
+            draft=SQLDraft(sql="select 1", tables=[], columns=[]),
+            source="llm",
+            repair_attempt=1,
+        ),
+        plan,
+        {
+            "table_allowlist": ["customer_trade", "product_info"],
+            "semantic_contract": {"reference_date": "2026-06-30"},
+        },
+        [
+            ReviewDecision(
+                passed=False,
+                score=0,
+                stage="sql_review",
+                error_type="column_whitelist",
+                reason="Unknown column",
+                confidence=1.0,
+            )
+        ],
+    )
+
+    assert fallback.source == "rule_fallback"
+    assert fallback.draft is not None
+    assert "mart.customer_trade" in fallback.draft.sql
+    assert "customer_trade_90d" not in fallback.draft.sql
+    assert "trade_date > '2026-04-01'::date" in fallback.draft.sql
+
+
+def test_net_outflow_fallback_uses_customer_number_and_positive_outflow() -> None:
+    plan = QueryPlan(
+        plan_status="ready",
+        intent="ranking_query",
+        confidence=0.9,
+        output=QueryOutput(limit=20),
+    )
+
+    fallback = QueryService._net_outflow_sql_fallback(
+        SQLBuildResult(
+            draft=SQLDraft(sql="select 1", tables=[], columns=[]),
+            source="llm",
+        ),
+        "近90天净流出金额最高的客户，展示前20名",
+        plan,
+        {"table_allowlist": ["customer_info", "customer_net_flow_90d"]},
+    )
+
+    assert fallback.source == "rule_fallback"
+    assert fallback.draft is not None
+    assert "c.customer_no" in fallback.draft.sql
+    assert "ROUND(-f.net_flow_amount_90d, 2) AS outflow_amount" in fallback.draft.sql
+
+
+def test_verified_sql_fallback_avoids_model_call_for_product_analysis() -> None:
+    plan = QueryPlan(
+        plan_status="ready",
+        intent="metric_query",
+        confidence=0.9,
+        dimensions=[QueryDimension(name="product", dimension_code="product_type")],
+        metrics=[
+            QueryMetric(name="customers", metric_code="customer_count"),
+            QueryMetric(name="amount", metric_code="trade_amount_90d"),
+        ],
+        output=QueryOutput(limit=100),
+    )
+
+    fallback = QueryService._verified_sql_fallback(
+        "按产品类型统计近90天交易客户数和交易金额",
+        plan,
+        {
+            "table_allowlist": ["customer_trade", "product_info"],
+            "semantic_contract": {"reference_date": "2026-06-30"},
+        },
+    )
+
+    assert fallback.source == "rule_fallback"
+    assert fallback.draft is not None
+    assert "mart.customer_trade" in fallback.draft.sql

@@ -10,8 +10,7 @@ from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 from app.schemas.sql import SQLDraft
 
-
-SQLActorSource = Literal["llm", "failed"]
+SQLActorSource = Literal["llm", "rule_fallback", "failed"]
 
 
 @dataclass(slots=True)
@@ -154,6 +153,27 @@ class LLMSQLActor:
 
 _SQL_ACTOR_SYSTEM_PROMPT = dedent(
     """
+    Semantic contract rules:
+    - semantic_contract in Metadata context is authoritative. Follow its table-grain, time-window,
+      formula, and sensitive-column rules exactly.
+    - A *_90d view already satisfies the 90-day window. Do not add an unsupported raw-date predicate.
+    - Never select or suggest any column in sensitive_columns_never_select, including while repairing SQL.
+    - Use a fact table whose grain supports the requested dimension: product analysis requires a
+      product-grain trade table; campaign analysis requires campaign/touch tables.
+    - Use metric_code as the output alias for aggregated metrics whenever possible.
+    - For "not held" / "without fund" conditions, write a correlated NOT EXISTS subquery over the
+      matching product type and snapshot date. A LEFT JOIN ... IS NULL is not equivalent.
+    - For net-outflow rankings, keep the negative-flow filter, convert the displayed amount to a
+      positive outflow amount, and order that amount descending.
+    - When semantic_contract.reference_date is present, use that literal as the relative-time anchor
+      instead of CURRENT_DATE.
+    - For campaign benchmark output, prefer campaign_code over campaign_name unless the user
+      explicitly requests names.
+    - For customer-facing detail output, select customer_no as the stable business identifier.
+      customer_id is an internal join key and is not a substitute for customer_no.
+    - For campaign response_rate, use responded touch count divided by all touch count; keep any
+      responded customer-count metric separate from the rate denominator.
+
     你是证券客户营销问数系统的 SQLActor。你的任务是把已经通过审核的 QueryPlan
     转换成 PostgreSQL SELECT SQL。你只生成 SQLDraft JSON，不执行 SQL。
 

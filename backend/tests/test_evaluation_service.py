@@ -1,5 +1,5 @@
 from app.schemas.query import QueryResponse
-from app.schemas.query_plan import ClarificationQuestion, QueryMetric, QueryPlan
+from app.schemas.query_plan import ClarificationQuestion, QueryDimension, QueryMetric, QueryPlan
 from app.services.evaluation_service import EvaluationManager
 
 
@@ -64,6 +64,85 @@ def test_completed_case_matches_metric_code_when_presentation_alias_differs() ->
 
     assert scored["passed"] is True
     assert scored["result_correct"] is True
+
+
+def test_completed_case_maps_known_metric_source_aliases() -> None:
+    manager = EvaluationManager()
+    case = {
+        "expected_status": "completed",
+        "expected_query_plan": {},
+        "expected_result": {"rows": [{"current_total_asset": 500000}]},
+        "difficulty": "simple",
+    }
+    response = QueryResponse(
+        status="completed",
+        answer="ok",
+        sql="select total_asset from benchmark limit 1",
+        query_plan=QueryPlan(
+            plan_status="ready",
+            confidence=0.9,
+            metrics=[QueryMetric(name="asset", metric_code="current_total_asset")],
+        ),
+        result_preview=[{"total_asset": 500000}],
+    )
+
+    scored = manager._score(case, response, None, 12)
+
+    assert scored["passed"] is True
+
+
+def test_completed_case_maps_known_presentation_aliases() -> None:
+    manager = EvaluationManager()
+    case = {
+        "expected_status": "completed",
+        "expected_query_plan": {},
+        "expected_result": {"rows": [{"customer_count": 8, "trade_amount_90d": 125.5}]},
+        "difficulty": "simple",
+    }
+    response = QueryResponse(
+        status="completed",
+        answer="ok",
+        sql="select 8 as customer_count, 125.5 as trade_amount limit 1",
+        query_plan=QueryPlan(plan_status="ready", confidence=0.9),
+        result_preview=[{"交易客户数": 8, "交易金额": 125.5}],
+    )
+
+    scored = manager._score(case, response, None, 12)
+
+    assert scored["passed"] is True
+
+
+def test_completed_case_keeps_stable_presentation_alias_over_incorrect_plan_dimension() -> None:
+    manager = EvaluationManager()
+    case = {
+        "expected_status": "completed",
+        "expected_query_plan": {},
+        "expected_result": {
+            "rows": [
+                {
+                    "campaign_code": "CAM0001",
+                    "response_customer_count": 0,
+                    "response_rate": 0.0,
+                }
+            ]
+        },
+        "difficulty": "simple",
+    }
+    response = QueryResponse(
+        status="completed",
+        answer="ok",
+        sql="select 'CAM0001' as campaign_code limit 1",
+        query_plan=QueryPlan(
+            plan_status="ready",
+            confidence=0.9,
+            dimensions=[QueryDimension(name="营销活动", dimension_code="campaign_id")],
+        ),
+        result_preview=[{"营销活动": "CAM0001", "已响应客户数": 0, "响应率": 0.0}],
+    )
+
+    scored = manager._score(case, response, None, 12)
+
+    assert scored["passed"] is True
 
 
 def test_completed_case_allows_extra_display_fields_but_requires_expected_fields() -> None:

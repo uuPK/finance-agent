@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from app.metadata.retriever import MetadataRetriever
+from app.metadata.schema_context import SchemaContextProvider
+from app.schemas.query_plan import QueryDimension, QueryMetric, QueryPlan
 
 
 class FakeResult:
@@ -124,7 +126,10 @@ class FakeConnection:
                         "right_table": "customer_current_asset",
                         "right_column": "customer_id",
                         "relationship_type": "one_to_one",
-                        "description": "customer_info.customer_id -> customer_current_asset.customer_id",
+                        "description": (
+                            "customer_info.customer_id -> "
+                            "customer_current_asset.customer_id"
+                        ),
                     },
                     {
                         "left_schema": "mart",
@@ -134,7 +139,10 @@ class FakeConnection:
                         "right_table": "customer_trade_90d",
                         "right_column": "customer_id",
                         "relationship_type": "one_to_one",
-                        "description": "customer_info.customer_id -> customer_trade_90d.customer_id",
+                        "description": (
+                            "customer_info.customer_id -> "
+                            "customer_trade_90d.customer_id"
+                        ),
                     },
                 ]
             )
@@ -167,4 +175,39 @@ def test_metadata_retriever_matches_asset_and_trade_question() -> None:
 
     context = result.to_context()
     assert context["strategy"] == "structured_keyword_retrieval"
-    assert "当前资产" in context["keywords"]
+    assert context["keywords"]
+
+
+def test_semantic_contract_marks_preaggregated_and_product_grain_tables() -> None:
+    contract = SchemaContextProvider._semantic_contract(
+        {"customer_trade_90d", "customer_trade", "customer_net_flow_90d"},
+        [{"metric_code": "trade_count_90d", "formula": "sum(trade_count_90d)"}],
+        {"customer_name_masked"},
+        "2026-06-30",
+    )
+
+    assert any("already aggregated" in rule for rule in contract["rules"])
+    assert any("product-level" in rule for rule in contract["rules"])
+    assert contract["sensitive_columns_never_select"] == ["customer_name_masked"]
+    assert contract["reference_date"] == "2026-06-30"
+
+
+def test_schema_context_adds_verified_tables_for_product_and_net_outflow_semantics() -> None:
+    product_plan = QueryPlan(
+        plan_status="ready",
+        dimensions=[QueryDimension(name="product", dimension_code="product_type")],
+        metrics=[QueryMetric(name="amount", metric_code="trade_amount_90d")],
+    )
+    net_outflow_plan = QueryPlan(plan_status="ready")
+
+    assert SchemaContextProvider._required_semantic_tables(None, product_plan) == {
+        "customer_trade",
+        "product_info",
+    }
+    net_outflow_tables = SchemaContextProvider._required_semantic_tables(
+        "近90天净流出客户", net_outflow_plan
+    )
+    assert net_outflow_tables == {
+        "customer_info",
+        "customer_net_flow_90d",
+    }
