@@ -23,6 +23,7 @@ from app.schemas.evaluation import (
     EvaluationResultSummary,
     EvaluationRunDetail,
     EvaluationRunSummary,
+    QueryReviewCreated,
     ReviewBatchSummary,
     ReviewDecisionInput,
     ReviewImportResult,
@@ -303,30 +304,73 @@ class EvaluationRepository:
             latest_run=EvaluationRunSummary(**self._run_summary_payload(latest)) if latest else None,
         )
 
-    def create_review_batch(self, batch_name: str, max_items: int, created_by: str) -> ReviewBatchSummary:
+    def create_review_batch(
+        self,
+        eval_run_id: UUID,
+        batch_name: str,
+        max_items: int,
+        created_by: str,
+    ) -> ReviewBatchSummary:
         with self.engine.begin() as connection:
+            run = connection.execute(
+                text("select status, dataset_version from evaluation.eval_runs where eval_run_id = :run_id"),
+                {"run_id": str(eval_run_id)},
+            ).mappings().first()
+            if run is None:
+                raise LookupError("Evaluation run not found.")
+            if run["status"] != "completed":
+                raise ValueError("Evaluation run must be completed before creating a review batch.")
             batch = connection.execute(
                 text(
                     """
-                    insert into evaluation.review_batches (batch_name, dataset_version, created_by)
-                    values (:batch_name, 'synthetic-v1', :created_by)
-                    returning review_batch_id, batch_name, status, dataset_version, created_at
+                    select review_batch_id
+                    from evaluation.review_batches
+                    where eval_run_id = :run_id and batch_type = 'evaluation_run'
+                    order by created_at desc
+                    limit 1
                     """
                 ),
-                {"batch_name": batch_name, "created_by": created_by},
-            ).mappings().one()
+                {"run_id": str(eval_run_id)},
+            ).mappings().first()
+            if batch is None:
+                batch = connection.execute(
+                    text(
+                        """
+                        insert into evaluation.review_batches
+                            (batch_name, dataset_version, created_by, eval_run_id, batch_type)
+                        values (:batch_name, :dataset_version, :created_by, :run_id, 'evaluation_run')
+                        returning review_batch_id
+                        """
+                    ),
+                    {
+                        "batch_name": batch_name,
+                        "dataset_version": run["dataset_version"],
+                        "created_by": created_by,
+                        "run_id": str(eval_run_id),
+                    },
+                ).mappings().one()
             candidates = connection.execute(
                 text(
                     """
-                    select eval_result_id, review_priority, risk_reasons
-                    from evaluation.eval_results
-                    where review_status = 'pending'
-                    order by case review_priority when 'blocking' then 1 when 'high' then 2 else 3 end,
-                             created_at asc
+                    select er.eval_result_id, er.review_priority, er.risk_reasons
+                    from evaluation.eval_results er
+                    where er.eval_run_id = :run_id
+                      and er.review_status in ('pending', 'batched')
+                      and not exists (
+                          select 1 from evaluation.review_items existing
+                          where existing.eval_result_id = er.eval_result_id
+                            and (existing.review_batch_id = :batch_id or existing.status = 'reviewed')
+                      )
+                    order by case er.review_priority when 'blocking' then 1 when 'high' then 2 else 3 end,
+                             er.created_at asc
                     limit :limit
                     """
                 ),
-                {"limit": max_items},
+                {
+                    "run_id": str(eval_run_id),
+                    "batch_id": str(batch["review_batch_id"]),
+                    "limit": max_items,
+                },
             ).mappings().all()
             for item in candidates:
                 connection.execute(
@@ -345,32 +389,201 @@ class EvaluationRepository:
                     },
                 )
             if candidates:
+                candidate_ids = [str(item["eval_result_id"]) for item in candidates]
                 connection.execute(
                     text(
                         "update evaluation.eval_results set review_status = 'batched' where eval_result_id = any(:ids)"
                     ),
-                    {"ids": [str(item["eval_result_id"]) for item in candidates]},
+                    {"ids": candidate_ids},
                 )
-        return ReviewBatchSummary(**dict(batch), item_count=len(candidates))
+                connection.execute(
+                    text(
+                        """
+                        delete from evaluation.review_items ri
+                        using evaluation.review_batches rb
+                        where ri.review_batch_id = rb.review_batch_id
+                          and rb.eval_run_id is null
+                          and rb.batch_type = 'legacy_backlog'
+                          and ri.status = 'pending'
+                          and ri.eval_result_id = any(:ids)
+                        """
+                    ),
+                    {"ids": candidate_ids},
+                )
+            summary = connection.execute(
+                text(
+                    """
+                    select rb.review_batch_id, rb.batch_name, rb.status, rb.dataset_version,
+                           rb.eval_run_id, rb.batch_type, rb.created_at,
+                           count(ri.review_item_id) as item_count,
+                           count(ri.review_item_id) filter (where ri.status = 'pending') as pending_count,
+                           count(ri.review_item_id) filter (where ri.status = 'reviewed') as reviewed_count
+                    from evaluation.review_batches rb
+                    left join evaluation.review_items ri on ri.review_batch_id = rb.review_batch_id
+                    where rb.review_batch_id = :batch_id
+                    group by rb.review_batch_id
+                    """
+                ),
+                {"batch_id": str(batch["review_batch_id"])},
+            ).mappings().one()
+        return ReviewBatchSummary(**dict(summary))
+
+    def list_review_batches(self, limit: int = 30) -> list[ReviewBatchSummary]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    select rb.review_batch_id, rb.batch_name, rb.status, rb.dataset_version,
+                           rb.eval_run_id, rb.batch_type, rb.created_at,
+                           count(ri.review_item_id) as item_count,
+                           count(ri.review_item_id) filter (where ri.status = 'pending') as pending_count,
+                           count(ri.review_item_id) filter (where ri.status = 'reviewed') as reviewed_count
+                    from evaluation.review_batches rb
+                    left join evaluation.review_items ri on ri.review_batch_id = rb.review_batch_id
+                    group by rb.review_batch_id
+                    order by rb.created_at desc
+                    limit :limit
+                    """
+                ),
+                {"limit": limit},
+            ).mappings().all()
+        return [ReviewBatchSummary(**dict(row)) for row in rows]
+
+    def submit_query_review(
+        self, query_id: UUID, user_id: str, reason: str | None
+    ) -> QueryReviewCreated:
+        sanitized_reason = sanitize_event_payload(reason.strip()) if reason and reason.strip() else None
+        with self.engine.begin() as connection:
+            run = connection.execute(
+                text(
+                    """
+                    select query_id, user_id, status, review_status
+                    from agent.query_runs
+                    where query_id = :query_id
+                    for update
+                    """
+                ),
+                {"query_id": str(query_id)},
+            ).mappings().first()
+            if run is None or run["user_id"] != user_id:
+                raise LookupError("Query run not found.")
+            if run["status"] != "completed":
+                raise ValueError("Only completed query results can be submitted for review.")
+            existing = connection.execute(
+                text(
+                    """
+                    select review_item_id, review_batch_id, status
+                    from evaluation.review_items
+                    where query_id = :query_id and source_type = 'user_feedback'
+                    """
+                ),
+                {"query_id": str(query_id)},
+            ).mappings().first()
+            if existing:
+                return QueryReviewCreated(
+                    **dict(existing),
+                    already_submitted=True,
+                )
+            batch = connection.execute(
+                text(
+                    """
+                    select review_batch_id
+                    from evaluation.review_batches
+                    where batch_type = 'user_feedback' and status = 'open'
+                      and created_at::date = current_date
+                    order by created_at desc
+                    limit 1
+                    for update
+                    """
+                )
+            ).mappings().first()
+            if batch is None:
+                batch = connection.execute(
+                    text(
+                        """
+                        insert into evaluation.review_batches
+                            (batch_name, dataset_version, created_by, batch_type)
+                        values ('业务用户反馈-' || to_char(current_date, 'YYYY-MM-DD'),
+                                'live-query', :created_by, 'user_feedback')
+                        returning review_batch_id
+                        """
+                    ),
+                    {"created_by": user_id},
+                ).mappings().one()
+            item = connection.execute(
+                text(
+                    """
+                    insert into evaluation.review_items
+                        (review_batch_id, query_id, source_type, priority, risk_reasons, user_reason)
+                    values (:batch_id, :query_id, 'user_feedback', 'high',
+                            '["user_dispute"]'::jsonb, :reason)
+                    returning review_item_id, review_batch_id, status
+                    """
+                ),
+                {
+                    "batch_id": str(batch["review_batch_id"]),
+                    "query_id": str(query_id),
+                    "reason": sanitized_reason,
+                },
+            ).mappings().one()
+            connection.execute(
+                text(
+                    """
+                    update agent.query_runs
+                    set review_status = 'pending', review_reason = :reason,
+                        review_requested_at = now(), updated_at = now()
+                    where query_id = :query_id
+                    """
+                ),
+                {"query_id": str(query_id), "reason": sanitized_reason},
+            )
+        return QueryReviewCreated(**dict(item))
 
     def list_review_items(self, batch_id: UUID | None = None, status: str = "pending") -> list[ReviewItemDetail]:
-        clause = "where ri.status = :status"
-        params: dict[str, Any] = {"status": status}
+        clause = ""
+        params: dict[str, Any] = {}
+        if status != "all":
+            clause = "where ri.status = :status"
+            params["status"] = status
         if batch_id:
-            clause += " and ri.review_batch_id = :batch_id"
+            clause += " and" if clause else "where"
+            clause += " ri.review_batch_id = :batch_id"
             params["batch_id"] = str(batch_id)
         with self.engine.connect() as connection:
             rows = connection.execute(
                 text(
                     f"""
-                    select ri.review_item_id, ri.review_batch_id, ri.status, ri.priority, ri.risk_reasons,
-                           ec.case_code, ec.question, ec.difficulty, ec.expected_status,
-                           ec.expected_query_plan, ec.expected_sql, ec.expected_result,
-                           er.generated_query_plan, er.generated_sql, er.generated_response,
-                           er.auto_decision, er.failure_type, er.failure_reason, er.elapsed_ms
+                    select ri.review_item_id, ri.review_batch_id, ri.status, ri.priority,
+                           ri.risk_reasons, ri.source_type, ri.query_id, ri.user_reason,
+                           coalesce(ec.case_code, 'QUERY-' || upper(left(ri.query_id::text, 8))) as case_code,
+                           coalesce(ec.question, qr.question) as question,
+                           coalesce(ec.difficulty, 'medium') as difficulty,
+                           coalesce(ec.expected_status, 'manual_review') as expected_status,
+                           coalesce(ec.expected_query_plan, '{{}}'::jsonb) as expected_query_plan,
+                           ec.expected_sql,
+                           coalesce(ec.expected_result, '{{}}'::jsonb) as expected_result,
+                           coalesce(er.generated_query_plan, qr.final_response->'query_plan', '{{}}'::jsonb) as generated_query_plan,
+                           coalesce(er.generated_sql, qr.final_sql) as generated_sql,
+                           coalesce(er.generated_response, qr.final_response, '{{}}'::jsonb) as generated_response,
+                           coalesce(er.auto_decision, 'user_dispute') as auto_decision,
+                           coalesce(er.failure_type, case when ri.query_id is not null then 'user_feedback' end) as failure_type,
+                           coalesce(er.failure_reason, ri.user_reason) as failure_reason,
+                           coalesce(er.elapsed_ms, qr.elapsed_ms) as elapsed_ms,
+                           rd.reviewer_id, rd.verdict, rd.error_class, rd.severity,
+                           rd.corrected_query_plan, rd.corrected_sql, rd.corrected_result,
+                           rd.reviewer_note, rd.confidence, rd.created_at as reviewed_at
                     from evaluation.review_items ri
-                    join evaluation.eval_results er on er.eval_result_id = ri.eval_result_id
-                    join evaluation.eval_cases ec on ec.case_id = er.case_id
+                    left join evaluation.eval_results er on er.eval_result_id = ri.eval_result_id
+                    left join evaluation.eval_cases ec on ec.case_id = er.case_id
+                    left join agent.query_runs qr on qr.query_id = ri.query_id
+                    left join lateral (
+                        select reviewer_id, verdict, error_class, severity, corrected_query_plan,
+                               corrected_sql, corrected_result, reviewer_note, confidence, created_at
+                        from evaluation.review_decisions
+                        where review_item_id = ri.review_item_id
+                        order by created_at desc
+                        limit 1
+                    ) rd on true
                     {clause}
                     order by case ri.priority when 'blocking' then 1 when 'high' then 2 else 3 end,
                              ri.created_at
@@ -381,7 +594,7 @@ class EvaluationRepository:
         return [ReviewItemDetail(**self._review_item_payload(row)) for row in rows]
 
     def export_review_batch(self, batch_id: UUID, export_format: str) -> tuple[str, bytes]:
-        items = self.list_review_items(batch_id)
+        items = self.list_review_items(batch_id, "all")
         if export_format == "jsonl":
             lines = [json.dumps(item.model_dump(mode="json"), ensure_ascii=False) for item in items]
             payload = "\n".join(lines).encode("utf-8")
@@ -391,10 +604,11 @@ class EvaluationRepository:
             writer = csv.DictWriter(
                 output,
                 fieldnames=[
-                    "review_item_id", "review_batch_id", "priority", "risk_reasons", "case_code",
+                    "review_item_id", "review_batch_id", "source_type", "query_id", "user_reason",
+                    "priority", "risk_reasons", "case_code",
                     "question", "difficulty", "expected_status", "auto_decision", "failure_type",
                     "failure_reason", "generated_sql", "reviewer_id", "verdict", "error_class",
-                    "severity", "reviewer_note", "confidence",
+                    "severity", "reviewer_note", "confidence", "corrected_sql",
                 ],
             )
             writer.writeheader()
@@ -405,6 +619,7 @@ class EvaluationRepository:
                         **{key: row.get(key) for key in writer.fieldnames if key in row},
                         "risk_reasons": "; ".join(item.risk_reasons),
                         "generated_sql": item.generated_sql or "",
+                        "corrected_sql": item.corrected_sql or "",
                     }
                 )
             payload = ("\ufeff" + output.getvalue()).encode("utf-8")
@@ -424,11 +639,14 @@ class EvaluationRepository:
                 item = connection.execute(
                     text(
                         """
-                        select ri.review_item_id, ri.eval_result_id, ri.status, ri.review_batch_id,
-                               ec.case_id, ec.question, ec.difficulty
+                        select ri.review_item_id, ri.eval_result_id, ri.query_id, ri.status,
+                               ri.review_batch_id, ec.case_id,
+                               coalesce(ec.question, qr.question) as question,
+                               coalesce(ec.difficulty, 'medium') as difficulty
                         from evaluation.review_items ri
-                        join evaluation.eval_results er on er.eval_result_id = ri.eval_result_id
-                        join evaluation.eval_cases ec on ec.case_id = er.case_id
+                        left join evaluation.eval_results er on er.eval_result_id = ri.eval_result_id
+                        left join evaluation.eval_cases ec on ec.case_id = er.case_id
+                        left join agent.query_runs qr on qr.query_id = ri.query_id
                         where ri.review_item_id = :review_item_id for update
                         """
                     ),
@@ -468,17 +686,40 @@ class EvaluationRepository:
                         "source_checksum": checksum,
                     },
                 )
-                self._promote_review_feedback(connection, item, decision)
+                if item["case_id"] is not None:
+                    self._promote_review_feedback(connection, item, decision)
                 connection.execute(
                     text("update evaluation.review_items set status = 'reviewed', updated_at = now() where review_item_id = :review_item_id"),
                     {"review_item_id": str(decision.review_item_id)},
                 )
+                if item["eval_result_id"] is not None:
+                    connection.execute(
+                        text("update evaluation.eval_results set review_status = 'reviewed' where eval_result_id = :eval_result_id"),
+                        {"eval_result_id": str(item["eval_result_id"])},
+                    )
+                if item["query_id"] is not None:
+                    connection.execute(
+                        text(
+                            """
+                            update agent.query_runs
+                            set review_status = 'reviewed', updated_at = now()
+                            where query_id = :query_id
+                            """
+                        ),
+                        {"query_id": str(item["query_id"])},
+                    )
                 connection.execute(
-                    text("update evaluation.eval_results set review_status = 'reviewed' where eval_result_id = :eval_result_id"),
-                    {"eval_result_id": str(item["eval_result_id"])},
-                )
-                connection.execute(
-                    text("update evaluation.review_batches set imported_at = now(), updated_at = now() where review_batch_id = :batch_id"),
+                    text(
+                        """
+                        update evaluation.review_batches
+                        set imported_at = now(), updated_at = now(),
+                            status = case when not exists (
+                                select 1 from evaluation.review_items
+                                where review_batch_id = :batch_id and status <> 'reviewed'
+                            ) then 'completed' else 'open' end
+                        where review_batch_id = :batch_id
+                        """
+                    ),
                     {"batch_id": str(item["review_batch_id"])},
                 )
                 accepted += 1
@@ -605,6 +846,8 @@ class EvaluationRepository:
             "expected_result": dict(row["expected_result"] or {}),
             "generated_query_plan": dict(row["generated_query_plan"] or {}),
             "generated_response": dict(row["generated_response"] or {}),
+            "corrected_query_plan": dict(row["corrected_query_plan"] or {}),
+            "corrected_result": dict(row["corrected_result"] or {}),
         }
 
 

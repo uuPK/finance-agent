@@ -1,4 +1,4 @@
-import { ArrowRight, Download, RotateCcw, Send, Sparkles, Square } from "lucide-react";
+import { ArrowRight, Download, MessageSquareWarning, RotateCcw, Send, Sparkles, Square, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -6,6 +6,7 @@ import {
   downloadQueryExport,
   getQueryRun,
   submitClarifications,
+  submitQueryReview,
   subscribeToQueryRun
 } from "../api/client";
 import { ArtifactView } from "../components/ArtifactView";
@@ -36,6 +37,10 @@ export function QueryWorkbench({
   const [selectedId, setSelectedId] = useState<number>();
   const [submitting, setSubmitting] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewReason, setReviewReason] = useState("");
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewNotice, setReviewNotice] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const closeStreamRef = useRef<(() => void) | null>(null);
@@ -53,6 +58,7 @@ export function QueryWorkbench({
 
   const mergeEvent = useCallback((event: QueryEvent) => {
     setError(null);
+    setReviewNotice("");
     setEvents((current) => {
       if (current.some((item) => item.event_id === event.event_id)) return current;
       return [...current, event].sort((left, right) => left.event_id - right.event_id);
@@ -183,6 +189,24 @@ export function QueryWorkbench({
     }
   }
 
+  async function handleSubmitReview() {
+    if (!run || run.status !== "completed") return;
+    setReviewSubmitting(true);
+    setError(null);
+    try {
+      const result = await submitQueryReview(run.query_id, getClientId(), reviewReason.trim() || undefined);
+      const snapshot = await getQueryRun(run.query_id);
+      setRun(snapshot);
+      setReviewOpen(false);
+      setReviewReason("");
+      setReviewNotice(result.already_submitted ? "该结果已经在人工审核队列中。" : "已提交人工审核，复核人员将查看本次查询的计划、SQL 和结果。" );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "提交人工审核失败");
+    } finally {
+      setReviewSubmitting(false);
+    }
+  }
+
   const clarifications = run?.status === "needs_clarification" ? run.response?.query_plan?.clarifications ?? [] : [];
 
   return (
@@ -195,6 +219,17 @@ export function QueryWorkbench({
               <p className="mt-1 text-sm text-muted">可信查询过程与业务结果同步呈现</p>
             </div>
             <div className="flex items-center gap-2">
+              {run?.status === "completed" ? (
+                <button
+                  type="button"
+                  onClick={() => setReviewOpen(true)}
+                  disabled={run.review_status === "pending" || run.review_status === "reviewed"}
+                  className="inline-flex h-9 items-center gap-2 border border-line bg-white px-3 text-sm text-ink hover:bg-slate-50 disabled:cursor-default disabled:bg-slate-50 disabled:text-muted"
+                >
+                  <MessageSquareWarning className="h-4 w-4" />
+                  {run.review_status === "reviewed" ? "已审核" : run.review_status === "pending" ? "审核中" : "提交审核"}
+                </button>
+              ) : null}
               {run?.status === "completed" ? (
                 <label className="relative inline-flex h-9 items-center gap-2 border border-line bg-white px-2 text-sm text-ink hover:bg-slate-50">
                   <Download className="h-4 w-4" />
@@ -247,6 +282,7 @@ export function QueryWorkbench({
             ))}
           </div>
           {error ? <div className="mt-3 border-l-2 border-red-500 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div> : null}
+          {reviewNotice ? <div className="mt-3 border-l-2 border-teal-600 bg-teal-50 px-3 py-2 text-sm text-teal-900">{reviewNotice}</div> : null}
         </div>
       </section>
 
@@ -298,6 +334,36 @@ export function QueryWorkbench({
             <button type="button" onClick={handleClarification} disabled={submitting} className="mt-4 inline-flex items-center gap-2 rounded bg-amber-800 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">继续查询<ArrowRight className="h-4 w-4" /></button>
           </div>
         </section>
+      ) : null}
+
+      {reviewOpen && run ? (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 px-4" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title">
+          <section className="w-full max-w-lg border border-line bg-white shadow-xl">
+            <div className="flex items-start justify-between border-b border-line px-4 py-3">
+              <div>
+                <h2 id="review-dialog-title" className="text-sm font-semibold text-ink">提交人工审核</h2>
+                <p className="mt-1 text-xs text-muted">复核人员将看到本次查询的脱敏计划、SQL、审核证据与结果。</p>
+              </div>
+              <button type="button" onClick={() => setReviewOpen(false)} title="关闭" className="grid h-8 w-8 place-items-center hover:bg-slate-100"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="p-4">
+              <p className="border-l-2 border-slate-300 pl-3 text-sm text-ink">{run.question}</p>
+              <label className="mt-4 block text-xs font-medium text-muted">异议理由（可选）
+                <textarea
+                  value={reviewReason}
+                  onChange={(event) => setReviewReason(event.target.value)}
+                  maxLength={2000}
+                  placeholder="例如：客户数量与业务台账不一致；也可以不填写直接提交。"
+                  className="mt-1 min-h-28 w-full resize-y border border-line p-3 text-sm leading-6 text-ink outline-none focus:border-accent"
+                />
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-line px-4 py-3">
+              <button type="button" onClick={() => setReviewOpen(false)} className="h-9 border border-line px-3 text-sm text-ink">取消</button>
+              <button type="button" onClick={() => void handleSubmitReview()} disabled={reviewSubmitting} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><MessageSquareWarning className="h-4 w-4" />{reviewSubmitting ? "提交中" : "提交审核"}</button>
+            </div>
+          </section>
+        </div>
       ) : null}
     </div>
   );

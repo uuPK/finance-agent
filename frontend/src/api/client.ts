@@ -75,6 +75,20 @@ export async function submitClarifications(
   return parseResponse(response);
 }
 
+export async function submitQueryReview(
+  queryId: string,
+  userId: string,
+  reason?: string
+): Promise<{ review_item_id: string; review_batch_id: string; status: string; already_submitted: boolean }> {
+  return parseResponse(
+    await fetch(`/api/chat/runs/${queryId}/reviews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, reason: reason || null })
+    })
+  );
+}
+
 export async function downloadQueryExport(
   queryId: string,
   userId: string,
@@ -186,6 +200,7 @@ export async function createEvaluationRun(payload: {
 }
 
 export async function createReviewBatch(payload: {
+  eval_run_id: string;
   batch_name: string;
   max_items: number;
   created_by: string;
@@ -199,8 +214,17 @@ export async function createReviewBatch(payload: {
   );
 }
 
-export async function listReviewItems(): Promise<ReviewItemDetail[]> {
-  return parseResponse(await fetch("/api/evaluation/review-items?status=pending"));
+export async function listReviewBatches(): Promise<ReviewBatchSummary[]> {
+  return parseResponse(await fetch("/api/evaluation/review-batches"));
+}
+
+export async function listReviewItems(options: {
+  batchId?: string;
+  status?: "pending" | "reviewed" | "all";
+} = {}): Promise<ReviewItemDetail[]> {
+  const params = new URLSearchParams({ status: options.status ?? "pending" });
+  if (options.batchId) params.set("batch_id", options.batchId);
+  return parseResponse(await fetch(`/api/evaluation/review-items?${params}`));
 }
 
 export async function importReviewDecisions(

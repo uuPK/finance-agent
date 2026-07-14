@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 
+from app.schemas.evaluation import QueryReviewCreated, QueryReviewRequest
 from app.schemas.run import (
     ClarificationSubmission,
     QueryRunCreate,
@@ -11,6 +12,7 @@ from app.schemas.run import (
     QueryRunList,
     QueryRunSnapshot,
 )
+from app.services.evaluation_service import get_evaluation_manager
 from app.services.query_export_service import QueryExportError, QueryExportService
 from app.services.run_service import get_run_manager
 
@@ -39,6 +41,25 @@ async def get_run(query_id: UUID) -> QueryRunSnapshot:
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Query run not found.")
     return snapshot
+
+
+@router.post(
+    "/{query_id}/reviews",
+    response_model=QueryReviewCreated,
+    status_code=status.HTTP_201_CREATED,
+)
+async def submit_query_review(query_id: UUID, request: QueryReviewRequest) -> QueryReviewCreated:
+    try:
+        return await asyncio.to_thread(
+            get_evaluation_manager().repository.submit_query_review,
+            query_id,
+            request.user_id,
+            request.reason,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{query_id}/export")

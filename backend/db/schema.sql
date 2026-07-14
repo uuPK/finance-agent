@@ -334,6 +334,9 @@ create table if not exists agent.query_runs (
     current_stage varchar(64),
     clarification_context jsonb not null default '{}'::jsonb,
     final_response jsonb,
+    review_status varchar(32) not null default 'not_requested',
+    review_reason text,
+    review_requested_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -561,6 +564,8 @@ create table if not exists evaluation.review_batches (
     batch_name varchar(128) not null,
     status varchar(32) not null default 'open',
     dataset_version varchar(64),
+    eval_run_id uuid references evaluation.eval_runs(eval_run_id) on delete set null,
+    batch_type varchar(32) not null default 'legacy_backlog',
     created_by varchar(128) not null default 'system',
     exported_at timestamptz,
     imported_at timestamptz,
@@ -571,18 +576,31 @@ create table if not exists evaluation.review_batches (
 create table if not exists evaluation.review_items (
     review_item_id uuid primary key default gen_random_uuid(),
     review_batch_id uuid not null references evaluation.review_batches(review_batch_id) on delete cascade,
-    eval_result_id uuid not null references evaluation.eval_results(eval_result_id) on delete cascade,
+    eval_result_id uuid references evaluation.eval_results(eval_result_id) on delete cascade,
+    query_id uuid references agent.query_runs(query_id) on delete cascade,
+    source_type varchar(32) not null default 'evaluation',
+    user_reason text,
     status varchar(32) not null default 'pending',
     priority varchar(16) not null default 'normal',
     risk_reasons jsonb not null default '[]'::jsonb,
     assigned_to varchar(128),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
-    constraint uq_review_item_per_batch unique (review_batch_id, eval_result_id)
+    constraint uq_review_item_per_batch unique (review_batch_id, eval_result_id),
+    constraint ck_review_item_single_source check (
+        (eval_result_id is not null and query_id is null)
+        or (eval_result_id is null and query_id is not null)
+    )
 );
 
 create index if not exists idx_review_items_status on evaluation.review_items(status);
 create index if not exists idx_review_items_result on evaluation.review_items(eval_result_id);
+create index if not exists idx_review_items_query on evaluation.review_items(query_id);
+create unique index if not exists uq_review_item_query_feedback
+    on evaluation.review_items(query_id)
+    where query_id is not null and source_type = 'user_feedback';
+create index if not exists idx_review_batches_eval_run on evaluation.review_batches(eval_run_id);
+create index if not exists idx_review_batches_type on evaluation.review_batches(batch_type);
 
 create table if not exists evaluation.review_decisions (
     review_decision_id uuid primary key default gen_random_uuid(),

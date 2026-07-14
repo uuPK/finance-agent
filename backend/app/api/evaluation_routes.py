@@ -52,12 +52,23 @@ async def get_evaluation_run(eval_run_id: UUID) -> EvaluationRunDetail:
 
 @router.post("/review-batches", response_model=ReviewBatchSummary, status_code=status.HTTP_201_CREATED)
 async def create_review_batch(payload: ReviewBatchCreate) -> ReviewBatchSummary:
-    return await asyncio.to_thread(
-        get_evaluation_manager().repository.create_review_batch,
-        payload.batch_name,
-        payload.max_items,
-        payload.created_by,
-    )
+    try:
+        return await asyncio.to_thread(
+            get_evaluation_manager().repository.create_review_batch,
+            payload.eval_run_id,
+            payload.batch_name,
+            payload.max_items,
+            payload.created_by,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/review-batches", response_model=list[ReviewBatchSummary])
+async def list_review_batches(limit: int = Query(30, ge=1, le=100)) -> list[ReviewBatchSummary]:
+    return await asyncio.to_thread(get_evaluation_manager().repository.list_review_batches, limit)
 
 
 @router.get("/review-items", response_model=list[ReviewItemDetail])

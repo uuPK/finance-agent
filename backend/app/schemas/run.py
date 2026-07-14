@@ -62,6 +62,9 @@ class QueryRunSnapshot(BaseModel):
     error_type: str | None = None
     error_message: str | None = None
     clarification_context: dict[str, Any] = Field(default_factory=dict)
+    review_status: str = "not_requested"
+    review_reason: str | None = None
+    review_requested_at: datetime | None = None
     response: QueryResponse | None = None
     events: list[QueryEvent] = Field(default_factory=list)
     created_at: datetime

@@ -169,6 +169,9 @@ export interface QueryRunSnapshot {
   error_type?: string;
   error_message?: string;
   clarification_context: Record<string, unknown>;
+  review_status: "not_requested" | "pending" | "reviewed";
+  review_reason?: string;
+  review_requested_at?: string;
   response?: QueryResponse;
   events: QueryEvent[];
   created_at: string;
@@ -319,6 +322,10 @@ export interface ReviewBatchSummary {
   batch_name: string;
   status: string;
   item_count: number;
+  pending_count: number;
+  reviewed_count: number;
+  eval_run_id?: string;
+  batch_type: "evaluation_run" | "user_feedback" | "legacy_backlog";
   dataset_version?: string;
   created_at: string;
 }
@@ -329,6 +336,9 @@ export interface ReviewItemDetail {
   status: string;
   priority: string;
   risk_reasons: string[];
+  source_type: "evaluation" | "user_feedback";
+  query_id?: string;
+  user_reason?: string;
   case_code: string;
   question: string;
   difficulty: EvaluationDifficulty;
@@ -343,6 +353,16 @@ export interface ReviewItemDetail {
   failure_type?: string;
   failure_reason?: string;
   elapsed_ms?: number;
+  reviewer_id?: string;
+  verdict?: "correct" | "incorrect" | "needs_clarification" | "insufficient_data";
+  error_class?: string;
+  severity?: "minor" | "major" | "blocking";
+  corrected_query_plan: Record<string, unknown>;
+  corrected_sql?: string;
+  corrected_result: Record<string, unknown>;
+  reviewer_note?: string;
+  confidence?: number;
+  reviewed_at?: string;
 }
 
 export interface ReviewDecisionPayload {

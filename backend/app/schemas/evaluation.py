@@ -77,6 +77,7 @@ class EvaluationRunDetail(EvaluationRunSummary):
 
 
 class ReviewBatchCreate(BaseModel):
+    eval_run_id: UUID
     batch_name: str = Field(default="human-review", min_length=1, max_length=128)
     max_items: int = Field(default=50, ge=1, le=500)
     created_by: str = Field(default="system", min_length=1, max_length=128)
@@ -87,6 +88,10 @@ class ReviewBatchSummary(BaseModel):
     batch_name: str
     status: str
     item_count: int
+    pending_count: int = 0
+    reviewed_count: int = 0
+    eval_run_id: UUID | None = None
+    batch_type: str = "legacy_backlog"
     dataset_version: str | None = None
     created_at: datetime
 
@@ -120,6 +125,9 @@ class ReviewItemDetail(BaseModel):
     status: str
     priority: str
     risk_reasons: list[str] = Field(default_factory=list)
+    source_type: str = "evaluation"
+    query_id: UUID | None = None
+    user_reason: str | None = None
     case_code: str
     question: str
     difficulty: Difficulty
@@ -134,3 +142,25 @@ class ReviewItemDetail(BaseModel):
     failure_type: str | None = None
     failure_reason: str | None = None
     elapsed_ms: int | None = None
+    reviewer_id: str | None = None
+    verdict: ReviewVerdict | None = None
+    error_class: str | None = None
+    severity: ReviewSeverity | None = None
+    corrected_query_plan: dict[str, Any] = Field(default_factory=dict)
+    corrected_sql: str | None = None
+    corrected_result: dict[str, Any] = Field(default_factory=dict)
+    reviewer_note: str | None = None
+    confidence: float | None = None
+    reviewed_at: datetime | None = None
+
+
+class QueryReviewRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class QueryReviewCreated(BaseModel):
+    review_item_id: UUID
+    review_batch_id: UUID
+    status: str
+    already_submitted: bool = False
