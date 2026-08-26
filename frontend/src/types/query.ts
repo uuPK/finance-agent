@@ -233,6 +233,7 @@ export interface MetadataMetric {
   grain?: string;
   source_tables: string[];
   required_filters: Array<Record<string, unknown>>;
+  owner: string;
 }
 
 export interface MetadataBusinessTerm {
@@ -244,6 +245,7 @@ export interface MetadataBusinessTerm {
 }
 
 export interface MetadataJoin {
+  id: number;
   left_schema: string;
   left_table: string;
   left_column: string;
@@ -255,12 +257,31 @@ export interface MetadataJoin {
 }
 
 export interface MetadataQuestionExample {
+  id: number;
   question: string;
   difficulty: string;
   scenario: string;
   expected_query_plan: Record<string, unknown>;
   expected_sql?: string;
+  expected_result: Record<string, unknown>;
   tags: string[];
+}
+
+export interface MetadataRuleConstraint {
+  rule_code: string;
+  rule_name: string;
+  rule_type: string;
+  config: Record<string, unknown>;
+  severity: string;
+  description: string;
+}
+
+export type MetadataEditableKind = "metric" | "term" | "join" | "example" | "rule";
+
+export interface MetadataChangePayload {
+  action: "create" | "update";
+  kind: MetadataEditableKind;
+  payload: Record<string, unknown>;
 }
 
 export type EvaluationDifficulty = "simple" | "medium" | "complex";
@@ -377,4 +398,5 @@ export interface ReviewDecisionPayload {
   reviewer_note?: string;
   confidence?: number;
   source_checksum?: string;
+  metadata_changes?: MetadataChangePayload[];
 }

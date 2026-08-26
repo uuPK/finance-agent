@@ -30,6 +30,7 @@ from app.schemas.evaluation import (
     ReviewItemDetail,
 )
 from app.schemas.query import QueryRequest, QueryResponse
+from app.services.metadata_catalog_service import MetadataCatalogService
 from app.services.query_service import QueryService
 from app.services.run_repository import sanitize_event_payload
 from app.services.sql_executor import SQLExecutor
@@ -131,6 +132,7 @@ def _same_result_rows(
 class EvaluationRepository:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or default_engine
+        self.metadata_catalog = MetadataCatalogService(self.engine)
 
     def create_run(self, run_name: str, mode: str) -> UUID:
         with self.engine.begin() as connection:
@@ -757,6 +759,7 @@ class EvaluationRepository:
     def import_decisions(self, decisions: list[ReviewDecisionInput]) -> ReviewImportResult:
         accepted = 0
         rejected: list[str] = []
+        metadata_changes_applied = 0
         with self.engine.begin() as connection:
             for decision in decisions:
                 item = (
@@ -784,6 +787,13 @@ class EvaluationRepository:
                     continue
                 if item["status"] == "reviewed":
                     rejected.append(f"{decision.review_item_id}: already reviewed")
+                    continue
+                try:
+                    metadata_changes_applied += self.metadata_catalog.apply_review_changes(
+                        connection, decision.metadata_changes
+                    )
+                except (LookupError, ValueError) as exc:
+                    rejected.append(f"{decision.review_item_id}: metadata change rejected: {exc}")
                     continue
                 checksum = decision.source_checksum or self._decision_checksum(decision)
                 connection.execute(
@@ -858,7 +868,11 @@ class EvaluationRepository:
                     {"batch_id": str(item["review_batch_id"])},
                 )
                 accepted += 1
-        return ReviewImportResult(accepted=accepted, rejected=rejected)
+        return ReviewImportResult(
+            accepted=accepted,
+            rejected=rejected,
+            metadata_changes_applied=metadata_changes_applied,
+        )
 
     def _promote_review_feedback(
         self, connection: Any, item: Any, decision: ReviewDecisionInput

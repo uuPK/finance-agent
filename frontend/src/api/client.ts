@@ -13,6 +13,7 @@ import type {
   MetadataMetric,
   MetadataOverview,
   MetadataQuestionExample,
+  MetadataRuleConstraint,
   MetadataTable,
   MetadataTableDetail,
   ReviewBatchSummary,
@@ -146,6 +147,40 @@ export async function listMetadataExamples(): Promise<MetadataQuestionExample[]>
   return parseResponse(await fetch("/api/metadata/examples"));
 }
 
+export async function listMetadataRules(): Promise<MetadataRuleConstraint[]> {
+  return parseResponse(await fetch("/api/metadata/rules"));
+}
+
+export async function createMetadataRecord<T>(kind: string, payload: Record<string, unknown>): Promise<T> {
+  return parseResponse(
+    await fetch(`/api/metadata/${kind}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+  );
+}
+
+export async function updateMetadataRecord<T>(kind: string, identifier: string | number, payload: Record<string, unknown>): Promise<T> {
+  return parseResponse(
+    await fetch(`/api/metadata/${kind}/${encodeURIComponent(String(identifier))}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+  );
+}
+
+export async function deactivateMetadataRecord(kind: string, identifier: string | number): Promise<void> {
+  const response = await fetch(`/api/metadata/${kind}/${encodeURIComponent(String(identifier))}`, {
+    method: "DELETE"
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail ?? `请求失败（${response.status}）`);
+  }
+}
+
 const eventTypes = [
   "run.created",
   "stage.started",
@@ -229,7 +264,7 @@ export async function listReviewItems(options: {
 
 export async function importReviewDecisions(
   decisions: ReviewDecisionPayload[]
-): Promise<{ accepted: number; rejected: string[] }> {
+): Promise<{ accepted: number; rejected: string[]; metadata_changes_applied: number }> {
   return parseResponse(
     await fetch("/api/evaluation/review-imports", {
       method: "POST",

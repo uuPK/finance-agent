@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.schemas.metadata import MetadataChangeInput
+
 Difficulty = Literal["simple", "medium", "complex"]
 ReviewVerdict = Literal["correct", "incorrect", "needs_clarification", "insufficient_data"]
 ReviewSeverity = Literal["minor", "major", "blocking"]
@@ -108,6 +110,7 @@ class ReviewDecisionInput(BaseModel):
     reviewer_note: str | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     source_checksum: str | None = Field(default=None, max_length=128)
+    metadata_changes: list[MetadataChangeInput] = Field(default_factory=list, max_length=10)
 
 
 class ReviewImportRequest(BaseModel):
@@ -117,6 +120,7 @@ class ReviewImportRequest(BaseModel):
 class ReviewImportResult(BaseModel):
     accepted: int
     rejected: list[str] = Field(default_factory=list)
+    metadata_changes_applied: int = 0
 
 
 class ReviewItemDetail(BaseModel):

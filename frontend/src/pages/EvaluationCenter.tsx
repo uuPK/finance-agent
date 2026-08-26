@@ -28,6 +28,7 @@ import type {
   EvaluationDashboard,
   EvaluationRunDetail,
   EvaluationRunSummary,
+  MetadataEditableKind,
   ReviewBatchSummary,
   ReviewDecisionPayload,
   ReviewItemDetail
@@ -130,6 +131,9 @@ export function EvaluationCenter() {
   const [correctedPlan, setCorrectedPlan] = useState("");
   const [correctedSql, setCorrectedSql] = useState("");
   const [correctedResult, setCorrectedResult] = useState("");
+  const [captureMetadata, setCaptureMetadata] = useState(false);
+  const [metadataKind, setMetadataKind] = useState<MetadataEditableKind>("term");
+  const [metadataPayload, setMetadataPayload] = useState("");
 
   const loadRun = useCallback(async (runId: string) => {
     const detail = await getEvaluationRun(runId);
@@ -187,6 +191,15 @@ export function EvaluationCenter() {
     setCorrectedPlan(Object.keys(selectedItem.corrected_query_plan ?? {}).length ? JSON.stringify(selectedItem.corrected_query_plan, null, 2) : "");
     setCorrectedSql(selectedItem.corrected_sql ?? "");
     setCorrectedResult(Object.keys(selectedItem.corrected_result ?? {}).length ? JSON.stringify(selectedItem.corrected_result, null, 2) : "");
+    setCaptureMetadata(false);
+    setMetadataKind("term");
+    setMetadataPayload(JSON.stringify({
+      term: "",
+      definition: selectedItem.failure_reason || "请补充该失败案例需要的可验证业务口径。",
+      synonyms: [],
+      default_plan_fragment: {},
+      clarification_required: false
+    }, null, 2));
   }, [selectedItem]);
 
   const selectedResults = selectedRun?.results ?? [];
@@ -280,11 +293,18 @@ export function EvaluationCenter() {
         decision.corrected_sql = correctedSql.trim() || undefined;
         decision.corrected_result = parseJsonObject(correctedResult, "修正后的标准结果");
       }
+      if (captureMetadata) {
+        decision.metadata_changes = [{
+          action: "create",
+          kind: metadataKind,
+          payload: parseJsonObject(metadataPayload, "待沉淀元数据") ?? {}
+        }];
+      }
       const result = await importReviewDecisions([decision]);
       await loadOverview();
       if (activeBatchId) await loadReviewItems(activeBatchId, reviewFilter);
       setMessage(result.accepted
-        ? "人工复核结论已写入审计记录；完整的修正 SQL 与标准结果会在安全校验后沉淀为回归样本。"
+        ? `人工复核结论已写入审计记录；完整的修正 SQL 与标准结果会在安全校验后沉淀为回归样本。${result.metadata_changes_applied ? `已同步新增 ${result.metadata_changes_applied} 条元数据。` : ""}`
         : result.rejected.join("；"));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法提交人工复核结论。");
@@ -375,7 +395,17 @@ export function EvaluationCenter() {
 
             <section className="border border-line bg-white p-4">
               <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><ShieldAlert className="h-4 w-4 text-amber-700" /><div><h2 className="text-sm font-semibold text-ink">提交人工裁定</h2><p className="mt-1 text-xs text-muted">评测案例可沉淀修正事实；业务反馈保留人工裁定和审计记录。</p></div></div>{needsCorrection && selectedItem?.source_type === "evaluation" && <button type="button" onClick={loadStandardCorrection} className="inline-flex h-8 items-center gap-1 border border-line px-2 text-xs text-ink"><FileCheck2 className="h-3.5 w-3.5" />载入标准口径</button>}</div>
-              {selectedItem?.status === "reviewed" ? <ReviewedDecision item={selectedItem} /> : <div className="mt-4 grid gap-3 lg:grid-cols-2"><label className="text-xs font-medium text-muted">审核人<input value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="mt-1 h-9 w-full border border-line px-2 text-sm text-ink" /></label><label className="text-xs font-medium text-muted">结论<select value={verdict} onChange={(event) => setVerdict(event.target.value as ReviewDecisionPayload["verdict"])} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink"><option value="correct">正确</option><option value="incorrect">错误</option><option value="needs_clarification">需要澄清</option><option value="insufficient_data">数据不足</option></select></label><label className="text-xs font-medium text-muted">错误分类{verdict !== "correct" && <span className="ml-1 text-rose-700">必填</span>}<select value={errorClass} onChange={(event) => setErrorClass(event.target.value)} disabled={verdict === "correct"} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink disabled:bg-slate-50"><option value="">请选择</option>{errorClasses.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="text-xs font-medium text-muted">严重程度<select value={severity} onChange={(event) => setSeverity(event.target.value as ReviewDecisionPayload["severity"])} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink"><option value="minor">轻微</option><option value="major">主要</option><option value="blocking">阻断</option></select></label><label className="lg:col-span-2 text-xs font-medium text-muted">复核说明<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录业务判断、差异原因或补充依据" className="mt-1 min-h-24 w-full resize-y border border-line p-2 text-sm text-ink" /></label>{needsCorrection && <><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的查询计划（JSON）<textarea value={correctedPlan} onChange={(event) => setCorrectedPlan(event.target.value)} placeholder='{"intent": "..."}' className="mt-1 min-h-32 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的只读 SQL<label className="ml-1 font-normal text-muted">提供后将进行 SQL 安全校验并作为回归候选</label><textarea value={correctedSql} onChange={(event) => setCorrectedSql(event.target.value)} placeholder="SELECT ..." className="mt-1 min-h-28 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的标准结果（JSON）<textarea value={correctedResult} onChange={(event) => setCorrectedResult(event.target.value)} placeholder='{"columns": [], "rows": []}' className="mt-1 min-h-32 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label></>}<div className="flex flex-wrap gap-2 lg:col-span-2"><button type="button" onClick={() => void submitReview()} disabled={!isReviewReady} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><ClipboardCheck className="h-4 w-4" />回写裁定</button><label className="inline-flex h-9 cursor-pointer items-center gap-2 border border-line px-3 text-sm text-ink"><FileUp className="h-4 w-4" />导入 JSON / JSONL<input type="file" accept=".json,.jsonl,.ndjson" onChange={(event) => void importJsonl(event)} className="hidden" /></label></div></div>}
+              {selectedItem?.status === "reviewed" ? <ReviewedDecision item={selectedItem} /> : <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                <label className="text-xs font-medium text-muted">审核人<input value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="mt-1 h-9 w-full border border-line px-2 text-sm text-ink" /></label>
+                <label className="text-xs font-medium text-muted">结论<select value={verdict} onChange={(event) => setVerdict(event.target.value as ReviewDecisionPayload["verdict"])} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink"><option value="correct">正确</option><option value="incorrect">错误</option><option value="needs_clarification">需要澄清</option><option value="insufficient_data">数据不足</option></select></label>
+                <label className="text-xs font-medium text-muted">错误分类{verdict !== "correct" && <span className="ml-1 text-rose-700">必填</span>}<select value={errorClass} onChange={(event) => setErrorClass(event.target.value)} disabled={verdict === "correct"} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink disabled:bg-slate-50"><option value="">请选择</option>{errorClasses.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+                <label className="text-xs font-medium text-muted">严重程度<select value={severity} onChange={(event) => setSeverity(event.target.value as ReviewDecisionPayload["severity"])} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink"><option value="minor">轻微</option><option value="major">主要</option><option value="blocking">阻断</option></select></label>
+                <label className="lg:col-span-2 text-xs font-medium text-muted">复核说明<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录业务判断、差异原因或补充依据" className="mt-1 min-h-24 w-full resize-y border border-line p-2 text-sm text-ink" /></label>
+                {needsCorrection && <><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的查询计划（JSON）<textarea value={correctedPlan} onChange={(event) => setCorrectedPlan(event.target.value)} placeholder='{"intent": "..."}' className="mt-1 min-h-32 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的只读 SQL<label className="ml-1 font-normal text-muted">提供后将进行 SQL 安全校验并作为回归候选</label><textarea value={correctedSql} onChange={(event) => setCorrectedSql(event.target.value)} placeholder="SELECT ..." className="mt-1 min-h-28 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label><label className="lg:col-span-2 text-xs font-medium text-muted">修正后的标准结果（JSON）<textarea value={correctedResult} onChange={(event) => setCorrectedResult(event.target.value)} placeholder='{"columns": [], "rows": []}' className="mt-1 min-h-32 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label></>}
+                <label className="lg:col-span-2 flex items-center gap-2 border border-line bg-slate-50 px-3 py-2 text-sm text-ink"><input type="checkbox" checked={captureMetadata} onChange={(event) => setCaptureMetadata(event.target.checked)} disabled={verdict === "correct"} />将本案例的业务口径沉淀为新元数据</label>
+                {captureMetadata && <><label className="text-xs font-medium text-muted">元数据类型<select value={metadataKind} onChange={(event) => setMetadataKind(event.target.value as MetadataEditableKind)} className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm text-ink"><option value="term">业务术语</option><option value="metric">指标</option><option value="join">关联关系</option><option value="example">问法样例</option><option value="rule">规则约束</option></select></label><p className="self-end text-xs leading-5 text-muted">与本次裁定同一事务保存；指标和关联会校验只引用官方 mart 表与字段。</p><label className="lg:col-span-2 text-xs font-medium text-muted">待沉淀元数据（JSON）<textarea value={metadataPayload} onChange={(event) => setMetadataPayload(event.target.value)} className="mt-1 min-h-32 w-full resize-y border border-line p-2 font-mono text-xs leading-5 text-ink" /></label></>}
+                <div className="flex flex-wrap gap-2 lg:col-span-2"><button type="button" onClick={() => void submitReview()} disabled={!isReviewReady} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><ClipboardCheck className="h-4 w-4" />回写裁定</button><label className="inline-flex h-9 cursor-pointer items-center gap-2 border border-line px-3 text-sm text-ink"><FileUp className="h-4 w-4" />导入 JSON / JSONL<input type="file" accept=".json,.jsonl,.ndjson" onChange={(event) => void importJsonl(event)} className="hidden" /></label></div>
+              </div>}
             </section>
           </div>
         </section>
