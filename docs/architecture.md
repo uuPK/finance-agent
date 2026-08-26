@@ -1,54 +1,62 @@
-# Architecture
+# 系统架构
 
-## 目标
+## 设计目标
 
-构建面向客户营销场景的可信智能问数 Agent。系统以 PostgreSQL 为数据底座，以 FastAPI 提供服务，以 LangGraph 编排 Actor-Critic 查询流程。
+构建面向证券客户营销场景的可信智能问数 Agent：业务人员通过自然语言完成客户画像、资产、交易、持仓和营销分群查询；系统在执行前完成业务语义、安全与结果校验，并留下可复核证据。
 
 ## 核心链路
 
 ```text
-User Question
-  -> Intent Parser
-  -> Metadata Retriever
-  -> QueryPlan Actor
-  -> Plan Critic
+用户问题
+  -> 官方元数据召回
+  -> QueryPlan Actor（意图、指标、维度、过滤、时间、粒度、澄清项）
+  -> QueryPlan 硬校验 + Plan Critic + 有限修复
   -> SQL Actor
-  -> SQL Guardrail
-  -> SQL Executor
-  -> Result Critic
-  -> Final Answer
+  -> SQL Guardrail + SQL Critic + 有限修复
+  -> PostgreSQL 只读执行
+  -> 结果硬校验 + Result Critic
+  -> 可解释答案、SSE 阶段事件、审计记录和可导出结果
 ```
+
+系统以 Actor / Critic 职责分离实现 Agentic 闭环：Actor 负责生成候选计划或 SQL；Critic 负责输出结构化问题与修复建议；硬校验负责确定性的安全底线。LLM 不可用或输出不合规时，计划生成可回退到确定性规则策略。
 
 ## 关键设计
 
-1. QueryPlan 先于 SQL
+### QueryPlan 优先于 SQL
 
-   模型先生成结构化 QueryPlan，再编译或生成 SQL。这样可以更早发现遗漏时间范围、指标口径、筛选条件和粒度错误。
+QueryPlan 是自然语言问题与 SQL 之间的中间协议。它显式描述查询意图、指标、筛选条件、维度、预期粒度和需要澄清的信息，使系统能在执行前发现时间范围遗漏、指标口径错误、维度缺失和粒度冲突。
 
-2. Guardrail 分层
+### 元数据治理与物理表边界
 
-   - SQL 安全：只读、白名单、超时、行数限制。
-   - Schema 合法性：表、字段、join 关系、指标定义必须存在。
-   - 业务语义：QueryPlan 是否覆盖用户意图。
-   - 结果合理性：字段、行数、粒度和解释是否一致。
+- 官方业务数据固定在 `mart` schema，表和列结构不提供修改接口。
+- `metadata` schema 保存可运营的表/列说明、指标、术语、关联关系、问法样例和规则约束。
+- 元数据检索只向模型提供与问题相关的上下文；新增指标与关联必须引用真实存在的 `mart` 表和字段。
+- 人工复核可以沉淀语义元数据；物理业务数据不可由该流程修改。
 
-3. Actor-Critic 修复闭环
+### 纵深安全围栏
 
-   Critic 只负责指出问题并给出结构化修复建议，Actor 根据建议重新生成 QueryPlan 或 SQL。
+- SQL 必须是单条、只读、显式字段的 `SELECT`。
+- 仅允许 `mart` schema、元数据白名单中的表/列和批准函数。
+- 禁止 DDL/DML、`SELECT INTO`、行锁、递归 CTE、敏感字段、无界结果和超大偏移量。
+- 执行阶段使用 PostgreSQL 只读事务、语句超时与最大返回行数。
+- QueryPlan、SQL 与结果均保留校验结果；人工复核提交的纠正 SQL 也复用同一规则。
 
-4. 自动评测中心
+### 可观测与人工闭环
 
-   通过问答对持续统计 SQL 可执行率、结果准确率、一次通过率、修复后通过率、平均耗时和失败原因。
+`agent` schema 持久化查询运行、事件、阶段、Guardrail、SQL 执行、结果校验和导出记录。前端通过 SSE 实时展示每个阶段；失败案例进入评测复核队列后，可回写裁定、修正语义元数据和回归样例。
 
-## 初始服务边界
+## 服务边界
 
-- `backend/app/agents`: LangGraph 工作流与节点。
-- `backend/app/guardrails`: SQL 和语义校验。
-- `backend/app/metadata`: 元数据模型与检索。
-- `backend/app/evaluation`: 离线评测流程。
-- `backend/app/db`: PostgreSQL 连接与会话。
-- `frontend/src`: 问数工作台、过程展示、元数据、评测中心。
+| 目录 | 责任 |
+| --- | --- |
+| `backend/app/agents` | QueryPlan、SQL、结果生成与 Critic 节点 |
+| `backend/app/guardrails` | SQL AST 与结果校验 |
+| `backend/app/metadata` | 元数据检索与物理 schema 上下文 |
+| `backend/app/services` | 问数编排、运行审计、导出、评测与复核 |
+| `backend/app/api` | FastAPI REST / SSE 接口 |
+| `frontend/src` | 智能问数、历史、元数据、评测工作台 |
+| `backend/db` | 官方数据导入、67 题基线生成、schema 与迁移 |
 
-## QueryPlan 标准
+## 数据与评测
 
-QueryPlan 是自然语言问题和 SQL 之间的中间协议。当前标准见 `docs/query_plan_standard.md`。
+项目基于 8 张官方脱敏 `mart` 表，保存 7 条官方原始问答和 60 条由官方表实跑生成的回归题。评测中心以真实 Agent 输出计算可执行率、结果准确率、一次通过率、修复后通过率、耗时和失败原因；详见 [官方数据与评测基线](official_dataset.md) 与 [评测设计](evaluation_design.md)。
