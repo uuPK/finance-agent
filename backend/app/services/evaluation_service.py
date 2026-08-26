@@ -136,7 +136,10 @@ class EvaluationRepository:
         self.metadata_catalog = MetadataCatalogService(self.engine)
         self.schema_context_provider = SchemaContextProvider(self.engine)
 
-    def create_run(self, run_name: str, mode: str) -> UUID:
+    def create_run(self, run_name: str, mode: str, case_source: str | None = None) -> UUID:
+        dataset_version = (
+            "official-v1-extension" if case_source == "official_extension" else "official-v1"
+        )
         with self.engine.begin() as connection:
             return connection.execute(
                 text(
@@ -144,20 +147,25 @@ class EvaluationRepository:
                     insert into evaluation.eval_runs
                         (run_name, model_name, status, dataset_version, metadata_version, prompt_version,
                          evaluation_mode)
-                    values (:run_name, 'deepseek-chat', 'running', 'official-v1', 'official-metadata-v1',
+                    values (:run_name, 'deepseek-chat', 'running', :dataset_version, 'official-metadata-v1',
                             'official-query-pipeline-v1', :mode)
                     returning eval_run_id
                     """
                 ),
-                {"run_name": run_name, "mode": mode},
+                {"run_name": run_name, "mode": mode, "dataset_version": dataset_version},
             ).scalar_one()
 
-    def load_cases(self, difficulty: str | None, limit: int) -> list[dict[str, Any]]:
+    def load_cases(
+        self, difficulty: str | None, case_source: str | None, limit: int
+    ) -> list[dict[str, Any]]:
         where = "where is_active = true"
         params: dict[str, Any] = {"limit": limit}
         if difficulty:
             where += " and difficulty = :difficulty"
             params["difficulty"] = difficulty
+        if case_source:
+            where += " and source_type = :case_source"
+            params["case_source"] = case_source
         with self.engine.connect() as connection:
             rows = (
                 connection.execute(
@@ -1041,9 +1049,20 @@ class EvaluationManager:
         self.service_factory = service_factory
         self.tasks: set[asyncio.Task[None]] = set()
 
-    async def start_run(self, run_name: str, difficulty: str | None, limit: int, mode: str) -> UUID:
-        eval_run_id = await asyncio.to_thread(self.repository.create_run, run_name, mode)
-        cases = await asyncio.to_thread(self.repository.load_cases, difficulty, limit)
+    async def start_run(
+        self,
+        run_name: str,
+        difficulty: str | None,
+        case_source: str | None,
+        limit: int,
+        mode: str,
+    ) -> UUID:
+        eval_run_id = await asyncio.to_thread(
+            self.repository.create_run, run_name, mode, case_source
+        )
+        cases = await asyncio.to_thread(
+            self.repository.load_cases, difficulty, case_source, limit
+        )
         self._start_task(self._execute(eval_run_id, cases))
         return eval_run_id
 

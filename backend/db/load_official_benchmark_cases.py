@@ -31,6 +31,9 @@ from app.db.session import engine
 DATASET_VERSION = "official-v1"
 SOURCE_TYPE = "official_derived"
 TAG = "official_derived"
+EXTENSION_DATASET_VERSION = "official-v1-extension"
+EXTENSION_SOURCE_TYPE = "official_extension"
+EXTENSION_TAG = "official_extension"
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,12 @@ class BenchmarkCase:
 
 def _case(no: int, question: str, difficulty: str, sql: str, topic: str) -> BenchmarkCase:
     return BenchmarkCase(f"REG-{no:03d}", question, difficulty, sql.strip(), topic)
+
+
+def _extension_case(
+    no: int, question: str, difficulty: str, sql: str, topic: str
+) -> BenchmarkCase:
+    return BenchmarkCase(f"EXT-{no:03d}", question, difficulty, sql.strip(), topic)
 
 
 CASES: tuple[BenchmarkCase, ...] = (
@@ -648,6 +657,279 @@ CASES: tuple[BenchmarkCase, ...] = (
 )
 
 
+# Held-out extension set.  These are evaluated against the same official tables but are
+# deliberately not inserted into metadata.question_examples, so the Agent cannot retrieve
+# an exact question/SQL pair during this generalization check.
+EXTENSION_CASES: tuple[BenchmarkCase, ...] = (
+    _extension_case(1, "当前官方客户快照中，客户平均年龄是多少？", "simple", """
+        select avg(cust_age) as average_customer_age
+        from mart.ads_cust_info_d
+        limit 1
+    """, "customer"),
+    _extension_case(2, "当前官方客户快照中，年龄不低于40岁的去重客户有多少位？", "simple", """
+        select count(distinct pty_id) as customer_count
+        from mart.ads_cust_info_d
+        where cust_age >= 40
+        limit 1
+    """, "customer"),
+    _extension_case(3, "请按性别代码和客户状态统计当前客户数。", "medium", """
+        select gender_cd, cust_status, count(distinct pty_id) as customer_count
+        from mart.ads_cust_info_d
+        group by gender_cd, cust_status
+        order by customer_count desc, gender_cd, cust_status
+        limit 50
+    """, "customer"),
+    _extension_case(4, "请按客户等级代码统计当前客户数和平均年龄。", "medium", """
+        select cust_lvl_cd, count(distinct pty_id) as customer_count,
+               avg(cust_age) as average_customer_age
+        from mart.ads_cust_info_d
+        group by cust_lvl_cd
+        order by customer_count desc, cust_lvl_cd
+        limit 20
+    """, "customer"),
+    _extension_case(5, "请按一级营业部统计当前客户数，展示前20个一级营业部。", "medium", """
+        select b.up_org_name, count(distinct c.pty_id) as customer_count
+        from mart.ads_cust_info_d c
+        join mart.dim_branch b on b.org_id = c.org_id
+        group by b.up_org_name
+        order by customer_count desc, b.up_org_name
+        limit 20
+    """, "customer"),
+    _extension_case(6, "当前官方客户快照中，已分配营业部的去重客户有多少位？", "simple", """
+        select count(distinct pty_id) as customer_count
+        from mart.ads_cust_info_d
+        where org_id is not null and org_id <> ''
+        limit 1
+    """, "customer"),
+    _extension_case(7, "截至2026年3月31日，普通账户总资产合计是多少？", "simple", """
+        select sum(coalesce(nm_tot_aset, 0)) as normal_total_asset
+        from mart.dws_cust_aset_d
+        where data_dt = '20260331'
+        limit 1
+    """, "asset"),
+    _extension_case(8, "截至2026年3月31日，信用账户净资产合计是多少？", "simple", """
+        select sum(coalesce(fc_pur_aset, 0)) as credit_total_asset
+        from mart.dws_cust_aset_d
+        where data_dt = '20260331'
+        limit 1
+    """, "asset"),
+    _extension_case(9, "截至2026年3月31日，总资产低于10万元的客户有多少位？", "simple", """
+        select count(distinct pty_id) as customer_count
+        from mart.dws_cust_aset_d
+        where data_dt = '20260331'
+          and coalesce(nm_tot_aset, 0) + coalesce(fc_pur_aset, 0) < 100000
+        limit 1
+    """, "asset"),
+    _extension_case(10, "截至2026年3月31日，请按客户类型统计客户数和总资产。", "medium", """
+        select c.cust_type, count(distinct a.pty_id) as customer_count,
+               sum(coalesce(a.nm_tot_aset, 0) + coalesce(a.fc_pur_aset, 0)) as total_asset
+        from mart.dws_cust_aset_d a
+        join mart.ads_cust_info_d c on c.pty_id = a.pty_id
+        where a.data_dt = '20260331'
+        group by c.cust_type
+        order by total_asset desc, c.cust_type
+        limit 20
+    """, "asset"),
+    _extension_case(11, "截至2026年3月31日，请按客户等级代码汇总客户总资产，展示前20个等级。", "medium", """
+        select c.cust_lvl_cd,
+               sum(coalesce(a.nm_tot_aset, 0) + coalesce(a.fc_pur_aset, 0)) as total_asset
+        from mart.dws_cust_aset_d a
+        join mart.ads_cust_info_d c on c.pty_id = a.pty_id
+        where a.data_dt = '20260331'
+        group by c.cust_lvl_cd
+        order by total_asset desc, c.cust_lvl_cd
+        limit 20
+    """, "asset"),
+    _extension_case(12, "截至2026年3月31日，请按一级营业部汇总客户总资产，展示前20个一级营业部。", "medium", """
+        select b.up_org_name,
+               sum(coalesce(a.nm_tot_aset, 0) + coalesce(a.fc_pur_aset, 0)) as total_asset
+        from mart.dws_cust_aset_d a
+        join mart.ads_cust_info_d c on c.pty_id = a.pty_id
+        join mart.dim_branch b on b.org_id = c.org_id
+        where a.data_dt = '20260331'
+        group by b.up_org_name
+        order by total_asset desc, b.up_org_name
+        limit 20
+    """, "asset"),
+    _extension_case(13, "2026年第一季度，客户买入金额和卖出金额分别是多少？", "simple", """
+        select sum(coalesce(buy_amt, 0)) as buy_amount,
+               sum(coalesce(sell_amt, 0)) as sell_amount
+        from mart.dwd_cust_tran_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "trade"),
+    _extension_case(14, "2026年第一季度，客户交易费用合计是多少？", "simple", """
+        select sum(coalesce(buy_fare, 0) + coalesce(sell_fare, 0)) as trade_fee
+        from mart.dwd_cust_tran_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "trade"),
+    _extension_case(15, "2026年第一季度，客户成交数量合计是多少？", "simple", """
+        select sum(coalesce(buy_mnt, 0) + coalesce(sell_mnt, 0)) as trade_quantity
+        from mart.dwd_cust_tran_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "trade"),
+    _extension_case(16, "2026年第一季度，请按币种统计交易金额。", "medium", """
+        select ccy, sum(coalesce(buy_amt, 0) + coalesce(sell_amt, 0)) as trade_amount
+        from mart.dwd_cust_tran_d
+        where data_dt between '20260101' and '20260331'
+        group by ccy
+        order by trade_amount desc, ccy
+        limit 20
+    """, "trade"),
+    _extension_case(17, "2026年3月，客户交易金额合计是多少？", "simple", """
+        select sum(coalesce(buy_amt, 0) + coalesce(sell_amt, 0)) as trade_amount
+        from mart.dwd_cust_tran_d
+        where data_dt between '20260301' and '20260331'
+        limit 1
+    """, "trade"),
+    _extension_case(18, "2026年第一季度，同时发生过买入和卖出的去重客户有多少位？", "medium", """
+        select count(*) as customer_count
+        from (
+            select pty_id
+            from mart.dwd_cust_tran_d
+            where data_dt between '20260101' and '20260331'
+            group by pty_id
+            having sum(coalesce(buy_amt, 0)) > 0 and sum(coalesce(sell_amt, 0)) > 0
+        ) customer_trade
+        limit 1
+    """, "trade"),
+    _extension_case(19, "截至2026年3月31日，请按币种统计持仓客户数和持仓市值。", "medium", """
+        select ccy, count(distinct pty_id) as customer_count,
+               sum(coalesce(mkt_val, 0)) as holding_market_value
+        from mart.dwd_cust_hold_d
+        where data_dt = '20260331'
+        group by ccy
+        order by holding_market_value desc, ccy
+        limit 20
+    """, "holding"),
+    _extension_case(20, "截至2026年3月31日，请列出持有份额最高的20只产品。", "medium", """
+        select h.prdt_id, p.prdt_name, sum(coalesce(h.hold_cnt, 0)) as holding_quantity
+        from mart.dwd_cust_hold_d h
+        join mart.dim_product p on p.prdt_id = h.prdt_id
+        where h.data_dt = '20260331'
+        group by h.prdt_id, p.prdt_name
+        order by holding_quantity desc, h.prdt_id
+        limit 20
+    """, "holding"),
+    _extension_case(21, "截至2026年3月31日，请按产品市场统计持仓市值。", "medium", """
+        select p.market_id, sum(coalesce(h.mkt_val, 0)) as holding_market_value
+        from mart.dwd_cust_hold_d h
+        join mart.dim_product p on p.prdt_id = h.prdt_id
+        where h.data_dt = '20260331'
+        group by p.market_id
+        order by holding_market_value desc, p.market_id
+        limit 20
+    """, "holding"),
+    _extension_case(22, "截至2026年3月31日，持有至少两只不同产品的客户有多少位？", "medium", """
+        select count(*) as customer_count
+        from (
+            select pty_id
+            from mart.dwd_cust_hold_d
+            where data_dt = '20260331'
+            group by pty_id
+            having count(distinct prdt_id) >= 2
+        ) customer_holding
+        limit 1
+    """, "holding"),
+    _extension_case(23, "2026年第一季度，客户现金净流入合计是多少？", "simple", """
+        select sum(coalesce(cash_in, 0) - coalesce(cash_out, 0)) as net_cash_inflow
+        from mart.dws_cust_fin_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "cash_flow"),
+    _extension_case(24, "2026年第一季度，客户转账金额合计是多少？", "simple", """
+        select sum(coalesce(tran_in, 0) + coalesce(tran_out, 0)) as transfer_amount
+        from mart.dws_cust_fin_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "cash_flow"),
+    _extension_case(25, "2026年第一季度，客户划拨金额合计是多少？", "simple", """
+        select sum(coalesce(assign_in, 0) + coalesce(assign_out, 0)) as assignment_amount
+        from mart.dws_cust_fin_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "cash_flow"),
+    _extension_case(26, "2026年第一季度，有资金流水记录的去重客户有多少位？", "simple", """
+        select count(distinct pty_id) as customer_count
+        from mart.dws_cust_fin_d
+        where data_dt between '20260101' and '20260331'
+        limit 1
+    """, "cash_flow"),
+    _extension_case(27, "截至2026年3月31日总资产不少于30万元且第一季度净资金流入为正的客户有多少位？", "complex", """
+        with asset_customer as (
+            select pty_id
+            from mart.dws_cust_aset_d
+            where data_dt = '20260331'
+              and coalesce(nm_tot_aset, 0) + coalesce(fc_pur_aset, 0) >= 300000
+        ), positive_cash_customer as (
+            select pty_id
+            from mart.dws_cust_fin_d
+            where data_dt between '20260101' and '20260331'
+            group by pty_id
+            having sum(coalesce(cash_in, 0) + coalesce(tran_in, 0) + coalesce(assign_in, 0)
+                       - coalesce(cash_out, 0) - coalesce(tran_out, 0) - coalesce(assign_out, 0)) > 0
+        )
+        select count(*) as customer_count
+        from asset_customer a
+        join positive_cash_customer f on f.pty_id = a.pty_id
+        limit 1
+    """, "segment"),
+    _extension_case(28, "截至2026年3月31日总资产不少于10万元且持仓市值不少于10万元的客户有多少位？", "complex", """
+        with asset_customer as (
+            select pty_id
+            from mart.dws_cust_aset_d
+            where data_dt = '20260331'
+              and coalesce(nm_tot_aset, 0) + coalesce(fc_pur_aset, 0) >= 100000
+        ), holding_customer as (
+            select pty_id
+            from mart.dwd_cust_hold_d
+            where data_dt = '20260331'
+            group by pty_id
+            having sum(coalesce(mkt_val, 0)) >= 100000
+        )
+        select count(*) as customer_count
+        from asset_customer a
+        join holding_customer h on h.pty_id = a.pty_id
+        limit 1
+    """, "segment"),
+    _extension_case(29, "2026年第一季度发生股票类交易且截至3月31日仍有持仓的客户有多少位？", "complex", """
+        with stock_trade_customer as (
+            select distinct t.pty_id
+            from mart.dwd_cust_tran_d t
+            join mart.dim_product p on p.prdt_id = t.prdt_id
+            where t.data_dt between '20260101' and '20260331'
+              and p.up_prdt_type_id = 'PT040000'
+        ), holding_customer as (
+            select distinct pty_id
+            from mart.dwd_cust_hold_d
+            where data_dt = '20260331' and coalesce(mkt_val, 0) > 0
+        )
+        select count(*) as customer_count
+        from stock_trade_customer t
+        join holding_customer h on h.pty_id = t.pty_id
+        limit 1
+    """, "segment"),
+    _extension_case(30, "截至2026年3月31日，请按客户状态统计总资产不少于10万元客户的客户数和持仓市值。", "complex", """
+        with asset_customer as (
+            select pty_id
+            from mart.dws_cust_aset_d
+            where data_dt = '20260331'
+              and coalesce(nm_tot_aset, 0) + coalesce(fc_pur_aset, 0) >= 100000
+        )
+        select c.cust_status, count(distinct a.pty_id) as customer_count,
+               sum(coalesce(h.mkt_val, 0)) as holding_market_value
+        from asset_customer a
+        join mart.ads_cust_info_d c on c.pty_id = a.pty_id
+        left join mart.dwd_cust_hold_d h on h.pty_id = a.pty_id and h.data_dt = '20260331'
+        group by c.cust_status
+        order by holding_market_value desc nulls last, c.cust_status
+        limit 20
+    """, "segment"),
+)
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
@@ -669,11 +951,14 @@ def _result_payload(cursor: Any, sql: str) -> dict[str, Any]:
 def _validate_cases() -> None:
     if len(CASES) < 50:
         raise ValueError("The official regression bank must contain at least 50 cases.")
-    codes = [case.code for case in CASES]
-    questions = [case.question for case in CASES]
+    if len(EXTENSION_CASES) != 30:
+        raise ValueError("The held-out official extension must contain exactly 30 cases.")
+    all_cases = CASES + EXTENSION_CASES
+    codes = [case.code for case in all_cases]
+    questions = [case.question for case in all_cases]
     if len(codes) != len(set(codes)) or len(questions) != len(set(questions)):
         raise ValueError("Benchmark case codes and questions must be unique.")
-    for case in CASES:
+    for case in all_cases:
         sql = case.sql.lower()
         if "mart." not in sql or " limit " not in sql or ".name" in sql:
             raise ValueError(f"{case.code} is not an official, bounded, non-sensitive query.")
@@ -684,63 +969,86 @@ def main() -> None:
     raw_connection = engine.raw_connection()
     try:
         with raw_connection.cursor() as cursor:
-            # Keep historic evaluation rows intact; only active derived rows are refreshed.
-            cursor.execute(
-                "update evaluation.eval_cases set is_active = false where source_type = %s",
-                (SOURCE_TYPE,),
+            case_sets = (
+                (CASES, DATASET_VERSION, SOURCE_TYPE, TAG, True),
+                (
+                    EXTENSION_CASES,
+                    EXTENSION_DATASET_VERSION,
+                    EXTENSION_SOURCE_TYPE,
+                    EXTENSION_TAG,
+                    False,
+                ),
             )
-            cursor.execute(
-                "delete from metadata.question_examples where tags @> %s::jsonb",
-                (Jsonb([TAG]),),
-            )
+            # Keep historic evaluation rows intact; only the reproducible official
+            # derived bank and its held-out extension rows are refreshed.
+            for _, _, source_type, tag, include_as_retrieval_example in case_sets:
+                cursor.execute(
+                    "update evaluation.eval_cases set is_active = false where source_type = %s",
+                    (source_type,),
+                )
+                if include_as_retrieval_example:
+                    cursor.execute(
+                        "delete from metadata.question_examples where tags @> %s::jsonb",
+                        (Jsonb([tag]),),
+                    )
 
-            for case in CASES:
-                expected_result = _result_payload(cursor, case.sql)
-                tags = [TAG, "benchmark", case.topic, case.difficulty, case.code.lower()]
-                expected_plan = {"intent": "metric_query", "scenario": "customer_marketing"}
-                cursor.execute(
-                    """
-                    insert into metadata.question_examples
-                        (question, difficulty, scenario, expected_query_plan, expected_sql, expected_result, tags)
-                    values (%s, %s, 'customer_marketing', %s, %s, %s, %s)
-                    """,
-                    (case.question, case.difficulty, Jsonb(expected_plan), case.sql, Jsonb(expected_result), Jsonb(tags)),
-                )
-                cursor.execute(
-                    """
-                    insert into evaluation.eval_cases
-                        (case_code, question, difficulty, scenario, expected_query_plan, expected_sql,
-                         expected_result, scoring_config, dataset_version, source_type, expected_status,
-                         tags, is_active)
-                    values (%s, %s, %s, 'customer_marketing', %s, %s, %s, %s, %s, %s, 'completed', %s, true)
-                    on conflict (case_code) do update set
-                        question = excluded.question,
-                        difficulty = excluded.difficulty,
-                        scenario = excluded.scenario,
-                        expected_query_plan = excluded.expected_query_plan,
-                        expected_sql = excluded.expected_sql,
-                        expected_result = excluded.expected_result,
-                        scoring_config = excluded.scoring_config,
-                        dataset_version = excluded.dataset_version,
-                        source_type = excluded.source_type,
-                        expected_status = excluded.expected_status,
-                        tags = excluded.tags,
-                        is_active = true,
-                        updated_at = now()
-                    """,
-                    (
-                        case.code,
-                        case.question,
-                        case.difficulty,
-                        Jsonb(expected_plan),
-                        case.sql,
-                        Jsonb(expected_result),
-                        Jsonb({"comparison": "unordered", "require_execution": True}),
-                        DATASET_VERSION,
-                        SOURCE_TYPE,
-                        Jsonb(tags),
-                    ),
-                )
+            for cases, dataset_version, source_type, tag, include_as_retrieval_example in case_sets:
+                for case in cases:
+                    expected_result = _result_payload(cursor, case.sql)
+                    tags = [tag, "benchmark", case.topic, case.difficulty, case.code.lower()]
+                    expected_plan = {"intent": "metric_query", "scenario": "customer_marketing"}
+                    if include_as_retrieval_example:
+                        cursor.execute(
+                            """
+                            insert into metadata.question_examples
+                                (question, difficulty, scenario, expected_query_plan, expected_sql,
+                                 expected_result, tags)
+                            values (%s, %s, 'customer_marketing', %s, %s, %s, %s)
+                            """,
+                            (
+                                case.question,
+                                case.difficulty,
+                                Jsonb(expected_plan),
+                                case.sql,
+                                Jsonb(expected_result),
+                                Jsonb(tags),
+                            ),
+                        )
+                    cursor.execute(
+                        """
+                        insert into evaluation.eval_cases
+                            (case_code, question, difficulty, scenario, expected_query_plan, expected_sql,
+                             expected_result, scoring_config, dataset_version, source_type, expected_status,
+                             tags, is_active)
+                        values (%s, %s, %s, 'customer_marketing', %s, %s, %s, %s, %s, %s, 'completed', %s, true)
+                        on conflict (case_code) do update set
+                            question = excluded.question,
+                            difficulty = excluded.difficulty,
+                            scenario = excluded.scenario,
+                            expected_query_plan = excluded.expected_query_plan,
+                            expected_sql = excluded.expected_sql,
+                            expected_result = excluded.expected_result,
+                            scoring_config = excluded.scoring_config,
+                            dataset_version = excluded.dataset_version,
+                            source_type = excluded.source_type,
+                            expected_status = excluded.expected_status,
+                            tags = excluded.tags,
+                            is_active = true,
+                            updated_at = now()
+                        """,
+                        (
+                            case.code,
+                            case.question,
+                            case.difficulty,
+                            Jsonb(expected_plan),
+                            case.sql,
+                            Jsonb(expected_result),
+                            Jsonb({"comparison": "unordered", "require_execution": True}),
+                            dataset_version,
+                            source_type,
+                            Jsonb(tags),
+                        ),
+                    )
         raw_connection.commit()
     except Exception:
         raw_connection.rollback()
@@ -748,8 +1056,28 @@ def main() -> None:
     finally:
         raw_connection.close()
 
-    difficulty_counts = {difficulty: sum(case.difficulty == difficulty for case in CASES) for difficulty in ("simple", "medium", "complex")}
-    print(json.dumps({"loaded_cases": len(CASES), "difficulty_counts": difficulty_counts, "source_type": SOURCE_TYPE}, ensure_ascii=False))
+    difficulty_counts = {
+        difficulty: sum(case.difficulty == difficulty for case in CASES)
+        for difficulty in ("simple", "medium", "complex")
+    }
+    extension_difficulty_counts = {
+        difficulty: sum(case.difficulty == difficulty for case in EXTENSION_CASES)
+        for difficulty in ("simple", "medium", "complex")
+    }
+    print(
+        json.dumps(
+            {
+                "loaded_cases": len(CASES),
+                "difficulty_counts": difficulty_counts,
+                "source_type": SOURCE_TYPE,
+                "loaded_extension_cases": len(EXTENSION_CASES),
+                "extension_difficulty_counts": extension_difficulty_counts,
+                "extension_source_type": EXTENSION_SOURCE_TYPE,
+                "extension_is_held_out": True,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

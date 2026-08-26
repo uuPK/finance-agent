@@ -32,7 +32,11 @@ async def get_dashboard() -> EvaluationDashboard:
 @router.post("/runs", response_model=EvaluationRunCreated, status_code=status.HTTP_202_ACCEPTED)
 async def create_evaluation_run(payload: EvaluationRunCreate) -> EvaluationRunCreated:
     eval_run_id = await get_evaluation_manager().start_run(
-        payload.run_name, payload.difficulty, payload.limit, payload.evaluation_mode
+        payload.run_name,
+        payload.difficulty,
+        payload.case_source,
+        payload.limit,
+        payload.evaluation_mode,
     )
     return EvaluationRunCreated(eval_run_id=eval_run_id, status="running")
 

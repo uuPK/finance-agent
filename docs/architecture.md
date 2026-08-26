@@ -55,8 +55,8 @@ QueryPlan 是自然语言问题与 SQL 之间的中间协议。它显式描述�
 | `backend/app/services` | 问数编排、运行审计、导出、评测与复核 |
 | `backend/app/api` | FastAPI REST / SSE 接口 |
 | `frontend/src` | 智能问数、历史、元数据、评测工作台 |
-| `backend/db` | 官方数据导入、67 题基线生成、schema 与迁移 |
+| `backend/db` | 官方数据导入、97 题基线与独立扩展集生成、schema 与迁移 |
 
 ## 数据与评测
 
-项目基于 8 张官方脱敏 `mart` 表，保存 7 条官方原始问答和 60 条由官方表实跑生成的回归题。评测中心以真实 Agent 输出计算可执行率、结果准确率、一次通过率、修复后通过率、耗时和失败原因；详见 [官方数据与评测基线](official_dataset.md) 与 [评测设计](evaluation_design.md)。
+项目基于 8 张官方脱敏 `mart` 表，保存 7 条官方原始问答、60 条由官方表实跑生成的基础回归题和 30 条独立扩展题。扩展题不进入检索样例，评测中心可单独运行它们来衡量未见问法的表现。评测中心以真实 Agent 输出计算可执行率、结果准确率、一次通过率、修复后通过率、耗时和失败原因；详见 [官方数据与评测基线](official_dataset.md) 与 [评测设计](evaluation_design.md)。

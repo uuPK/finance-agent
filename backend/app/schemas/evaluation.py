@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from app.schemas.metadata import MetadataChangeInput
 
 Difficulty = Literal["simple", "medium", "complex"]
+EvaluationCaseSource = Literal["official", "official_derived", "official_extension"]
 ReviewVerdict = Literal["correct", "incorrect", "needs_clarification", "insufficient_data"]
 ReviewSeverity = Literal["minor", "major", "blocking"]
 
@@ -17,6 +18,7 @@ ReviewSeverity = Literal["minor", "major", "blocking"]
 class EvaluationRunCreate(BaseModel):
     run_name: str = Field(default="manual-evaluation", min_length=1, max_length=128)
     difficulty: Difficulty | None = None
+    case_source: EvaluationCaseSource | None = None
     limit: int = Field(default=20, ge=1, le=200)
     evaluation_mode: Literal["smoke", "full"] = "full"
 

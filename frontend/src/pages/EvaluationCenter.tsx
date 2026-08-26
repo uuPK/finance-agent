@@ -121,6 +121,7 @@ export function EvaluationCenter() {
   const [reviewItems, setReviewItems] = useState<ReviewItemDetail[]>([]);
   const [selectedItem, setSelectedItem] = useState<ReviewItemDetail | null>(null);
   const [difficulty, setDifficulty] = useState("");
+  const [caseSource, setCaseSource] = useState("");
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState("");
   const [reviewerId, setReviewerId] = useState("reviewer-01");
@@ -232,10 +233,11 @@ export function EvaluationCenter() {
       const created = await createEvaluationRun({
         run_name: `workbench-${new Date().toISOString().slice(0, 19)}`,
         difficulty: difficulty || undefined,
+        case_source: caseSource === "extension" ? "official_extension" : undefined,
         // A full run must cover every active baseline case.  The repository
         // caps this at 200, so this also remains safe as the benchmark grows.
-        limit: difficulty ? 20 : 200,
-        evaluation_mode: difficulty ? "smoke" : "full"
+        limit: caseSource === "extension" ? 30 : difficulty ? 20 : 200,
+        evaluation_mode: caseSource === "extension" || !difficulty ? "full" : "smoke"
       });
       await loadRun(created.eval_run_id);
       await loadOverview();
@@ -339,7 +341,10 @@ export function EvaluationCenter() {
             <p className="mt-1 text-sm text-muted">基准案例、自动评分与人工裁定运行在同一条可审计链路中。</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <select value={difficulty} onChange={(event) => setDifficulty(event.target.value)} className="h-9 border border-line bg-white px-3 text-sm text-ink">
+            <select value={caseSource} onChange={(event) => { setCaseSource(event.target.value); if (event.target.value) setDifficulty(""); }} className="h-9 border border-line bg-white px-3 text-sm text-ink">
+              <option value="">全部评测集（97题）</option><option value="extension">新增扩展集（30题）</option>
+            </select>
+            <select value={difficulty} onChange={(event) => { setDifficulty(event.target.value); if (event.target.value) setCaseSource(""); }} disabled={caseSource === "extension"} className="h-9 border border-line bg-white px-3 text-sm text-ink disabled:bg-slate-50">
               <option value="">完整评测集</option><option value="simple">简单案例冒烟</option><option value="medium">中等案例冒烟</option><option value="complex">复杂案例冒烟</option>
             </select>
             <button type="button" onClick={() => void startEvaluation()} disabled={hasRunningRun} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><Play className="h-4 w-4" />{hasRunningRun ? "评测运行中" : "运行评测"}</button>

@@ -20,7 +20,7 @@ uv run python .\db\load_official_dataset.py --data-dir "D:\contest-data\htsc"
 uv run python .\db\load_official_benchmark_cases.py
 ```
 
-数据包必须包含 `表描述.sql`、`Q&A.xlsx` 和 8 个官方 CSV。导入后有 8 张官方 `mart` 表、7 条官方原始问答和 60 条官方派生回归题。
+数据包必须包含 `表描述.sql`、`Q&A.xlsx` 和 8 个官方 CSV。导入后有 8 张官方 `mart` 表、7 条官方原始问答、60 条官方基础回归题和 30 条独立扩展题。扩展题不写入检索样例，可独立运行以衡量泛化表现。
 
 ## 迁移原则
 
