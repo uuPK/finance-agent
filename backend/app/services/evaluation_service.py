@@ -789,9 +789,11 @@ class EvaluationRepository:
                     rejected.append(f"{decision.review_item_id}: already reviewed")
                     continue
                 try:
-                    metadata_changes_applied += self.metadata_catalog.apply_review_changes(
-                        connection, decision.metadata_changes
-                    )
+                    with connection.begin_nested():
+                        applied_changes = self.metadata_catalog.apply_review_changes(
+                            connection, decision.metadata_changes
+                        )
+                    metadata_changes_applied += applied_changes
                 except (LookupError, ValueError) as exc:
                     rejected.append(f"{decision.review_item_id}: metadata change rejected: {exc}")
                     continue
