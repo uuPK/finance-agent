@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 
 from app.schemas.query_plan import ClarificationQuestion
 
-
 ReviewStage = Literal["query_plan_review", "sql_review", "result_review"]
 
 

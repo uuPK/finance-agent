@@ -92,16 +92,6 @@ class QueryService:
         self.event_sink = event_sink
         self.event_attempt = max(0, event_attempt)
         self.result_preview_rows = max(1, result_preview_rows or self.settings.result_preview_rows)
-        self.default_sensitive_columns = {
-            "phone",
-            "mobile",
-            "mobile_phone",
-            "id_no",
-            "id_number",
-            "cert_no",
-            "bank_account",
-            "address",
-        }
 
     async def run(
         self,
@@ -1247,22 +1237,7 @@ class QueryService:
         )
 
     def _build_sql_guardrail(self, metadata_context: dict[str, object]) -> SQLGuardrail:
-        table_allowlist = set(self._string_list(metadata_context.get("table_allowlist")))
-        sensitive_columns = {
-            *self.default_sensitive_columns,
-            *self._string_list(metadata_context.get("sensitive_columns")),
-        }
-        allowed_columns_by_table = {
-            table_name: set(self._string_list(columns))
-            for table_name, columns in self._dict_value(
-                metadata_context.get("allowed_columns_by_table")
-            ).items()
-        }
-        return SQLGuardrail(
-            allowed_tables=table_allowlist,
-            allowed_columns_by_table=allowed_columns_by_table,
-            sensitive_columns=sensitive_columns,
-        )
+        return SQLGuardrail.from_metadata_context(metadata_context)
 
     def _string_list(self, value: object) -> list[str]:
         if not isinstance(value, list):

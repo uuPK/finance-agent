@@ -18,6 +18,7 @@ from sqlalchemy.engine import Engine
 
 from app.db.session import engine as default_engine
 from app.guardrails.sql_guardrail import SQLGuardrail
+from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.evaluation import (
     EvaluationDashboard,
     EvaluationResultSummary,
@@ -133,6 +134,7 @@ class EvaluationRepository:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or default_engine
         self.metadata_catalog = MetadataCatalogService(self.engine)
+        self.schema_context_provider = SchemaContextProvider(self.engine)
 
     def create_run(self, run_name: str, mode: str) -> UUID:
         with self.engine.begin() as connection:
@@ -885,27 +887,30 @@ class EvaluationRepository:
         example (or a confirmed clarification outcome) is used as reusable agent context.
         """
         if decision.verdict == "needs_clarification":
+            if not decision.corrected_query_plan:
+                return
+            fields = "expected_status = 'needs_clarification', expected_query_plan = cast(:plan as jsonb)"
+            params: dict[str, Any] = {
+                "case_id": str(item["case_id"]),
+                "plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
+            }
+            if decision.corrected_result:
+                fields += ", expected_result = cast(:result as jsonb)"
+                params["result"] = json.dumps(decision.corrected_result, ensure_ascii=False)
             connection.execute(
                 text(
-                    """
-                    update evaluation.eval_cases
-                    set expected_status = 'needs_clarification',
-                        expected_query_plan = cast(:plan as jsonb),
-                        expected_result = cast(:result as jsonb), updated_at = now()
-                    where case_id = :case_id
-                    """
+                    f"update evaluation.eval_cases set {fields}, updated_at = now() "
+                    "where case_id = :case_id"
                 ),
-                {
-                    "case_id": str(item["case_id"]),
-                    "plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
-                    "result": json.dumps(decision.corrected_result, ensure_ascii=False),
-                },
+                params,
             )
             return
         if decision.verdict != "incorrect" or not decision.corrected_sql:
             return
-        guardrail = SQLGuardrail(require_limit=False)
-        if not all(finding.passed for finding in guardrail.validate(decision.corrected_sql)):
+        guardrail = self._review_sql_guardrail()
+        if guardrail is None or not all(
+            finding.passed for finding in guardrail.validate(decision.corrected_sql)
+        ):
             return
         expected_result = decision.corrected_result
         if not expected_result:
@@ -934,6 +939,7 @@ class EvaluationRepository:
                 "result": json.dumps(expected_result, ensure_ascii=False),
             },
         )
+
         connection.execute(
             text(
                 """
@@ -953,6 +959,17 @@ class EvaluationRepository:
                 "tags": json.dumps(["human_review", "regression"], ensure_ascii=False),
             },
         )
+
+    def _review_sql_guardrail(self) -> SQLGuardrail | None:
+        """Only promote review SQL when the live physical schema can constrain it."""
+        metadata_context = self.schema_context_provider.load()
+        if (
+            metadata_context.get("source") != "database"
+            or not metadata_context.get("table_allowlist")
+            or not metadata_context.get("allowed_columns_by_table")
+        ):
+            return None
+        return SQLGuardrail.from_metadata_context(metadata_context, require_limit=False)
 
     @staticmethod
     def _decision_checksum(decision: ReviewDecisionInput) -> str:

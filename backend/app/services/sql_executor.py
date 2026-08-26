@@ -13,7 +13,6 @@ from sqlalchemy.engine import Engine
 from app.core.config import get_settings
 from app.db.session import engine as default_engine
 
-
 SQLExecutionStatus = Literal["success", "failed", "timeout"]
 
 

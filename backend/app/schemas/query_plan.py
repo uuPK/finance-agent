@@ -2,7 +2,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 PlanStatus = Literal["draft", "ready", "needs_clarification", "invalid"]
 QueryIntent = Literal[
     "customer_segmentation",

@@ -1,7 +1,21 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
+
+DEFAULT_SENSITIVE_COLUMNS = frozenset(
+    {
+        "phone",
+        "mobile",
+        "mobile_phone",
+        "id_no",
+        "id_number",
+        "cert_no",
+        "bank_account",
+        "address",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -20,6 +34,7 @@ class SQLGuardrail:
         sensitive_columns: set[str] | None = None,
         require_limit: bool = True,
         max_limit: int = 1000,
+        max_offset: int = 10_000,
         allowed_schema: str = "mart",
         allowed_functions: set[str] | None = None,
     ) -> None:
@@ -28,6 +43,7 @@ class SQLGuardrail:
         self.sensitive_columns = sensitive_columns or set()
         self.require_limit = require_limit
         self.max_limit = max_limit
+        self.max_offset = max_offset
         self.allowed_schema = allowed_schema
         self.allowed_functions = {
             "abs",
@@ -55,6 +71,44 @@ class SQLGuardrail:
             "upper",
             *(allowed_functions or set()),
         }
+
+    @classmethod
+    def from_metadata_context(
+        cls,
+        metadata_context: Mapping[str, object],
+        *,
+        require_limit: bool = True,
+        max_limit: int = 1000,
+        max_offset: int = 10_000,
+    ) -> "SQLGuardrail":
+        """Build one consistent SQL policy from retrieved physical metadata."""
+
+        def string_list(value: object) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [item for item in value if isinstance(item, str)]
+
+        raw_columns = metadata_context.get("allowed_columns_by_table")
+        allowed_columns_by_table = (
+            {
+                table_name: set(string_list(columns))
+                for table_name, columns in raw_columns.items()
+                if isinstance(table_name, str)
+            }
+            if isinstance(raw_columns, dict)
+            else {}
+        )
+        return cls(
+            allowed_tables=set(string_list(metadata_context.get("table_allowlist"))),
+            allowed_columns_by_table=allowed_columns_by_table,
+            sensitive_columns={
+                *DEFAULT_SENSITIVE_COLUMNS,
+                *string_list(metadata_context.get("sensitive_columns")),
+            },
+            require_limit=require_limit,
+            max_limit=max_limit,
+            max_offset=max_offset,
+        )
 
     def validate(self, sql: str) -> list[GuardrailFinding]:
         findings: list[GuardrailFinding] = []
@@ -95,6 +149,7 @@ class SQLGuardrail:
         )
         findings.append(self._check_select_only(expression))
         findings.append(self._check_forbidden_expressions(expression))
+        findings.append(self._check_recursive_ctes(expression))
         findings.append(self._check_no_select_star(expression))
         findings.extend(self._check_allowed_tables(expression))
         findings.append(self._check_has_business_table(expression))
@@ -105,6 +160,7 @@ class SQLGuardrail:
 
         if self.require_limit:
             findings.append(self._check_limit(expression))
+        findings.append(self._check_offset(expression))
 
         return findings
 
@@ -126,6 +182,8 @@ class SQLGuardrail:
             "Create",
             "Alter",
             "TruncateTable",
+            "Into",
+            "Lock",
         )
         forbidden_types = tuple(
             expression_type
@@ -143,6 +201,23 @@ class SQLGuardrail:
                 else f"Forbidden SQL operations found: {', '.join(found)}"
             ),
             severity="error" if not passed else "info",
+        )
+
+    def _check_recursive_ctes(self, expression: exp.Expression) -> GuardrailFinding:
+        recursive_ctes = [
+            with_expression
+            for with_expression in expression.find_all(exp.With)
+            if bool(with_expression.args.get("recursive"))
+        ]
+        return GuardrailFinding(
+            name="recursive_cte",
+            passed=not recursive_ctes,
+            message=(
+                "SQL does not use recursive CTEs."
+                if not recursive_ctes
+                else "Recursive CTEs are not allowed in generated SQL."
+            ),
+            severity="error" if recursive_ctes else "info",
         )
 
     def _check_no_select_star(self, expression: exp.Expression) -> GuardrailFinding:
@@ -420,3 +495,35 @@ class SQLGuardrail:
         if isinstance(expression, exp.Literal) and expression.is_int:
             return int(expression.this)
         return None
+
+    def _check_offset(self, expression: exp.Expression) -> GuardrailFinding:
+        offsets = list(expression.find_all(exp.Offset))
+        if not offsets:
+            return GuardrailFinding(
+                name="offset_max_rows",
+                passed=True,
+                message="SQL does not use OFFSET.",
+            )
+
+        for offset in offsets:
+            offset_value = self._extract_limit_value(offset)
+            if offset_value is None or offset_value < 0:
+                return GuardrailFinding(
+                    name="offset_value",
+                    passed=False,
+                    message="SQL OFFSET must be a non-negative integer literal.",
+                    severity="error",
+                )
+            if offset_value > self.max_offset:
+                return GuardrailFinding(
+                    name="offset_max_rows",
+                    passed=False,
+                    message=f"SQL OFFSET {offset_value} exceeds max offset {self.max_offset}.",
+                    severity="error",
+                )
+
+        return GuardrailFinding(
+            name="offset_max_rows",
+            passed=True,
+            message=f"SQL OFFSET is within the maximum of {self.max_offset} rows.",
+        )
