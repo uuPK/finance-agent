@@ -371,6 +371,17 @@ class QueryService:
             "科创板",
             "分公司各营业部",
             "不同客户年龄段资产分布",
+            "普通账户总资产",
+            "信用账户净资产",
+            "交易费用",
+            "成交数量",
+            "现金净流入",
+            "转账金额",
+            "划拨金额",
+            "一级营业部",
+            "同时发生过买入和卖出",
+            "双向交易",
+            "不同产品",
         )
         if (
             deterministic_plan.plan_status == "ready"
@@ -553,10 +564,18 @@ class QueryService:
             "customer_count": ("数量", "人数", "多少", "总数", "几个", "几位", "客户数"),
             "total_asset": ("总资产", "资产合计"),
             "average_total_asset": ("平均总资产", "平均资产"),
+            "average_customer_age": ("平均年龄",),
+            "normal_total_asset": ("普通账户总资产", "普通资产"),
+            "credit_total_asset": ("信用账户净资产", "信用资产"),
             "holding_market_value": ("持仓市值", "持仓金额", "市值合计"),
             "holding_quantity": ("持有份额", "持仓份额"),
             "trade_amount": ("交易金额", "成交金额", "交易额"),
+            "trade_fee": ("交易费用", "手续费"),
+            "trade_quantity": ("成交数量", "交易数量", "成交份额"),
             "net_cash_flow": ("净资金流入", "净流入金额"),
+            "net_cash_inflow": ("现金净流入", "现金净流"),
+            "transfer_amount": ("转账金额",),
+            "assignment_amount": ("划拨金额",),
         }
         filter_metric_codes = {
             item.metric_code for item in plan.filters if item.metric_code is not None

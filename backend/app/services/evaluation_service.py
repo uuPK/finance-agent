@@ -97,6 +97,9 @@ def _normalize_metric_aliases(
         "响应率": "response_rate",
         "客户标识": "pty_id",
         "净流出金额": "outflow_amount",
+        "avg_age": "average_customer_age",
+        "average_age": "average_customer_age",
+        "mean_age": "average_customer_age",
     }
     aliases.update(presentation_aliases)
     for metric in generated_plan.get("metrics", []):

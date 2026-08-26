@@ -50,7 +50,7 @@ class RuleBasedQueryPlanActor:
             filters=filters,
             time_range=time_range,
             grain=grain,
-            data_requirements=self._build_data_requirements(metrics, filters),
+            data_requirements=self._build_data_requirements(metrics, filters, dimensions),
             output=self._build_output(normalized, grain, metrics, dimensions),
             safety=SafetyRequirement(),
             clarifications=clarifications,
@@ -99,7 +99,33 @@ class RuleBasedQueryPlanActor:
         # Remove this date phrase before deciding whether total-asset output was asked for.
         asset_intent_question = question.replace("最新资产日期", "").replace("资产日期", "")
 
-        if any(token in question for token in ("交易", "成交", "买入", "卖出")):
+        if "交易费用" in question or "手续费" in question:
+            metrics.append(
+                QueryMetric(
+                    name="交易费用",
+                    metric_code="trade_fee",
+                    definition_id="metric:trade_fee",
+                    aggregation="sum",
+                    alias="交易费用",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("trade_fee", "交易费用"),
+                    is_resolved=True,
+                )
+            )
+        elif any(token in question for token in ("成交数量", "交易数量", "成交份额")):
+            metrics.append(
+                QueryMetric(
+                    name="成交数量",
+                    metric_code="trade_quantity",
+                    definition_id="metric:trade_quantity",
+                    aggregation="sum",
+                    alias="成交数量",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("trade_quantity", "成交数量"),
+                    is_resolved=True,
+                )
+            )
+        elif any(token in question for token in ("交易", "成交", "买入", "卖出")):
             metrics.append(
                 QueryMetric(
                     name="交易金额",
@@ -141,10 +167,52 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
+        if "平均年龄" in question:
+            metrics.append(
+                QueryMetric(
+                    name="客户平均年龄",
+                    metric_code="average_customer_age",
+                    definition_id="metric:average_customer_age",
+                    aggregation="avg",
+                    alias="客户平均年龄",
+                    metadata_ref=self._metric_ref("average_customer_age", "客户平均年龄"),
+                    is_resolved=True,
+                )
+            )
+        account_asset_metric: str | None = None
+        if "普通账户" in asset_intent_question and "资产" in asset_intent_question:
+            account_asset_metric = "normal_total_asset"
+            metrics.append(
+                QueryMetric(
+                    name="普通账户总资产",
+                    metric_code=account_asset_metric,
+                    definition_id=f"metric:{account_asset_metric}",
+                    aggregation="sum",
+                    alias="普通账户总资产",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref(account_asset_metric, "普通账户总资产"),
+                    is_resolved=True,
+                )
+            )
+        elif "信用账户" in asset_intent_question and "资产" in asset_intent_question:
+            account_asset_metric = "credit_total_asset"
+            metrics.append(
+                QueryMetric(
+                    name="信用账户净资产",
+                    metric_code=account_asset_metric,
+                    definition_id=f"metric:{account_asset_metric}",
+                    aggregation="sum",
+                    alias="信用账户净资产",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref(account_asset_metric, "信用账户净资产"),
+                    is_resolved=True,
+                )
+            )
         needs_total_asset = (
             "资产" in asset_intent_question
             and "日均资产" not in asset_intent_question
             and not any(token in asset_intent_question for token in ("盈亏", "盈利"))
+            and account_asset_metric is None
             and (
                 not has_average_total_asset
                 or asset_intent_question.count("总资产")
@@ -175,6 +243,45 @@ class RuleBasedQueryPlanActor:
                     alias="资产盈亏",
                     time_window=time_range,
                     metadata_ref=self._metric_ref("profit_loss", "资产盈亏"),
+                    is_resolved=True,
+                )
+            )
+        elif "现金净流入" in question:
+            metrics.append(
+                QueryMetric(
+                    name="现金净流入",
+                    metric_code="net_cash_inflow",
+                    definition_id="metric:net_cash_inflow",
+                    aggregation="sum",
+                    alias="现金净流入",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("net_cash_inflow", "现金净流入"),
+                    is_resolved=True,
+                )
+            )
+        elif "转账金额" in question:
+            metrics.append(
+                QueryMetric(
+                    name="转账金额",
+                    metric_code="transfer_amount",
+                    definition_id="metric:transfer_amount",
+                    aggregation="sum",
+                    alias="转账金额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("transfer_amount", "转账金额"),
+                    is_resolved=True,
+                )
+            )
+        elif "划拨金额" in question:
+            metrics.append(
+                QueryMetric(
+                    name="划拨金额",
+                    metric_code="assignment_amount",
+                    definition_id="metric:assignment_amount",
+                    aggregation="sum",
+                    alias="划拨金额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("assignment_amount", "划拨金额"),
                     is_resolved=True,
                 )
             )
@@ -209,8 +316,20 @@ class RuleBasedQueryPlanActor:
             token in question
             for token in ("数量", "人数", "多少", "总数", "几个", "几位", "客户数")
         )
+        customer_count_requested = any(
+            token in question
+            for token in (
+                "客户数",
+                "客户数量",
+                "去重客户",
+                "几位客户",
+                "多少位客户",
+                "客户有多少",
+                "客户多少",
+            )
+        )
         if (
-            explicit_count
+            (explicit_count and (customer_count_requested or not metrics))
             or ("分布" in question and "客户" in question and "年龄" in question)
             or (not metrics and "统计" in question)
         ):
@@ -225,6 +344,15 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
+
+        # 买卖双向、不同产品数都是客户筛选条件；用户只问客户数时，不把交易金额
+        # 或持仓市值误当成待输出指标。筛选条件会在 _detect_filters 中保留。
+        if self._is_bidirectional_trade_question(question) and customer_count_requested:
+            metrics = [metric for metric in metrics if metric.metric_code != "trade_amount"]
+        if self._is_multi_product_holding_question(question) and customer_count_requested:
+            metrics = [
+                metric for metric in metrics if metric.metric_code != "holding_market_value"
+            ]
 
         return self._dedupe_metrics(metrics)
 
@@ -242,7 +370,7 @@ class RuleBasedQueryPlanActor:
             filters.append(
                 QueryFilter(
                     term=metric_labels[metric_code],
-                    operator=">",
+                    operator=str(threshold["operator"]),
                     value=QueryValue(
                         raw=threshold["raw"],
                         normalized=threshold["value"],
@@ -346,6 +474,46 @@ class RuleBasedQueryPlanActor:
                 )
             )
 
+        if self._is_bidirectional_trade_question(question):
+            filters.append(
+                QueryFilter(
+                    term="双向交易客户",
+                    operator="exists",
+                    value=QueryValue(raw=True, normalized=True, value_type="boolean"),
+                    metric_code="bidirectional_trade_customer",
+                    source="business_term",
+                    metadata_ref=self._metric_ref(
+                        "bidirectional_trade_customer", "双向交易客户"
+                    ),
+                    is_resolved=time_range is not None,
+                    requires_clarification=time_range is None,
+                )
+            )
+
+        distinct_product_threshold = self._extract_distinct_product_threshold(question)
+        if (
+            distinct_product_threshold is not None
+            and self._is_multi_product_holding_question(question)
+        ):
+            filters.append(
+                QueryFilter(
+                    term="不同产品持有数量",
+                    operator=">=",
+                    value=QueryValue(
+                        raw=distinct_product_threshold,
+                        normalized=distinct_product_threshold,
+                        value_type="number",
+                    ),
+                    metric_code="distinct_holding_product_count",
+                    source="business_term",
+                    metadata_ref=self._metric_ref(
+                        "distinct_holding_product_count", "不同产品持有数量"
+                    ),
+                    is_resolved=time_range is not None,
+                    requires_clarification=time_range is None,
+                )
+            )
+
         if "未持有基金" in question or "尚未持有基金" in question or "无基金持仓" in question:
             filters.append(
                 QueryFilter(
@@ -378,7 +546,40 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
-        if "营业部" in question or "分支机构" in question:
+        if "一级营业部" in question:
+            dimensions.append(
+                QueryDimension(
+                    name="一级营业部",
+                    dimension_code="up_org_name",
+                    role="group_by"
+                    if self._asks_for_grouping(question) or "统计" in question or "展示" in question
+                    else "display",
+                    alias="一级营业部",
+                    metadata_ref=MetadataReference(
+                        ref_type="column", code="up_org_name", name="一级营业部名称"
+                    ),
+                    is_resolved=True,
+                )
+            )
+            both_branch_levels = (
+                "一级营业部、营业部",
+                "一级营业部和营业部",
+                "一级营业部及营业部",
+            )
+            if any(marker in question for marker in both_branch_levels):
+                dimensions.append(
+                    QueryDimension(
+                        name="营业部",
+                        dimension_code="org_name",
+                        role="group_by",
+                        alias="营业部",
+                        metadata_ref=MetadataReference(
+                            ref_type="column", code="org_name", name="营业部名称"
+                        ),
+                        is_resolved=True,
+                    )
+                )
+        elif "营业部" in question or "分支机构" in question:
             dimensions.append(
                 QueryDimension(
                     name="营业部",
@@ -557,6 +758,15 @@ class RuleBasedQueryPlanActor:
                 granularity="quarter",
                 is_resolved=True,
             )
+        if "2026年3月31日" in question or "2026-03-31" in question:
+            return TimeRange(
+                label="截至2026年3月31日",
+                start="20260331",
+                end="20260331",
+                anchor_date="20260331",
+                granularity="day",
+                is_resolved=True,
+            )
         if "26年1月10日" in question and "26年2月15日" in question:
             return TimeRange(
                 label="2026年1月10日至2月15日",
@@ -589,6 +799,18 @@ class RuleBasedQueryPlanActor:
         return None
 
     def _detect_grain(self, question: str) -> QueryGrain:
+        if "一级营业部" in question and (
+            self._asks_for_grouping(question) or "分布" in question or "统计" in question
+        ):
+            keys = ["up_org_name"]
+            if any(
+                marker in question
+                for marker in ("一级营业部、营业部", "一级营业部和营业部", "一级营业部及营业部")
+            ):
+                keys.append("org_name")
+            return QueryGrain(
+                level="organization", keys=keys, description="一级营业部级", is_resolved=True
+            )
         if ("营业部" in question or "分支机构" in question) and (
             self._asks_for_grouping(question) or "分布" in question or "统计" in question
         ):
@@ -671,7 +893,10 @@ class RuleBasedQueryPlanActor:
         return QueryOutput(format="table", columns=columns or ["客户数量"], limit=100)
 
     def _build_data_requirements(
-        self, metrics: list[QueryMetric], filters: list[QueryFilter]
+        self,
+        metrics: list[QueryMetric],
+        filters: list[QueryFilter],
+        dimensions: list[QueryDimension],
     ) -> DataRequirement:
         domains: set[str] = {"customer"}
         candidate_tables: set[str] = {"ads_cust_info_d"}
@@ -680,19 +905,30 @@ class RuleBasedQueryPlanActor:
         filter_codes = {query_filter.metric_code for query_filter in filters}
         all_codes = metric_codes | filter_codes
 
-        if {"total_asset", "average_total_asset", "daily_average_asset"} & all_codes:
+        if {
+            "total_asset",
+            "average_total_asset",
+            "normal_total_asset",
+            "credit_total_asset",
+            "daily_average_asset",
+        } & all_codes:
             domains.add("asset")
             candidate_tables.add("dws_cust_aset_d")
-        if "trade_amount" in all_codes:
+        if {
+            "trade_amount",
+            "trade_fee",
+            "trade_quantity",
+            "bidirectional_trade_customer",
+        } & all_codes:
             domains.add("trade")
             candidate_tables.update({"dwd_cust_tran_d", "dim_product"})
-        if "net_cash_flow" in all_codes:
+        if {"net_cash_flow", "net_cash_inflow", "transfer_amount", "assignment_amount"} & all_codes:
             domains.add("finance")
             candidate_tables.add("dws_cust_fin_d")
         if "profit_loss" in all_codes:
             domains.update({"asset", "finance"})
             candidate_tables.update({"dws_cust_aset_d", "dws_cust_fin_d"})
-        if "holding_market_value" in all_codes:
+        if {"holding_market_value", "distinct_holding_product_count"} & all_codes:
             domains.add("holding")
             candidate_tables.update({"dwd_cust_hold_d", "dim_product"})
 
@@ -701,6 +937,12 @@ class RuleBasedQueryPlanActor:
             candidate_tables.add("dim_public")
         if {"prdt_name", "prdt_type_name", "up_prdt_type_id"} & field_codes:
             candidate_tables.add("dim_product")
+        if {
+            dimension.dimension_code
+            for dimension in dimensions
+            if dimension.dimension_code is not None
+        } & {"org_name", "up_org_name"}:
+            candidate_tables.add("dim_branch")
 
         return DataRequirement(
             domains=sorted(domains),
@@ -850,8 +1092,65 @@ class RuleBasedQueryPlanActor:
                 metric_code = "holding_market_value"
             else:
                 metric_code = "total_asset"
-            thresholds.append({"raw": raw_value, "value": int(value), "metric_code": metric_code})
+            comparison_context = f"{prefix}{suffix}"
+            operator = (
+                ">="
+                if any(
+                    marker in comparison_context for marker in ("不少于", "不低于", "至少", ">=")
+                )
+                else ">"
+            )
+            thresholds.append(
+                {
+                    "raw": raw_value,
+                    "value": int(value),
+                    "metric_code": metric_code,
+                    "operator": operator,
+                }
+            )
         return thresholds
+
+    @staticmethod
+    def _is_bidirectional_trade_question(question: str) -> bool:
+        has_buy = "买入" in question
+        has_sell = "卖出" in question
+        return (
+            has_buy and has_sell and any(token in question for token in ("同时", "均", "都"))
+        ) or (
+            "双向交易" in question or "买卖双向" in question
+        )
+
+    @staticmethod
+    def _is_multi_product_holding_question(question: str) -> bool:
+        return (
+            any(token in question for token in ("持有", "持仓"))
+            and "产品" in question
+            and any(token in question for token in ("不同", "去重", "多只", "多种"))
+        )
+
+    @staticmethod
+    def _extract_distinct_product_threshold(question: str) -> int | None:
+        match = re.search(
+            r"(?:至少|不少于|不低于|>=|大于等于)\s*(?:持有)?\s*(\d+|一|二|两|三|四|五|六|七|八|九|十)\s*(?:只|种|个)?\s*(?:不同|去重)?\s*产品",
+            question,
+        )
+        if match is None:
+            return None
+        numeral = match.group(1)
+        chinese_numerals = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        return int(numeral) if numeral.isdigit() else chinese_numerals[numeral]
 
     def _extract_trade_count_threshold(self, question: str) -> int | None:
         if "交易次数" not in question:

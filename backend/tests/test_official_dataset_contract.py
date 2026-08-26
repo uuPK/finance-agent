@@ -104,6 +104,14 @@ def test_evaluation_treats_official_age_and_asset_aliases_as_equivalent() -> Non
     )
 
 
+def test_evaluation_treats_average_age_aliases_as_equivalent() -> None:
+    assert _same_result_rows(
+        [{"avg_age": Decimal("42.25")}],
+        [{"average_customer_age": 42.25}],
+        {"metrics": [{"metric_code": "average_customer_age"}]},
+    )
+
+
 def test_rule_plan_preserves_multiple_official_amount_thresholds() -> None:
     plan = RuleBasedQueryPlanActor().build(
         "26年Q1日均资产大于30万的客户，股票交易量大于10万的，其持有的产品属于哪些产品大类"
@@ -230,6 +238,42 @@ def test_rule_plan_does_not_turn_snapshot_date_or_average_into_total_asset_outpu
     }
 
 
+@pytest.mark.parametrize(
+    ("question", "metric_code", "source_table"),
+    [
+        ("截至2026年3月31日，普通账户总资产合计是多少？", "normal_total_asset", "dws_cust_aset_d"),
+        ("截至2026年3月31日，信用账户净资产合计是多少？", "credit_total_asset", "dws_cust_aset_d"),
+        ("2026年第一季度，客户交易费用合计是多少？", "trade_fee", "dwd_cust_tran_d"),
+        ("2026年第一季度，客户成交数量合计是多少？", "trade_quantity", "dwd_cust_tran_d"),
+        ("2026年第一季度，客户现金净流入合计是多少？", "net_cash_inflow", "dws_cust_fin_d"),
+        ("2026年第一季度，客户转账金额合计是多少？", "transfer_amount", "dws_cust_fin_d"),
+        ("2026年第一季度，客户划拨金额合计是多少？", "assignment_amount", "dws_cust_fin_d"),
+    ],
+)
+def test_rule_plan_preserves_extension_metric_semantics(
+    question: str, metric_code: str, source_table: str
+) -> None:
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    assert {metric.metric_code for metric in plan.metrics} == {metric_code}
+    assert source_table in plan.data_requirements.candidate_tables
+
+
+def test_rule_plan_keeps_first_level_branch_as_its_own_grain() -> None:
+    plan = RuleBasedQueryPlanActor().build("请按一级营业部统计当前客户数，展示前20个一级营业部。")
+
+    assert plan.grain is not None and plan.grain.keys == ["up_org_name"]
+    assert [item.dimension_code for item in plan.dimensions] == ["up_org_name"]
+    assert "dim_branch" in plan.data_requirements.candidate_tables
+
+
+def test_rule_plan_keeps_snapshot_day_as_an_explicit_fact_anchor() -> None:
+    plan = RuleBasedQueryPlanActor().build("截至2026年3月31日，请按客户状态统计客户数和持仓市值。")
+
+    assert plan.time_range is not None
+    assert (plan.time_range.start, plan.time_range.end) == ("20260331", "20260331")
+
+
 def test_rule_safeguard_merges_grouping_and_explicit_output_metrics() -> None:
     question = "截至最新资产日期，请按性别代码统计客户数、平均总资产和总资产。"
     deterministic_plan = RuleBasedQueryPlanActor().build(question)
@@ -350,6 +394,71 @@ def test_sql_actor_does_not_reuse_derived_regression_reference() -> None:
     )
     assert result.source == "failed"
     assert result.draft is None
+
+
+def test_sql_actor_uses_customer_level_having_for_bidirectional_trade() -> None:
+    question = "2026年一季度双向交易客户数是多少？"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert "GROUP BY t.pty_id" in result.draft.sql
+    assert "HAVING SUM(COALESCE(t.buy_amt, 0)) > 0" in result.draft.sql
+    assert "COUNT(*) AS customer_count" in result.draft.sql
+
+
+def test_sql_actor_counts_multi_product_holders_after_customer_grouping() -> None:
+    question = "截至2026年3月31日，至少持有三种不同产品的客户数量是多少？"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert "GROUP BY h.pty_id" in result.draft.sql
+    assert "COUNT(DISTINCT h.prdt_id) >= 3" in result.draft.sql
+    assert "COUNT(*) AS customer_count" in result.draft.sql
+
+
+def test_sql_actor_groups_customer_counts_at_the_requested_branch_level() -> None:
+    question = "请按一级营业部统计当前客户数。"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert "SELECT b.up_org_name, COUNT(DISTINCT c.pty_id) AS customer_count" in result.draft.sql
+    assert "GROUP BY b.up_org_name" in result.draft.sql
+    assert "b.org_name" not in result.draft.sql
+
+
+def test_sql_actor_keeps_code_only_total_asset_grouping_compact() -> None:
+    question = "截至2026年3月31日，按客户等级代码汇总客户总资产，展示前10个等级。"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert "SELECT c.cust_lvl_cd," in result.draft.sql
+    assert "GROUP BY c.cust_lvl_cd" in result.draft.sql
+    assert "dim_public" not in result.draft.sql
+
+
+def test_sql_actor_keeps_customer_snapshot_separate_from_fact_snapshot() -> None:
+    question = "截至2026年3月31日，按客户类型统计总资产不少于20万元客户数和持仓市值。"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert "WHERE a.data_dt = '20260331'" in result.draft.sql
+    assert "WHERE c.data_dt = (SELECT MAX(data_dt) FROM mart.ads_cust_info_d)" in result.draft.sql
+    assert "c.data_dt = '20260331'" not in result.draft.sql
 
 
 def test_customer_result_requires_pty_id() -> None:

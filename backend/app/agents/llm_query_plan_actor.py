@@ -224,6 +224,13 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     - Preserve every explicit threshold, comparison, time window, ranking direction, requested limit, and output metric.
     - Use only metric_code values supplied in Retrieved metadata context. Never invent a legacy code.
     - For a multi-condition customer segment, include a metric or filter representation for every condition.
+    - “成交数量”“交易费用”“现金净流入”“转账金额”“划拨金额”“普通账户总资产”和
+      “信用账户净资产”是不同的已定义指标；若 metadata context 提供对应 metric_code，必须使用
+      该具体指标，不能退化为 trade_amount、total_asset 或 net_cash_flow。
+    - “按一级营业部”只要求 up_org_name 作为 group_by；不要因词中含“营业部”额外加入 org_name，
+      除非用户明确要求两个层级。
+    - 用户问资产或持仓截至 2026-03-31 并同时使用客户属性时，应记录事实表截止日；不要把该日期
+      当作客户属性表的默认快照日。
 
     你是证券客户营销场景的 QueryPlanActor。你的任务是把用户自然语言问题转换成
     后续 SQL agent 可以消费的标准 QueryPlan。你只负责规划，不生成 SQL，不执行查询。

@@ -25,7 +25,7 @@ uv run python .\db\load_official_benchmark_cases.py
 ## 迁移原则
 
 - 新库只需执行 `schema.sql`，不要手工补跑已被 schema 覆盖的旧迁移。
-- 已部署的官方数据版本可按版本说明执行增量元数据迁移，例如 `007`、`008`。
+- 已部署的官方数据版本可按版本说明执行增量元数据迁移，例如 `007`、`008`、`009`。
 - `006_replace_synthetic_with_official_dataset.sql` 会重建 `mart` schema，只适用于明确要从废弃合成数据迁移的本地环境；执行前必须备份并确认影响。
 - 业务表与列结构是赛事数据边界；语义元数据的人工维护必须通过应用 API 和校验规则完成。
 
