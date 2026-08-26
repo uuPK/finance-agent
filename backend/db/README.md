@@ -4,8 +4,8 @@ This directory contains PostgreSQL schema scripts for the Finance Agent project.
 
 ## Files
 
-- `schema.sql`: Creates schemas, business-domain tables, metadata tables, agent runtime tables, and evaluation tables. It does not insert data.
-- `seed_synthetic_data.py`: Inserts deterministic synthetic customer-marketing data for local development and SQL execution tests.
+- `schema.sql`: Creates the official competition mart tables, metadata tables, agent runtime tables, and evaluation tables. It does not insert data.
+- `load_official_dataset.py`: Validates and imports the official CSV and Q&A workbook, then rebuilds metadata and evaluation cases.
 
 ## Apply Locally
 
@@ -17,23 +17,12 @@ docker exec -i finance-agent-postgres psql -U finance_agent -d finance_agent -v 
 
 The script is idempotent for table creation and is safe to re-run during early development.
 
-## Seed Synthetic Data
+## Load the official package
 
-The default seed creates 500 synthetic customers, 180 days of asset snapshots, trades,
-cash-flow records, positions, metadata definitions, business terms, join paths, and
-question examples.
-
-From the `backend` directory:
+From the `backend` directory, run the schema script and then import the extracted official
+package directory. The importer loads all eight official tables and the seven provided Q&A
+cases; it also rebuilds the metadata and evaluation baseline from that package.
 
 ```bash
-python db/seed_synthetic_data.py --reset --customers 500 --days 180
+python db/load_official_dataset.py --data-dir <official-package-directory>
 ```
-
-With `uv`:
-
-```bash
-uv run python db/seed_synthetic_data.py --reset --customers 500 --days 180
-```
-
-`--reset` truncates synthetic `mart` and `metadata` data before inserting new rows. Use it
-only for local development databases, not for future official competition datasets.

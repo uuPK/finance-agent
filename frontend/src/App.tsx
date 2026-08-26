@@ -1,5 +1,5 @@
 import { BarChart3, Database, History, Menu, MessageSquareText, X } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 
 import { EvaluationCenter } from "./pages/EvaluationCenter";
 import { HistoryPage } from "./pages/HistoryPage";
@@ -28,11 +28,11 @@ export default function App() {
     setMobileNav(false);
   }
 
-  function setActiveRunId(queryId: string | null) {
+  const setActiveRunId = useCallback((queryId: string | null) => {
     setActiveRunIdState(queryId);
     if (queryId) window.localStorage.setItem(activeRunStorageKey, queryId);
     else window.localStorage.removeItem(activeRunStorageKey);
-  }
+  }, []);
 
   const content = page === "query" ? (
     <QueryWorkbench activeRunId={activeRunId} onRunChange={setActiveRunId} />

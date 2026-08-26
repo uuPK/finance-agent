@@ -42,3 +42,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local runtime state and generated document artifacts
+.run/
+output/
+tmp/

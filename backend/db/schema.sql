@@ -5,194 +5,55 @@ create schema if not exists metadata;
 create schema if not exists agent;
 create schema if not exists evaluation;
 
--- Customer marketing domain tables.
+-- Official competition data tables.
 
-create table if not exists mart.customer_info (
-    customer_id uuid primary key default gen_random_uuid(),
-    customer_no varchar(64) not null unique,
-    customer_name_masked varchar(128),
-    gender varchar(16),
-    birth_date date,
-    age_band varchar(32),
-    customer_level varchar(32),
-    risk_level varchar(32),
-    open_date date,
-    branch_code varchar(64),
-    customer_status varchar(32) not null default 'active',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+create table if not exists mart.dim_product (
+    prdt_id varchar(12), prdt_name varchar(100), sor_prdt_id varchar(12), market_id varchar(50),
+    prdt_type_id varchar(12), prdt_type_name varchar(40), up_prdt_type_id varchar(12), up_prdt_type_name varchar(40)
 );
-
-create index if not exists idx_customer_info_level on mart.customer_info(customer_level);
-create index if not exists idx_customer_info_branch on mart.customer_info(branch_code);
-create index if not exists idx_customer_info_status on mart.customer_info(customer_status);
-
-create table if not exists mart.service_manager (
-    manager_id uuid primary key default gen_random_uuid(),
-    manager_no varchar(64) not null unique,
-    manager_name_masked varchar(128),
-    org_code varchar(64),
-    branch_code varchar(64),
-    manager_status varchar(32) not null default 'active',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+create table if not exists mart.ads_cust_info_d (
+    data_dt varchar(8), pty_id varchar(32), sor_pty_id varchar(32), cust_lvl_cd varchar(12),
+    cust_status varchar(12), cust_type varchar(1), prov_name varchar(50), city_name varchar(50),
+    birth_dt varchar(8), cust_age numeric(20, 0), name varchar(40), gender_cd varchar(12),
+    edu_cd varchar(32), prof_cd varchar(100), org_id varchar(100)
 );
-
-create index if not exists idx_service_manager_branch on mart.service_manager(branch_code);
-create index if not exists idx_service_manager_org on mart.service_manager(org_code);
-
-create table if not exists mart.product_info (
-    product_id uuid primary key default gen_random_uuid(),
-    product_code varchar(64) not null unique,
-    product_name varchar(256) not null,
-    product_type varchar(64) not null,
-    risk_level varchar(32),
-    issuer varchar(128),
-    product_status varchar(32) not null default 'active',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
+create table if not exists mart.dws_cust_fin_d (
+    data_dt varchar(8) not null, pty_id varchar(32) not null, sys_source varchar(20) not null,
+    cash_in numeric(20,4), cash_out numeric(20,4), tran_in numeric(20,4), tran_out numeric(20,4),
+    assign_in numeric(20,4), assign_out numeric(20,4)
 );
-
-create index if not exists idx_product_info_type on mart.product_info(product_type);
-create index if not exists idx_product_info_risk on mart.product_info(risk_level);
-
-create table if not exists mart.public_dimension (
-    dimension_id uuid primary key default gen_random_uuid(),
-    dimension_type varchar(64) not null,
-    dimension_code varchar(64) not null,
-    dimension_name varchar(128) not null,
-    parent_code varchar(64),
-    sort_order integer not null default 0,
-    is_active boolean not null default true,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint uq_public_dimension unique (dimension_type, dimension_code)
+create table if not exists mart.dwd_cust_hold_d (
+    data_dt varchar(8) not null, pty_id varchar(32) not null, prdt_id varchar(12) not null,
+    sys_source varchar(20) not null, ccy varchar(12) not null, hold_cnt numeric(20,4), mkt_val numeric(20,4)
 );
-
-create index if not exists idx_public_dimension_type on mart.public_dimension(dimension_type);
-
-create table if not exists mart.service_relationship (
-    relationship_id uuid primary key default gen_random_uuid(),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    manager_id uuid not null references mart.service_manager(manager_id),
-    relationship_type varchar(32) not null default 'primary',
-    start_date date not null,
-    end_date date,
-    is_primary boolean not null default true,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint ck_service_relationship_date check (end_date is null or end_date >= start_date)
+create table if not exists mart.dwd_cust_tran_d (
+    data_dt varchar(8) not null, pty_id varchar(32) not null, prdt_id varchar(12) not null,
+    sys_source varchar(20) not null, ccy varchar(12) not null, buy_cnt integer, buy_mnt numeric(20,4),
+    buy_rake numeric(20,4), buy_amt numeric(20,4), buy_fare numeric(20,4), sell_cnt integer,
+    sell_mnt numeric(20,4), sell_rake numeric(20,4), sell_amt numeric(20,4), sell_fare numeric(20,4)
 );
-
-create index if not exists idx_service_relationship_customer on mart.service_relationship(customer_id);
-create index if not exists idx_service_relationship_manager on mart.service_relationship(manager_id);
-create index if not exists idx_service_relationship_primary on mart.service_relationship(is_primary);
-
-create table if not exists mart.customer_asset_daily (
-    asset_snapshot_id uuid primary key default gen_random_uuid(),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    as_of_date date not null,
-    total_asset numeric(20, 4) not null default 0,
-    cash_asset numeric(20, 4) not null default 0,
-    security_market_value numeric(20, 4) not null default 0,
-    fund_market_value numeric(20, 4) not null default 0,
-    product_market_value numeric(20, 4) not null default 0,
-    net_asset numeric(20, 4) not null default 0,
-    asset_level varchar(32),
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint uq_customer_asset_daily unique (customer_id, as_of_date)
+create table if not exists mart.dws_cust_aset_d (
+    data_dt varchar(8) not null, pty_id varchar(32) not null, nm_tot_aset numeric(20,4),
+    nm_bal numeric(20,4), fc_pur_aset numeric(20,4), fc_bal numeric(20,4)
 );
-
-create index if not exists idx_customer_asset_daily_date on mart.customer_asset_daily(as_of_date);
-create index if not exists idx_customer_asset_daily_total on mart.customer_asset_daily(total_asset);
-
-create table if not exists mart.customer_trade (
-    trade_id uuid primary key default gen_random_uuid(),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    product_id uuid references mart.product_info(product_id),
-    trade_date date not null,
-    trade_time time,
-    trade_type varchar(32) not null,
-    market varchar(32),
-    security_code varchar(64),
-    trade_amount numeric(20, 4) not null default 0,
-    trade_quantity numeric(20, 4) not null default 0,
-    fee_amount numeric(20, 4) not null default 0,
-    realized_profit_loss numeric(20, 4),
-    channel varchar(64),
-    created_at timestamptz not null default now()
+create table if not exists mart.dim_public (
+    code varchar(12) not null, code_type_id varchar(6) not null, describe varchar(50) not null
 );
-
-create index if not exists idx_customer_trade_customer_date on mart.customer_trade(customer_id, trade_date);
-create index if not exists idx_customer_trade_product on mart.customer_trade(product_id);
-create index if not exists idx_customer_trade_type on mart.customer_trade(trade_type);
-
-create table if not exists mart.customer_position_daily (
-    position_snapshot_id uuid primary key default gen_random_uuid(),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    product_id uuid not null references mart.product_info(product_id),
-    as_of_date date not null,
-    position_quantity numeric(20, 4) not null default 0,
-    market_value numeric(20, 4) not null default 0,
-    cost_amount numeric(20, 4),
-    unrealized_profit_loss numeric(20, 4),
-    holding_days integer,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint uq_customer_position_daily unique (customer_id, product_id, as_of_date)
+create table if not exists mart.dim_branch (
+    data_dt varchar(8) not null, org_id varchar(50) not null, org_name varchar(100) not null,
+    up_org_id varchar(50) not null, up_org_name varchar(100) not null
 );
-
-create index if not exists idx_customer_position_customer_date on mart.customer_position_daily(customer_id, as_of_date);
-create index if not exists idx_customer_position_product_date on mart.customer_position_daily(product_id, as_of_date);
-
-create table if not exists mart.customer_asset_flow (
-    flow_id uuid primary key default gen_random_uuid(),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    product_id uuid references mart.product_info(product_id),
-    occur_date date not null,
-    flow_type varchar(32) not null,
-    amount numeric(20, 4) not null,
-    channel varchar(64),
-    remark varchar(256),
-    created_at timestamptz not null default now(),
-    constraint ck_customer_asset_flow_type check (flow_type in ('inflow', 'outflow', 'transfer_in', 'transfer_out'))
-);
-
-create index if not exists idx_customer_asset_flow_customer_date on mart.customer_asset_flow(customer_id, occur_date);
-create index if not exists idx_customer_asset_flow_type on mart.customer_asset_flow(flow_type);
-
-create table if not exists mart.marketing_campaign (
-    campaign_id uuid primary key default gen_random_uuid(),
-    campaign_code varchar(64) not null unique,
-    campaign_name varchar(256) not null,
-    campaign_type varchar(64),
-    target_product_id uuid references mart.product_info(product_id),
-    start_date date,
-    end_date date,
-    campaign_status varchar(32) not null default 'draft',
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    constraint ck_marketing_campaign_date check (end_date is null or start_date is null or end_date >= start_date)
-);
-
-create table if not exists mart.marketing_touch (
-    touch_id uuid primary key default gen_random_uuid(),
-    campaign_id uuid not null references mart.marketing_campaign(campaign_id),
-    customer_id uuid not null references mart.customer_info(customer_id),
-    manager_id uuid references mart.service_manager(manager_id),
-    touch_time timestamptz,
-    touch_channel varchar(64),
-    touch_status varchar(32) not null default 'planned',
-    response_status varchar(32),
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-);
-
-create index if not exists idx_marketing_touch_campaign on mart.marketing_touch(campaign_id);
-create index if not exists idx_marketing_touch_customer on mart.marketing_touch(customer_id);
-create index if not exists idx_marketing_touch_manager on mart.marketing_touch(manager_id);
-
+create index if not exists idx_official_customer_date on mart.ads_cust_info_d (pty_id, data_dt);
+create index if not exists idx_official_customer_org on mart.ads_cust_info_d (org_id);
+create index if not exists idx_official_asset_customer_date on mart.dws_cust_aset_d (pty_id, data_dt);
+create index if not exists idx_official_fin_customer_date on mart.dws_cust_fin_d (pty_id, data_dt);
+create index if not exists idx_official_hold_customer_date on mart.dwd_cust_hold_d (pty_id, data_dt);
+create index if not exists idx_official_hold_product on mart.dwd_cust_hold_d (prdt_id);
+create index if not exists idx_official_trade_customer_date on mart.dwd_cust_tran_d (pty_id, data_dt);
+create index if not exists idx_official_trade_product on mart.dwd_cust_tran_d (prdt_id);
+create index if not exists idx_official_product_id on mart.dim_product (prdt_id);
+create index if not exists idx_official_public_code on mart.dim_public (code_type_id, code);
+create index if not exists idx_official_branch_org on mart.dim_branch (org_id, data_dt);
 -- AI-friendly metadata tables.
 
 create table if not exists metadata.table_metadata (
@@ -495,8 +356,8 @@ create table if not exists evaluation.eval_cases (
     expected_sql text,
     expected_result jsonb not null default '{}'::jsonb,
     scoring_config jsonb not null default '{}'::jsonb,
-    dataset_version varchar(64) not null default 'synthetic-v1',
-    source_type varchar(32) not null default 'synthetic',
+    dataset_version varchar(64) not null default 'official-v1',
+    source_type varchar(32) not null default 'official',
     expected_status varchar(32) not null default 'completed',
     tags jsonb not null default '[]'::jsonb,
     is_active boolean not null default true,
@@ -643,54 +504,3 @@ select
 from metadata.column_metadata
 where is_active = true
   and is_sensitive = true;
-
--- Business views used by SQL generation and result validation.
-
-create or replace view mart.customer_current_asset as
-select
-    cad.customer_id,
-    cad.as_of_date,
-    cad.total_asset,
-    cad.cash_asset,
-    cad.security_market_value,
-    cad.fund_market_value,
-    cad.product_market_value,
-    cad.net_asset,
-    cad.asset_level
-from mart.customer_asset_daily cad
-join (
-    select max(as_of_date) as as_of_date
-    from mart.customer_asset_daily
-) latest on latest.as_of_date = cad.as_of_date;
-
-create or replace view mart.customer_trade_90d as
-with latest as (
-    select coalesce(max(as_of_date), current_date) as as_of_date
-    from mart.customer_asset_daily
-)
-select
-    ct.customer_id,
-    count(*)::integer as trade_count_90d,
-    coalesce(sum(ct.trade_amount), 0) as trade_amount_90d,
-    coalesce(sum(ct.fee_amount), 0) as fee_amount_90d
-from mart.customer_trade ct
-cross join latest
-where ct.trade_date > latest.as_of_date - interval '90 days'
-  and ct.trade_date <= latest.as_of_date
-group by ct.customer_id;
-
-create or replace view mart.customer_net_flow_90d as
-with latest as (
-    select coalesce(max(as_of_date), current_date) as as_of_date
-    from mart.customer_asset_daily
-)
-select
-    caf.customer_id,
-    coalesce(sum(case when caf.flow_type in ('inflow', 'transfer_in') then caf.amount else 0 end), 0) as inflow_amount_90d,
-    coalesce(sum(case when caf.flow_type in ('outflow', 'transfer_out') then caf.amount else 0 end), 0) as outflow_amount_90d,
-    coalesce(sum(case when caf.flow_type in ('inflow', 'transfer_in') then caf.amount else -caf.amount end), 0) as net_flow_amount_90d
-from mart.customer_asset_flow caf
-cross join latest
-where caf.occur_date > latest.as_of_date - interval '90 days'
-  and caf.occur_date <= latest.as_of_date
-group by caf.customer_id;

@@ -47,8 +47,11 @@ def _jsonable(value: Any) -> Any:
 
 def _canonical(value: Any) -> str:
     def normalize(item: Any) -> Any:
-        if isinstance(item, float):
-            return round(item, 2)
+        # PostgreSQL numeric aggregates arrive as Decimal while expected JSON
+        # results are deserialized as float.  Normalize both to the same
+        # business precision before result comparison.
+        if isinstance(item, (float, Decimal)):
+            return round(float(item), 2)
         if isinstance(item, dict):
             return {key: normalize(value) for key, value in sorted(item.items())}
         if isinstance(item, list):
@@ -64,23 +67,33 @@ def _normalize_metric_aliases(
     """Compare known metric columns by stable code instead of presentation alias."""
     aliases: dict[str, str] = {}
     source_aliases = {
-        "current_total_asset": {"total_asset"},
-        "net_asset_inflow_90d": {"net_flow_amount_90d"},
-        "trade_amount_90d": {"trade_amount"},
-        "fund_holding_amount": {"market_value"},
+        "total_asset": {"aset"},
+        "cash_asset": {"nm_bal", "fc_bal"},
+        "holding_market_value": {"mkt_val"},
+        "holding_quantity": {"hold_cnt"},
+        "trade_amount": {"buy_amt", "sell_amt", "tran_amt"},
+        "net_cash_flow": {"cash_in", "cash_out", "tran_in", "tran_out"},
     }
     presentation_aliases = {
+        "count": "customer_count",
+        "count(*)": "customer_count",
+        "cnt": "customer_count",
         "客户数": "customer_count",
         "交易客户数": "customer_count",
-        "当前总资产": "current_total_asset",
-        "总资产": "current_total_asset",
-        "近90天交易金额": "trade_amount_90d",
-        "交易金额": "trade_amount_90d",
+        "cust_age_type": "age_group",
+        "cust_age_group": "age_group",
+        "age_group": "age_group",
+        "当前总资产": "total_asset",
+        "总资产": "total_asset",
+        "交易金额": "trade_amount",
+        "tran_amt": "trade_amount",
+        "持仓市值": "holding_market_value",
+        "mkt_val": "holding_market_value",
         "风险等级": "risk_level",
         "营销活动": "campaign_code",
         "已响应客户数": "response_customer_count",
         "响应率": "response_rate",
-        "客户ID": "customer_no",
+        "客户标识": "pty_id",
         "净流出金额": "outflow_amount",
     }
     aliases.update(presentation_aliases)
@@ -107,6 +120,7 @@ def _same_result_rows(
     actual: list[dict[str, Any]], expected: list[dict[str, Any]], generated_plan: dict[str, Any]
 ) -> bool:
     actual = _normalize_metric_aliases(actual, generated_plan)
+    expected = _normalize_metric_aliases(expected, generated_plan)
     expected_columns = {column for row in expected for column in row}
     # The benchmark defines required business fields. Extra non-sensitive display fields
     # do not change the answer, but a missing or different required field still fails.
@@ -126,8 +140,8 @@ class EvaluationRepository:
                     insert into evaluation.eval_runs
                         (run_name, model_name, status, dataset_version, metadata_version, prompt_version,
                          evaluation_mode)
-                    values (:run_name, 'deepseek-chat', 'running', 'synthetic-v1', 'metadata-v1',
-                            'query-pipeline-v1', :mode)
+                    values (:run_name, 'deepseek-chat', 'running', 'official-v1', 'official-metadata-v1',
+                            'official-query-pipeline-v1', :mode)
                     returning eval_run_id
                     """
                 ),
@@ -141,9 +155,10 @@ class EvaluationRepository:
             where += " and difficulty = :difficulty"
             params["difficulty"] = difficulty
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    f"""
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
                     select case_id, case_code, question, difficulty, expected_query_plan, expected_sql,
                            expected_result, expected_status, scoring_config, tags
                     from evaluation.eval_cases
@@ -151,9 +166,12 @@ class EvaluationRepository:
                     order by case_code
                     limit :limit
                     """
-                ),
-                params,
-            ).mappings().all()
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
         return [dict(row) for row in rows]
 
     def save_result(self, eval_run_id: UUID, case: dict[str, Any], result: dict[str, Any]) -> None:
@@ -192,8 +210,12 @@ class EvaluationRepository:
                     "eval_run_id": str(eval_run_id),
                     "case_id": str(case["case_id"]),
                     **result,
-                    "generated_query_plan": json.dumps(result["generated_query_plan"], ensure_ascii=False),
-                    "generated_response": json.dumps(result["generated_response"], ensure_ascii=False),
+                    "generated_query_plan": json.dumps(
+                        result["generated_query_plan"], ensure_ascii=False
+                    ),
+                    "generated_response": json.dumps(
+                        result["generated_response"], ensure_ascii=False
+                    ),
                     "risk_reasons": json.dumps(result["risk_reasons"], ensure_ascii=False),
                 },
             )
@@ -226,24 +248,32 @@ class EvaluationRepository:
 
     def get_run(self, eval_run_id: UUID) -> EvaluationRunDetail | None:
         with self.engine.connect() as connection:
-            run = connection.execute(
-                text("select * from evaluation.eval_runs where eval_run_id = :eval_run_id"),
-                {"eval_run_id": str(eval_run_id)},
-            ).mappings().first()
+            run = (
+                connection.execute(
+                    text("select * from evaluation.eval_runs where eval_run_id = :eval_run_id"),
+                    {"eval_run_id": str(eval_run_id)},
+                )
+                .mappings()
+                .first()
+            )
             if run is None:
                 return None
-            results = connection.execute(
-                text(
-                    """
+            results = (
+                connection.execute(
+                    text(
+                        """
                     select er.*, ec.case_code, ec.question, ec.difficulty, ec.expected_status
                     from evaluation.eval_results er
                     join evaluation.eval_cases ec on ec.case_id = er.case_id
                     where er.eval_run_id = :eval_run_id
                     order by ec.case_code
                     """
-                ),
-                {"eval_run_id": str(eval_run_id)},
-            ).mappings().all()
+                    ),
+                    {"eval_run_id": str(eval_run_id)},
+                )
+                .mappings()
+                .all()
+            )
         return EvaluationRunDetail(
             **self._run_summary_payload(run),
             results=[self._result_summary(row) for row in results],
@@ -251,16 +281,24 @@ class EvaluationRepository:
 
     def list_runs(self, limit: int = 20) -> list[EvaluationRunSummary]:
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                text("select * from evaluation.eval_runs order by started_at desc limit :limit"), {"limit": limit}
-            ).mappings().all()
+            rows = (
+                connection.execute(
+                    text(
+                        "select * from evaluation.eval_runs order by started_at desc limit :limit"
+                    ),
+                    {"limit": limit},
+                )
+                .mappings()
+                .all()
+            )
         return [EvaluationRunSummary(**self._run_summary_payload(row)) for row in rows]
 
     def dashboard(self) -> EvaluationDashboard:
         with self.engine.connect() as connection:
-            totals = connection.execute(
-                text(
-                    """
+            totals = (
+                connection.execute(
+                    text(
+                        """
                     with latest_run as (
                       select eval_run_id
                       from evaluation.eval_runs
@@ -282,12 +320,20 @@ class EvaluationRepository:
                     left join agent.query_runs q on q.query_id = er.query_id
                     where er.eval_run_id = (select eval_run_id from latest_run)
                     """
+                    )
                 )
-            ).mappings().one()
-            latest = connection.execute(
-                text("select * from evaluation.eval_runs order by started_at desc limit 1")
-            ).mappings().first()
+                .mappings()
+                .one()
+            )
+            latest = (
+                connection.execute(
+                    text("select * from evaluation.eval_runs order by started_at desc limit 1")
+                )
+                .mappings()
+                .first()
+            )
         total = int(totals["total_results"] or 0)
+
         def percent(value: Any) -> float:
             return round((float(value or 0) / total) * 100, 1) if total else 0.0
 
@@ -298,10 +344,14 @@ class EvaluationRepository:
             result_accuracy=percent(totals["correct_results"]),
             first_pass_rate=percent(totals["first_passed"]),
             repaired_pass_rate=percent(totals["repaired_passed"]),
-            average_elapsed_ms=float(totals["average_elapsed_ms"]) if totals["average_elapsed_ms"] else None,
+            average_elapsed_ms=float(totals["average_elapsed_ms"])
+            if totals["average_elapsed_ms"]
+            else None,
             pending_review_count=int(totals["pending_review_count"] or 0),
             reviewed_count=int(totals["reviewed_count"] or 0),
-            latest_run=EvaluationRunSummary(**self._run_summary_payload(latest)) if latest else None,
+            latest_run=EvaluationRunSummary(**self._run_summary_payload(latest))
+            if latest
+            else None,
         )
 
     def create_review_batch(
@@ -312,46 +362,61 @@ class EvaluationRepository:
         created_by: str,
     ) -> ReviewBatchSummary:
         with self.engine.begin() as connection:
-            run = connection.execute(
-                text("select status, dataset_version from evaluation.eval_runs where eval_run_id = :run_id"),
-                {"run_id": str(eval_run_id)},
-            ).mappings().first()
+            run = (
+                connection.execute(
+                    text(
+                        "select status, dataset_version from evaluation.eval_runs where eval_run_id = :run_id"
+                    ),
+                    {"run_id": str(eval_run_id)},
+                )
+                .mappings()
+                .first()
+            )
             if run is None:
                 raise LookupError("Evaluation run not found.")
             if run["status"] != "completed":
                 raise ValueError("Evaluation run must be completed before creating a review batch.")
-            batch = connection.execute(
-                text(
-                    """
+            batch = (
+                connection.execute(
+                    text(
+                        """
                     select review_batch_id
                     from evaluation.review_batches
                     where eval_run_id = :run_id and batch_type = 'evaluation_run'
                     order by created_at desc
                     limit 1
                     """
-                ),
-                {"run_id": str(eval_run_id)},
-            ).mappings().first()
+                    ),
+                    {"run_id": str(eval_run_id)},
+                )
+                .mappings()
+                .first()
+            )
             if batch is None:
-                batch = connection.execute(
-                    text(
-                        """
+                batch = (
+                    connection.execute(
+                        text(
+                            """
                         insert into evaluation.review_batches
                             (batch_name, dataset_version, created_by, eval_run_id, batch_type)
                         values (:batch_name, :dataset_version, :created_by, :run_id, 'evaluation_run')
                         returning review_batch_id
                         """
-                    ),
-                    {
-                        "batch_name": batch_name,
-                        "dataset_version": run["dataset_version"],
-                        "created_by": created_by,
-                        "run_id": str(eval_run_id),
-                    },
-                ).mappings().one()
-            candidates = connection.execute(
-                text(
-                    """
+                        ),
+                        {
+                            "batch_name": batch_name,
+                            "dataset_version": run["dataset_version"],
+                            "created_by": created_by,
+                            "run_id": str(eval_run_id),
+                        },
+                    )
+                    .mappings()
+                    .one()
+                )
+            candidates = (
+                connection.execute(
+                    text(
+                        """
                     select er.eval_result_id, er.review_priority, er.risk_reasons
                     from evaluation.eval_results er
                     where er.eval_run_id = :run_id
@@ -365,13 +430,16 @@ class EvaluationRepository:
                              er.created_at asc
                     limit :limit
                     """
-                ),
-                {
-                    "run_id": str(eval_run_id),
-                    "batch_id": str(batch["review_batch_id"]),
-                    "limit": max_items,
-                },
-            ).mappings().all()
+                    ),
+                    {
+                        "run_id": str(eval_run_id),
+                        "batch_id": str(batch["review_batch_id"]),
+                        "limit": max_items,
+                    },
+                )
+                .mappings()
+                .all()
+            )
             for item in candidates:
                 connection.execute(
                     text(
@@ -410,9 +478,10 @@ class EvaluationRepository:
                     ),
                     {"ids": candidate_ids},
                 )
-            summary = connection.execute(
-                text(
-                    """
+            summary = (
+                connection.execute(
+                    text(
+                        """
                     select rb.review_batch_id, rb.batch_name, rb.status, rb.dataset_version,
                            rb.eval_run_id, rb.batch_type, rb.created_at,
                            count(ri.review_item_id) as item_count,
@@ -423,16 +492,20 @@ class EvaluationRepository:
                     where rb.review_batch_id = :batch_id
                     group by rb.review_batch_id
                     """
-                ),
-                {"batch_id": str(batch["review_batch_id"])},
-            ).mappings().one()
+                    ),
+                    {"batch_id": str(batch["review_batch_id"])},
+                )
+                .mappings()
+                .one()
+            )
         return ReviewBatchSummary(**dict(summary))
 
     def list_review_batches(self, limit: int = 30) -> list[ReviewBatchSummary]:
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    """
+            rows = (
+                connection.execute(
+                    text(
+                        """
                     select rb.review_batch_id, rb.batch_name, rb.status, rb.dataset_version,
                            rb.eval_run_id, rb.batch_type, rb.created_at,
                            count(ri.review_item_id) as item_count,
@@ -444,49 +517,63 @@ class EvaluationRepository:
                     order by rb.created_at desc
                     limit :limit
                     """
-                ),
-                {"limit": limit},
-            ).mappings().all()
+                    ),
+                    {"limit": limit},
+                )
+                .mappings()
+                .all()
+            )
         return [ReviewBatchSummary(**dict(row)) for row in rows]
 
     def submit_query_review(
         self, query_id: UUID, user_id: str, reason: str | None
     ) -> QueryReviewCreated:
-        sanitized_reason = sanitize_event_payload(reason.strip()) if reason and reason.strip() else None
+        sanitized_reason = (
+            sanitize_event_payload(reason.strip()) if reason and reason.strip() else None
+        )
         with self.engine.begin() as connection:
-            run = connection.execute(
-                text(
-                    """
+            run = (
+                connection.execute(
+                    text(
+                        """
                     select query_id, user_id, status, review_status
                     from agent.query_runs
                     where query_id = :query_id
                     for update
                     """
-                ),
-                {"query_id": str(query_id)},
-            ).mappings().first()
+                    ),
+                    {"query_id": str(query_id)},
+                )
+                .mappings()
+                .first()
+            )
             if run is None or run["user_id"] != user_id:
                 raise LookupError("Query run not found.")
             if run["status"] != "completed":
                 raise ValueError("Only completed query results can be submitted for review.")
-            existing = connection.execute(
-                text(
-                    """
+            existing = (
+                connection.execute(
+                    text(
+                        """
                     select review_item_id, review_batch_id, status
                     from evaluation.review_items
                     where query_id = :query_id and source_type = 'user_feedback'
                     """
-                ),
-                {"query_id": str(query_id)},
-            ).mappings().first()
+                    ),
+                    {"query_id": str(query_id)},
+                )
+                .mappings()
+                .first()
+            )
             if existing:
                 return QueryReviewCreated(
                     **dict(existing),
                     already_submitted=True,
                 )
-            batch = connection.execute(
-                text(
-                    """
+            batch = (
+                connection.execute(
+                    text(
+                        """
                     select review_batch_id
                     from evaluation.review_batches
                     where batch_type = 'user_feedback' and status = 'open'
@@ -495,37 +582,48 @@ class EvaluationRepository:
                     limit 1
                     for update
                     """
+                    )
                 )
-            ).mappings().first()
+                .mappings()
+                .first()
+            )
             if batch is None:
-                batch = connection.execute(
-                    text(
-                        """
+                batch = (
+                    connection.execute(
+                        text(
+                            """
                         insert into evaluation.review_batches
                             (batch_name, dataset_version, created_by, batch_type)
                         values ('业务用户反馈-' || to_char(current_date, 'YYYY-MM-DD'),
                                 'live-query', :created_by, 'user_feedback')
                         returning review_batch_id
                         """
-                    ),
-                    {"created_by": user_id},
-                ).mappings().one()
-            item = connection.execute(
-                text(
-                    """
+                        ),
+                        {"created_by": user_id},
+                    )
+                    .mappings()
+                    .one()
+                )
+            item = (
+                connection.execute(
+                    text(
+                        """
                     insert into evaluation.review_items
                         (review_batch_id, query_id, source_type, priority, risk_reasons, user_reason)
                     values (:batch_id, :query_id, 'user_feedback', 'high',
                             '["user_dispute"]'::jsonb, :reason)
                     returning review_item_id, review_batch_id, status
                     """
-                ),
-                {
-                    "batch_id": str(batch["review_batch_id"]),
-                    "query_id": str(query_id),
-                    "reason": sanitized_reason,
-                },
-            ).mappings().one()
+                    ),
+                    {
+                        "batch_id": str(batch["review_batch_id"]),
+                        "query_id": str(query_id),
+                        "reason": sanitized_reason,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             connection.execute(
                 text(
                     """
@@ -539,7 +637,9 @@ class EvaluationRepository:
             )
         return QueryReviewCreated(**dict(item))
 
-    def list_review_items(self, batch_id: UUID | None = None, status: str = "pending") -> list[ReviewItemDetail]:
+    def list_review_items(
+        self, batch_id: UUID | None = None, status: str = "pending"
+    ) -> list[ReviewItemDetail]:
         clause = ""
         params: dict[str, Any] = {}
         if status != "all":
@@ -550,9 +650,10 @@ class EvaluationRepository:
             clause += " ri.review_batch_id = :batch_id"
             params["batch_id"] = str(batch_id)
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    f"""
+            rows = (
+                connection.execute(
+                    text(
+                        f"""
                     select ri.review_item_id, ri.review_batch_id, ri.status, ri.priority,
                            ri.risk_reasons, ri.source_type, ri.query_id, ri.user_reason,
                            coalesce(ec.case_code, 'QUERY-' || upper(left(ri.query_id::text, 8))) as case_code,
@@ -588,9 +689,12 @@ class EvaluationRepository:
                     order by case ri.priority when 'blocking' then 1 when 'high' then 2 else 3 end,
                              ri.created_at
                     """
-                ),
-                params,
-            ).mappings().all()
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
         return [ReviewItemDetail(**self._review_item_payload(row)) for row in rows]
 
     def export_review_batch(self, batch_id: UUID, export_format: str) -> tuple[str, bytes]:
@@ -604,11 +708,28 @@ class EvaluationRepository:
             writer = csv.DictWriter(
                 output,
                 fieldnames=[
-                    "review_item_id", "review_batch_id", "source_type", "query_id", "user_reason",
-                    "priority", "risk_reasons", "case_code",
-                    "question", "difficulty", "expected_status", "auto_decision", "failure_type",
-                    "failure_reason", "generated_sql", "reviewer_id", "verdict", "error_class",
-                    "severity", "reviewer_note", "confidence", "corrected_sql",
+                    "review_item_id",
+                    "review_batch_id",
+                    "source_type",
+                    "query_id",
+                    "user_reason",
+                    "priority",
+                    "risk_reasons",
+                    "case_code",
+                    "question",
+                    "difficulty",
+                    "expected_status",
+                    "auto_decision",
+                    "failure_type",
+                    "failure_reason",
+                    "generated_sql",
+                    "reviewer_id",
+                    "verdict",
+                    "error_class",
+                    "severity",
+                    "reviewer_note",
+                    "confidence",
+                    "corrected_sql",
                 ],
             )
             writer.writeheader()
@@ -626,7 +747,9 @@ class EvaluationRepository:
             content_type = "text/csv; charset=utf-8"
         with self.engine.begin() as connection:
             connection.execute(
-                text("update evaluation.review_batches set exported_at = now(), updated_at = now() where review_batch_id = :batch_id"),
+                text(
+                    "update evaluation.review_batches set exported_at = now(), updated_at = now() where review_batch_id = :batch_id"
+                ),
                 {"batch_id": str(batch_id)},
             )
         return content_type, payload
@@ -636,9 +759,10 @@ class EvaluationRepository:
         rejected: list[str] = []
         with self.engine.begin() as connection:
             for decision in decisions:
-                item = connection.execute(
-                    text(
-                        """
+                item = (
+                    connection.execute(
+                        text(
+                            """
                         select ri.review_item_id, ri.eval_result_id, ri.query_id, ri.status,
                                ri.review_batch_id, ec.case_id,
                                coalesce(ec.question, qr.question) as question,
@@ -649,9 +773,12 @@ class EvaluationRepository:
                         left join agent.query_runs qr on qr.query_id = ri.query_id
                         where ri.review_item_id = :review_item_id for update
                         """
-                    ),
-                    {"review_item_id": str(decision.review_item_id)},
-                ).mappings().first()
+                        ),
+                        {"review_item_id": str(decision.review_item_id)},
+                    )
+                    .mappings()
+                    .first()
+                )
                 if item is None:
                     rejected.append(f"{decision.review_item_id}: review item not found")
                     continue
@@ -678,9 +805,13 @@ class EvaluationRepository:
                         "verdict": decision.verdict,
                         "error_class": decision.error_class,
                         "severity": decision.severity,
-                        "corrected_query_plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
+                        "corrected_query_plan": json.dumps(
+                            decision.corrected_query_plan, ensure_ascii=False
+                        ),
                         "corrected_sql": decision.corrected_sql,
-                        "corrected_result": json.dumps(decision.corrected_result, ensure_ascii=False),
+                        "corrected_result": json.dumps(
+                            decision.corrected_result, ensure_ascii=False
+                        ),
                         "reviewer_note": decision.reviewer_note,
                         "confidence": decision.confidence,
                         "source_checksum": checksum,
@@ -689,12 +820,16 @@ class EvaluationRepository:
                 if item["case_id"] is not None:
                     self._promote_review_feedback(connection, item, decision)
                 connection.execute(
-                    text("update evaluation.review_items set status = 'reviewed', updated_at = now() where review_item_id = :review_item_id"),
+                    text(
+                        "update evaluation.review_items set status = 'reviewed', updated_at = now() where review_item_id = :review_item_id"
+                    ),
                     {"review_item_id": str(decision.review_item_id)},
                 )
                 if item["eval_result_id"] is not None:
                     connection.execute(
-                        text("update evaluation.eval_results set review_status = 'reviewed' where eval_result_id = :eval_result_id"),
+                        text(
+                            "update evaluation.eval_results set review_status = 'reviewed' where eval_result_id = :eval_result_id"
+                        ),
                         {"eval_result_id": str(item["eval_result_id"])},
                     )
                 if item["query_id"] is not None:
@@ -817,7 +952,9 @@ class EvaluationRepository:
             "total_cases": row["total_cases"],
             "passed_cases": row["passed_cases"],
             "review_queued_cases": row.get("review_queued_cases", 0),
-            "average_elapsed_ms": float(row["average_elapsed_ms"]) if row["average_elapsed_ms"] else None,
+            "average_elapsed_ms": float(row["average_elapsed_ms"])
+            if row["average_elapsed_ms"]
+            else None,
             "dataset_version": row.get("dataset_version"),
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
@@ -826,15 +963,25 @@ class EvaluationRepository:
     @staticmethod
     def _result_summary(row: Any) -> EvaluationResultSummary:
         return EvaluationResultSummary(
-            eval_result_id=row["eval_result_id"], case_id=row["case_id"], case_code=row["case_code"],
-            question=row["question"], difficulty=row["difficulty"], expected_status=row["expected_status"],
-            passed=row["passed"], executable=row["executable"], result_correct=row["result_correct"],
+            eval_result_id=row["eval_result_id"],
+            case_id=row["case_id"],
+            case_code=row["case_code"],
+            question=row["question"],
+            difficulty=row["difficulty"],
+            expected_status=row["expected_status"],
+            passed=row["passed"],
+            executable=row["executable"],
+            result_correct=row["result_correct"],
             plan_score=float(row["plan_score"]) if row["plan_score"] is not None else None,
             sql_score=float(row["sql_score"]) if row["sql_score"] is not None else None,
             result_score=float(row["result_score"]) if row["result_score"] is not None else None,
-            elapsed_ms=row["elapsed_ms"], failure_type=row["failure_type"], failure_reason=row["failure_reason"],
-            auto_decision=row["auto_decision"], review_priority=row["review_priority"],
-            review_status=row["review_status"], risk_reasons=list(row["risk_reasons"] or []),
+            elapsed_ms=row["elapsed_ms"],
+            failure_type=row["failure_type"],
+            failure_reason=row["failure_reason"],
+            auto_decision=row["auto_decision"],
+            review_priority=row["review_priority"],
+            review_status=row["review_status"],
+            risk_reasons=list(row["risk_reasons"] or []),
         )
 
     @staticmethod
@@ -876,7 +1023,9 @@ class EvaluationManager:
                 started_at = perf_counter()
                 try:
                     response = await self.service_factory().run(
-                        QueryRequest(question=case["question"], user_id="evaluation", include_debug=True)
+                        QueryRequest(
+                            question=case["question"], user_id="evaluation", include_debug=True
+                        )
                     )
                 except Exception as exc:  # The failure becomes an auditable evaluation result.
                     error = exc
@@ -897,24 +1046,43 @@ class EvaluationManager:
     ) -> dict[str, Any]:
         if response is None:
             return {
-                "query_id": None, "passed": False, "executable": False, "result_correct": False,
-                "plan_score": 0.0, "sql_score": 0.0, "result_score": 0.0, "elapsed_ms": elapsed_ms,
+                "query_id": None,
+                "passed": False,
+                "executable": False,
+                "result_correct": False,
+                "plan_score": 0.0,
+                "sql_score": 0.0,
+                "result_score": 0.0,
+                "elapsed_ms": elapsed_ms,
                 "failure_type": type(error).__name__ if error else "runtime_error",
                 "failure_reason": str(error) if error else "Evaluation returned no response.",
-                "generated_sql": None, "generated_query_plan": {}, "generated_response": {},
-                "auto_decision": "manual_review", "review_priority": "blocking",
-                "review_status": "pending", "risk_reasons": ["runtime_error"], "critic_confidence": None,
+                "generated_sql": None,
+                "generated_query_plan": {},
+                "generated_response": {},
+                "auto_decision": "manual_review",
+                "review_priority": "blocking",
+                "review_status": "pending",
+                "risk_reasons": ["runtime_error"],
+                "critic_confidence": None,
             }
         generated_plan = response.query_plan.model_dump(mode="json") if response.query_plan else {}
         expected_status = case["expected_status"]
         status_match = response.status == expected_status
         executable = response.status == "completed" and bool(response.sql)
         expected_result = dict(case["expected_result"] or {})
-        result_correct = status_match if expected_status == "needs_clarification" else (
-            executable
-            and _same_result_rows(response.result_preview, expected_result.get("rows", []), generated_plan)
+        result_correct = (
+            status_match
+            if expected_status == "needs_clarification"
+            else (
+                executable
+                and _same_result_rows(
+                    response.result_preview, expected_result.get("rows", []), generated_plan
+                )
+            )
         )
-        plan_score = self._plan_score(case["expected_query_plan"] or {}, generated_plan, status_match)
+        plan_score = self._plan_score(
+            case["expected_query_plan"] or {}, generated_plan, status_match
+        )
         sql_score = 100.0 if result_correct else 50.0 if executable else 0.0
         result_score = 100.0 if result_correct else 0.0
         passed = bool(status_match and result_correct)
@@ -933,22 +1101,34 @@ class EvaluationManager:
         if expected_status == "completed" and confidence is not None and confidence < 0.85:
             risk_reasons.append("low_plan_confidence")
         priority = (
-            "blocking" if {"status_mismatch", "not_executable"} & set(risk_reasons)
-            else "high" if "result_mismatch" in risk_reasons
-            else "normal" if risk_reasons else None
+            "blocking"
+            if {"status_mismatch", "not_executable"} & set(risk_reasons)
+            else "high"
+            if "result_mismatch" in risk_reasons
+            else "normal"
+            if risk_reasons
+            else None
         )
         needs_review = bool(priority)
         return {
-            "query_id": str(response.query_id), "passed": passed, "executable": executable,
-            "result_correct": result_correct, "plan_score": plan_score, "sql_score": sql_score,
-            "result_score": result_score, "elapsed_ms": response.elapsed_ms or elapsed_ms,
+            "query_id": str(response.query_id),
+            "passed": passed,
+            "executable": executable,
+            "result_correct": result_correct,
+            "plan_score": plan_score,
+            "sql_score": sql_score,
+            "result_score": result_score,
+            "elapsed_ms": response.elapsed_ms or elapsed_ms,
             "failure_type": None if passed else response.status,
             "failure_reason": None if passed else response.answer,
-            "generated_sql": response.sql, "generated_query_plan": sanitize_event_payload(generated_plan),
+            "generated_sql": response.sql,
+            "generated_query_plan": sanitize_event_payload(generated_plan),
             "generated_response": sanitize_event_payload(response.model_dump(mode="json")),
             "auto_decision": "auto_passed" if passed and not needs_review else "manual_review",
-            "review_priority": priority, "review_status": "pending" if needs_review else "not_required",
-            "risk_reasons": risk_reasons, "critic_confidence": confidence,
+            "review_priority": priority,
+            "review_status": "pending" if needs_review else "not_required",
+            "risk_reasons": risk_reasons,
+            "critic_confidence": confidence,
         }
 
     @staticmethod
@@ -970,13 +1150,17 @@ class EvaluationManager:
                     for item in actual.get("filters", [])
                 ]
             elif key == "dimensions":
-                actual_value = [item.get("dimension_code") or item.get("name") for item in actual.get("dimensions", [])]
+                actual_value = [
+                    item.get("dimension_code") or item.get("name")
+                    for item in actual.get("dimensions", [])
+                ]
             elif key == "clarification_fields":
                 actual_value = [item.get("field") for item in actual.get("clarifications", [])]
             else:
                 actual_value = actual.get(key)
             if _canonical(expected_value) == _canonical(actual_value) or (
-                isinstance(expected_value, list) and set(expected_value).issubset(set(actual_value or []))
+                isinstance(expected_value, list)
+                and set(expected_value).issubset(set(actual_value or []))
             ):
                 matched += 1
         return round((matched / fields) * 100, 2) if fields else 100.0

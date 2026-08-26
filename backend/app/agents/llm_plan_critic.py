@@ -9,7 +9,6 @@ from app.llm.schemas import LLMMessage
 from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 
-
 CriticStatus = Literal["reviewed", "skipped"]
 
 
@@ -135,7 +134,13 @@ class LLMPlanCritic:
             ),
             "business_terms": self._compact_items(
                 business_terms,
-                ("term", "definition", "synonyms", "default_plan_fragment", "clarification_required"),
+                (
+                    "term",
+                    "definition",
+                    "synonyms",
+                    "default_plan_fragment",
+                    "clarification_required",
+                ),
             ),
             "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
         }
@@ -172,6 +177,10 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
     1. 用户明示条件是否完整保留：主体、指标、阈值、比较符、时间窗口、产品/客户范围。
     2. 输出粒度是否匹配：客户名单应是 customer；按服务经理汇总应是 manager；总数应是 aggregate。
        用户问“多少、数量、人数、总数、几个、几位客户”时，若没有同时要求名单，grain 应为 aggregate。
+       用户出现“按 X”“按 X 统计”“按 X 展示”等分组措辞时，X 必须同时出现在
+       dimensions(role=group_by) 与 grain.keys，不能保留 customer 粒度。
+       用户以“、”“和”“及”等并列方式明确要求多个结果指标时，每个指标都必须在 metrics 和
+       output.columns 中；只作为阈值筛选条件的指标不应被误判为遗漏的输出指标。
     3. 业务词是否被擅自解释：高净值、活跃、沉默、重点、潜力等。
     4. 澄清问题是否具体可回答：不能只说“请补充信息”。
     5. 安全要求是否满足：readonly、limit、敏感字段、脱敏要求。
@@ -216,20 +225,31 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
       "stage": "query_plan_review",
       "error_type": "guessed_business_definition",
       "reason": "计划擅自假设高净值客户门槛，用户未确认该业务口径。",
-      "evidence": ["assumed_current_total_asset_gt_1000000"],
+      "evidence": ["assumed_total_asset_gt_1000000"],
       "repair_hint": "需要先询问高净值客户资产门槛。",
       "clarification_questions": [],
       "confidence": 0.92
     }
 
     正例 2：
-    用户问“查询近三个月交易次数超过3次且当前资产大于50万的客户列表”，计划包含
-    trade_count_90d > 3、current_total_asset > 500000、grain=customer。
+    用户问“查询一季度交易金额超过50万且总资产大于50万的客户列表”，计划包含
+    trade_amount > 500000、total_asset > 500000、grain=customer。
     审核应 passed=true，evidence 包含 explicit_filters_preserved。
 
+    官方复杂问数补充规则：
+    - 用户问“日均资产超过阈值、股票交易量超过阈值的客户持有的产品大类”时，
+      日均资产和交易金额是客户筛选条件，不是最终按产品分类展示的聚合指标；
+      因而 output 只含产品大类/产品分类和持仓市值是正确的。
+    - 该类问题中的 up_prdt_type_id='PT040000' 限制的是交易子查询的股票范围，
+      并不表示最终持有产品只能是股票。QueryPlan 使用该 field_code 表达这项业务约束是正确的。
+    - grain.level='product' 且维度含 up_prdt_type_name 与 prdt_type_name 时，
+      代表产品大类/产品分类输出，不能仅因 level 名称不是 product_category 而判错。
+    - “分公司各营业部的客户省份分析统计”返回分公司、营业部、省份、城市和客户数时，
+      organization grain 是正确的，所有上述名称维度均应被保留。
+
     反例 2：
-    用户问“按服务经理统计近30天触达客户数”，计划 grain=customer 且没有 manager 维度。
-    审核应 passed=false，error_type="wrong_grain"，repair_hint 说明应改为服务经理粒度。
+    用户问“按营业部统计一季度交易金额”，计划 grain=customer 且没有营业部维度。
+    审核应 passed=false，error_type="wrong_grain"，repair_hint 说明应改为营业部粒度。
 
     输出必须符合 ReviewDecision schema，stage 必须是 query_plan_review。
     """

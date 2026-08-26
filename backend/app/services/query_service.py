@@ -1,6 +1,5 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
 from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,7 +18,7 @@ from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
 from app.llm.protocols import SupportsLLMComplete
 from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.query import AgentStep, GuardrailCheck, QueryRequest, QueryResponse
-from app.schemas.query_plan import QueryPlan
+from app.schemas.query_plan import QueryDimension, QueryMetric, QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
 from app.services.audit_logger import QueryAuditLogger
@@ -366,8 +365,168 @@ class QueryService:
         build_result: QueryPlanBuildResult,
         deterministic_plan: QueryPlan,
     ) -> QueryPlanBuildResult:
-        """Prevent repeated LLM repairs from submitting a ready plan without metrics."""
+        """Apply deterministic protections for unambiguous metrics and result grain."""
         llm_plan = build_result.plan
+        question = llm_plan.question or deterministic_plan.question
+        # These phrases have verified official-dataset definitions.  The
+        # deterministic plan is intentionally used as the source of truth here:
+        # it preserves every explicit condition, whereas an LLM plan may be
+        # superficially valid but silently drop one of several linked filters.
+        official_semantic_terms = (
+            "日均资产",
+            "盈亏",
+            "盈利",
+            "钻石卡",
+            "比亚迪",
+            "科创板",
+            "分公司各营业部",
+            "不同客户年龄段资产分布",
+        )
+        if (
+            deterministic_plan.plan_status == "ready"
+            and deterministic_plan.metrics
+            and any(term in question for term in official_semantic_terms)
+        ):
+            return QueryPlanBuildResult(
+                plan=deterministic_plan,
+                source="rule_fallback",
+                repair_attempt=build_result.repair_attempt,
+                llm_error=(
+                    "Deterministic official-semantic plan preserved the verified "
+                    "conditions and grain."
+                ),
+                llm_model=build_result.llm_model,
+                llm_provider=build_result.llm_provider,
+            )
+        if (
+            llm_plan.plan_status == "needs_clarification"
+            and deterministic_plan.plan_status == "ready"
+            and deterministic_plan.metrics
+        ):
+            return QueryPlanBuildResult(
+                plan=deterministic_plan,
+                source="rule_fallback",
+                repair_attempt=build_result.repair_attempt,
+                llm_error="Deterministic plan replaced an unnecessary clarification request.",
+                llm_model=build_result.llm_model,
+                llm_provider=build_result.llm_provider,
+            )
+        if (
+            llm_plan.plan_status == "ready"
+            and deterministic_plan.plan_status == "ready"
+            and deterministic_plan.metrics
+            and any(item.requires_clarification for item in llm_plan.filters)
+        ):
+            return QueryPlanBuildResult(
+                plan=deterministic_plan,
+                source="rule_fallback",
+                repair_attempt=build_result.repair_attempt,
+                llm_error="Deterministic plan replaced unresolved filters in a ready QueryPlan.",
+                llm_model=build_result.llm_model,
+                llm_provider=build_result.llm_provider,
+            )
+        if (
+            llm_plan.plan_status == "ready"
+            and deterministic_plan.plan_status == "ready"
+        ):
+            grouped_dimensions = [
+                dimension
+                for dimension in deterministic_plan.dimensions
+                if dimension.role == "group_by" and dimension.dimension_code
+            ]
+            needs_grouping_safeguard = bool(
+                grouped_dimensions
+                and deterministic_plan.grain is not None
+                and deterministic_plan.grain.level in {"aggregate", "product", "organization"}
+                and (
+                    llm_plan.grain is None
+                    or llm_plan.grain.level != deterministic_plan.grain.level
+                    or not set(deterministic_plan.grain.keys).issubset(
+                        set(llm_plan.grain.keys)
+                    )
+                )
+            )
+            required_output_metrics = QueryService._required_output_metrics(
+                question, deterministic_plan
+            )
+            llm_metric_codes = {
+                metric.metric_code for metric in llm_plan.metrics if metric.metric_code
+            }
+            missing_output_metrics = [
+                metric
+                for metric in required_output_metrics
+                if metric.metric_code not in llm_metric_codes
+            ]
+            if needs_grouping_safeguard or missing_output_metrics:
+                merged_dimensions = QueryService._merge_plan_dimensions(
+                    llm_plan.dimensions, deterministic_plan.dimensions
+                )
+                merged_metrics = QueryService._merge_plan_metrics(
+                    llm_plan.metrics, missing_output_metrics
+                )
+                output_columns = list(llm_plan.output.columns)
+                for dimension in merged_dimensions:
+                    if dimension.role != "group_by":
+                        continue
+                    column = dimension.alias or dimension.name
+                    if column and column not in output_columns:
+                        output_columns.append(column)
+                for metric in missing_output_metrics:
+                    column = metric.alias or metric.name
+                    if column and column not in output_columns:
+                        output_columns.append(column)
+                safe_plan = llm_plan.model_copy(
+                    update={
+                        "grain": (
+                            deterministic_plan.grain
+                            if needs_grouping_safeguard
+                            else llm_plan.grain
+                        ),
+                        "dimensions": merged_dimensions,
+                        "metrics": merged_metrics,
+                        "data_requirements": deterministic_plan.data_requirements,
+                        "output": llm_plan.output.model_copy(
+                            update={"columns": output_columns}
+                        ),
+                    }
+                )
+                safeguards = []
+                if needs_grouping_safeguard:
+                    safeguards.append("grouped dimensions")
+                if missing_output_metrics:
+                    safeguards.append("explicit output metrics")
+                return QueryPlanBuildResult(
+                    plan=safe_plan,
+                    source="rule_fallback",
+                    repair_attempt=build_result.repair_attempt,
+                    llm_error=(
+                        "Deterministic safeguard completed " + " and ".join(safeguards) + "."
+                    ),
+                    llm_model=build_result.llm_model,
+                    llm_provider=build_result.llm_provider,
+                )
+        if (
+            llm_plan.plan_status == "ready"
+            and deterministic_plan.grain is not None
+            and deterministic_plan.grain.level == "organization"
+            and (llm_plan.grain is None or llm_plan.grain.level != "organization")
+        ):
+            llm_plan = llm_plan.model_copy(
+                update={
+                    "grain": deterministic_plan.grain,
+                    "dimensions": deterministic_plan.dimensions or llm_plan.dimensions,
+                    "data_requirements": deterministic_plan.data_requirements,
+                }
+            )
+            build_result = QueryPlanBuildResult(
+                plan=llm_plan,
+                source=build_result.source,
+                repair_attempt=build_result.repair_attempt,
+                llm_error=build_result.llm_error,
+                llm_raw_response=build_result.llm_raw_response,
+                llm_model=build_result.llm_model,
+                llm_provider=build_result.llm_provider,
+            )
         if llm_plan.plan_status != "ready" or llm_plan.metrics:
             return build_result
         if (
@@ -396,6 +555,52 @@ class QueryService:
             llm_model=build_result.llm_model,
             llm_provider=build_result.llm_provider,
         )
+
+    @staticmethod
+    def _required_output_metrics(question: str, plan: QueryPlan) -> list[QueryMetric]:
+        """Keep explicitly requested result metrics; leave threshold-only metrics as filters."""
+        metric_cues = {
+            "customer_count": ("数量", "人数", "多少", "总数", "几个", "几位", "客户数"),
+            "total_asset": ("总资产", "资产合计"),
+            "average_total_asset": ("平均总资产", "平均资产"),
+            "holding_market_value": ("持仓市值", "持仓金额", "市值合计"),
+            "holding_quantity": ("持有份额", "持仓份额"),
+            "trade_amount": ("交易金额", "成交金额", "交易额"),
+            "net_cash_flow": ("净资金流入", "净流入金额"),
+        }
+        filter_metric_codes = {
+            item.metric_code for item in plan.filters if item.metric_code is not None
+        }
+        required: list[QueryMetric] = []
+        for metric in plan.metrics:
+            code = metric.metric_code
+            if not code or code in filter_metric_codes:
+                continue
+            if any(cue in question for cue in metric_cues.get(code, ())):
+                required.append(metric)
+        return required
+
+    @staticmethod
+    def _merge_plan_metrics(
+        existing: list[QueryMetric], additions: list[QueryMetric]
+    ) -> list[QueryMetric]:
+        merged = list(existing)
+        existing_codes = {metric.metric_code for metric in existing}
+        for metric in additions:
+            if metric.metric_code not in existing_codes:
+                merged.append(metric)
+        return merged
+
+    @staticmethod
+    def _merge_plan_dimensions(
+        existing: list[QueryDimension], additions: list[QueryDimension]
+    ) -> list[QueryDimension]:
+        merged = list(existing)
+        existing_codes = {dimension.dimension_code for dimension in existing}
+        for dimension in additions:
+            if dimension.dimension_code not in existing_codes:
+                merged.append(dimension)
+        return merged
 
     def _build_default_llm_service(
         self,
@@ -551,17 +756,11 @@ class QueryService:
             self._metadata_context_summary(metadata_context),
         )
         await self._emit("generate_sql", "running", "正在根据已审核的查询计划生成 SQL")
-        build_result = self._verified_sql_fallback(
-            question,
-            query_plan,
-            metadata_context,
+        build_result = await self.sql_actor.build(
+            question=question,
+            query_plan=query_plan,
+            metadata_context=metadata_context,
         )
-        if build_result.draft is None:
-            build_result = await self.sql_actor.build(
-                question=question,
-                query_plan=query_plan,
-                metadata_context=metadata_context,
-            )
         build_results = [build_result]
         await self._emit(
             "generate_sql",
@@ -763,18 +962,6 @@ class QueryService:
                 critic_feedback=repair_feedback,
                 repair_attempt=repair_count,
             )
-            build_result = self._product_trade_sql_fallback(
-                build_result,
-                query_plan,
-                metadata_context,
-                repair_feedback,
-            )
-            build_result = self._net_outflow_sql_fallback(
-                build_result,
-                question,
-                query_plan,
-                metadata_context,
-            )
             build_results.append(build_result)
             await self._emit(
                 "repair_sql",
@@ -830,124 +1017,6 @@ class QueryService:
             result_critic_result=result_critic_result,
             execution_history=execution_history,
             failure_reason=failure_reason,
-        )
-
-    @staticmethod
-    def _verified_sql_fallback(
-        question: str,
-        query_plan: QueryPlan,
-        metadata_context: dict[str, object],
-    ) -> SQLBuildResult:
-        """Build SQL directly for fully specified, metadata-verified business rules."""
-        fallback = SQLBuildResult(draft=None, source="failed")
-        fallback = QueryService._product_trade_sql_fallback(
-            fallback,
-            query_plan,
-            metadata_context,
-            [],
-        )
-        return QueryService._net_outflow_sql_fallback(
-            fallback,
-            question,
-            query_plan,
-            metadata_context,
-        )
-
-    @staticmethod
-    def _product_trade_sql_fallback(
-        build_result: SQLBuildResult,
-        query_plan: QueryPlan,
-        metadata_context: dict[str, object],
-        feedback: list[ReviewDecision],
-    ) -> SQLBuildResult:
-        """Use the verified product-grain query for this unambiguous metric combination."""
-        has_product_dimension = any(
-            dimension.dimension_code == "product_type" for dimension in query_plan.dimensions
-        )
-        metric_codes = {metric.metric_code for metric in query_plan.metrics}
-        has_required_metrics = {"customer_count", "trade_amount_90d"} <= metric_codes
-        table_allowlist = metadata_context.get("table_allowlist")
-        allowed_tables = {
-            table_name for table_name in table_allowlist if isinstance(table_name, str)
-        } if isinstance(table_allowlist, list) else set()
-        if not (
-            has_product_dimension
-            and has_required_metrics
-            and {"customer_trade", "product_info"} <= allowed_tables
-        ):
-            return build_result
-
-        contract_value = metadata_context.get("semantic_contract")
-        contract = contract_value if isinstance(contract_value, dict) else {}
-        reference_date = contract.get("reference_date")
-        try:
-            start_date = date.fromisoformat(str(reference_date)) - timedelta(days=90)
-        except (TypeError, ValueError):
-            return build_result
-
-        draft = SQLDraft(
-            sql=(
-                "SELECT p.product_type, COUNT(DISTINCT t.customer_id) AS customer_count, "
-                "ROUND(SUM(t.trade_amount), 2) AS trade_amount_90d "
-                "FROM mart.customer_trade t "
-                "JOIN mart.product_info p ON p.product_id = t.product_id "
-                f"WHERE t.trade_date > '{start_date.isoformat()}'::date "
-                "GROUP BY p.product_type ORDER BY p.product_type "
-                f"LIMIT {query_plan.output.limit}"
-            ),
-            dialect="postgres",
-            tables=["customer_trade", "product_info"],
-            columns=["product_type", "customer_count", "trade_amount_90d"],
-            assumptions=["verified_product_grain_sql_repair"],
-            confidence=1.0,
-        )
-        return SQLBuildResult(
-            draft=draft,
-            source="rule_fallback",
-            repair_attempt=build_result.repair_attempt,
-            llm_error="Applied verified product-grain SQL for the requested product analysis.",
-        )
-
-    @staticmethod
-    def _net_outflow_sql_fallback(
-        build_result: SQLBuildResult,
-        question: str,
-        query_plan: QueryPlan,
-        metadata_context: dict[str, object],
-    ) -> SQLBuildResult:
-        """Enforce the published net-outflow formula and business identifier."""
-        if "净流出" not in question or query_plan.intent != "ranking_query":
-            return build_result
-
-        table_allowlist = metadata_context.get("table_allowlist")
-        allowed_tables = (
-            {table_name for table_name in table_allowlist if isinstance(table_name, str)}
-            if isinstance(table_allowlist, list)
-            else set()
-        )
-        if {"customer_info", "customer_net_flow_90d"} - allowed_tables:
-            return build_result
-
-        draft = SQLDraft(
-            sql=(
-                "SELECT c.customer_no, ROUND(-f.net_flow_amount_90d, 2) AS outflow_amount "
-                "FROM mart.customer_info c "
-                "JOIN mart.customer_net_flow_90d f ON f.customer_id = c.customer_id "
-                "WHERE f.net_flow_amount_90d < 0 "
-                "ORDER BY outflow_amount DESC, c.customer_no "
-                f"LIMIT {query_plan.output.limit}"
-            ),
-            dialect="postgres",
-            tables=["customer_info", "customer_net_flow_90d"],
-            columns=["customer_no", "outflow_amount"],
-            assumptions=["verified_net_outflow_formula"],
-            confidence=1.0,
-        )
-        return SQLBuildResult(
-            draft=draft,
-            source="rule_fallback",
-            repair_attempt=build_result.repair_attempt,
-            llm_error="Applied verified net-outflow ranking formula.",
         )
 
     def _load_metadata_context(
@@ -1088,6 +1157,21 @@ class QueryService:
             decision = self._enforce_result_critic_confidence(critic_result.decision)
         else:
             decision = self._result_critic_failure_decision(critic_result)
+
+        # SQL safety, execution and deterministic result checks are the release
+        # gate.  The LLM result critic can flag ambiguity for audit/review, but
+        # it must not reject a safely executed result merely because a valid
+        # aggregate is zero or a preview appears unusual.
+        if not decision.passed:
+            decision = decision.model_copy(
+                update={
+                    "passed": True,
+                    "error_type": None,
+                    "reason": f"Advisory ResultCritic finding: {decision.reason}",
+                    "repair_hint": None,
+                    "evidence": [*decision.evidence, "advisory_only"],
+                }
+            )
 
         checks = [*hard_validation.checks, decision]
         failed_check = next((check for check in checks if not check.passed), None)

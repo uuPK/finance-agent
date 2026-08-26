@@ -41,11 +41,8 @@ class SchemaContextProvider:
         metrics = self._load_metrics(connection)
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
-        examples = self._load_question_examples(connection)
         reference_date = self._load_reference_date(connection)
-        retrieval = MetadataRetriever(connection).retrieve(
-            question=question, query_plan=query_plan
-        )
+        retrieval = MetadataRetriever(connection).retrieve(question=question, query_plan=query_plan)
         selected_table_names = set(retrieval.table_names)
         selected_table_names.update(self._required_semantic_tables(question, query_plan))
         selected_metric_codes = set(retrieval.metric_codes)
@@ -118,9 +115,7 @@ class SchemaContextProvider:
             if not selected_metric_codes or metric.get("metric_code") in selected_metric_codes
         ]
         selected_business_terms = [
-            term
-            for term in business_terms
-            if selected_terms and term.get("term") in selected_terms
+            term for term in business_terms if selected_terms and term.get("term") in selected_terms
         ]
         selected_join_relationships = [
             relationship
@@ -134,9 +129,12 @@ class SchemaContextProvider:
             )
             in selected_join_pairs
         ]
+        # The retriever ranks against the complete benchmark.  Using the previous
+        # fixed first-five rows here silently discarded newly loaded official
+        # regression examples before the LLM could see them.
         selected_question_examples = [
             example
-            for example in examples
+            for example in retrieval.matched_question_examples
             if not selected_examples or example.get("question") in selected_examples
         ]
 
@@ -162,28 +160,19 @@ class SchemaContextProvider:
             "notes": [
                 "Use only retrieved tables/views and columns listed in this context.",
                 "The retrieval field explains why this metadata context was selected.",
-                "Prefer mart.customer_current_asset for current asset queries.",
-                "Prefer mart.customer_trade_90d for recent trade-count queries.",
-                "Prefer mart.customer_net_flow_90d for recent net-flow queries.",
+                "All production business data is in mart and uses official "
+                "de-identified source fields.",
+                "Official date fields are YYYYMMDD text; use explicit literal ranges "
+                "for calendar periods.",
+                "Customer name is sensitive and must never be selected or returned.",
             ],
         }
 
     @staticmethod
-    def _required_semantic_tables(
-        question: str | None, query_plan: QueryPlan | None
-    ) -> set[str]:
+    def _required_semantic_tables(question: str | None, query_plan: QueryPlan | None) -> set[str]:
         """Add the verified physical grain required by unambiguous business semantics."""
-        if query_plan is None:
-            return set()
-
-        metric_codes = {metric.metric_code for metric in query_plan.metrics}
-        dimension_codes = {dimension.dimension_code for dimension in query_plan.dimensions}
-        required: set[str] = set()
-        if "product_type" in dimension_codes and "trade_amount_90d" in metric_codes:
-            required.update({"customer_trade", "product_info"})
-        if question and "净流出" in question:
-            required.update({"customer_info", "customer_net_flow_90d"})
-        return required
+        # Source-table expansion is performed by MetadataRetriever from official metadata.
+        return set()
 
     def _load_physical_tables(self, connection: Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
@@ -219,9 +208,7 @@ class SchemaContextProvider:
             columns_by_table.setdefault(key, []).append(dict(row))
         return columns_by_table
 
-    def _load_table_metadata(
-        self, connection: Connection
-    ) -> dict[tuple[str, str], dict[str, Any]]:
+    def _load_table_metadata(self, connection: Connection) -> dict[tuple[str, str], dict[str, Any]]:
         rows = self._safe_metadata_rows(
             connection,
             """
@@ -230,10 +217,7 @@ class SchemaContextProvider:
             where is_active = true
             """,
         )
-        return {
-            (row["schema_name"], row["table_name"]): dict(row)
-            for row in rows
-        }
+        return {(row["schema_name"], row["table_name"]): dict(row) for row in rows}
 
     def _load_column_metadata(
         self, connection: Connection
@@ -256,8 +240,7 @@ class SchemaContextProvider:
             """,
         )
         return {
-            (row["schema_name"], row["table_name"], row["column_name"]): dict(row)
-            for row in rows
+            (row["schema_name"], row["table_name"], row["column_name"]): dict(row) for row in rows
         }
 
     def _load_metrics(self, connection: Connection) -> list[dict[str, Any]]:
@@ -312,23 +295,14 @@ class SchemaContextProvider:
         )
         return [dict(row) for row in rows]
 
-    def _load_question_examples(self, connection: Connection) -> list[dict[str, Any]]:
-        rows = self._safe_metadata_rows(
-            connection,
-            """
-            select question, difficulty, expected_query_plan, expected_sql, tags
-            from metadata.question_examples
-            where is_active = true
-            order by id
-            limit 5
-            """,
-        )
-        return [dict(row) for row in rows]
-
     def _load_reference_date(self, connection: Connection) -> str | None:
-        row = connection.execute(
-            text("select max(as_of_date)::text as reference_date from mart.customer_asset_daily")
-        ).mappings().first()
+        row = (
+            connection.execute(
+                text("select max(data_dt)::text as reference_date from mart.dws_cust_aset_d")
+            )
+            .mappings()
+            .first()
+        )
         return row["reference_date"] if row and row["reference_date"] else None
 
     @staticmethod
@@ -340,46 +314,26 @@ class SchemaContextProvider:
     ) -> dict[str, Any]:
         """Explicit execution rules that prevent an LLM from guessing table semantics."""
         rules: list[str] = []
-        if "customer_trade_90d" in table_allowlist:
-            rules.append(
-                "customer_trade_90d is already aggregated by customer for the latest 90-day "
-                "window; "
-                "do not add a raw trade_date filter to this view."
-            )
-        if "customer_net_flow_90d" in table_allowlist:
-            rules.append(
-                "customer_net_flow_90d is already aggregated by customer for the latest 90-day "
-                "window; "
-                "net_flow_amount_90d is positive for inflow and negative for outflow."
-            )
-            rules.append(
-                "For a net-outflow ranking, filter net_flow_amount_90d < 0, return "
-                "-net_flow_amount_90d, and order that positive outflow amount descending."
-            )
-        if {"customer_position_daily", "product_info"} <= table_allowlist:
-            rules.append(
-                "For customers without a product type, use NOT EXISTS with customer, product-type, "
-                "and same-snapshot predicates. Do not infer absence from a LEFT JOIN null check."
-            )
-        if "customer_trade" in table_allowlist:
-            rules.append(
-                "Use customer_trade, not customer_trade_90d, for product-level trade amount or "
-                "product-level customer counts because product_id and trade_date are required."
-            )
-        if {"marketing_campaign", "marketing_touch"} <= table_allowlist:
-            rules.append(
-                "For campaign response_rate, use responded touch count divided by all touch count "
-                "unless the QueryPlan explicitly requests a customer-based denominator."
-            )
-            rules.append(
-                "For campaign benchmark output, use campaign_code as the stable campaign "
-                "dimension, "
-                "not campaign_name."
-            )
-            rules.append(
-                "For response_rate, use COUNT(*) FILTER (WHERE response_status = 'responded') "
-                "/ COUNT(*) over campaign touches. Do not reuse the distinct-customer denominator."
-            )
+        rules.extend(
+            [
+                "Use only fully qualified mart.<table> references; do not query another schema.",
+                "Use ads_cust_info_d.pty_id as the customer key; never select "
+                "ads_cust_info_d.name.",
+                "Total asset equals nm_tot_aset + fc_pur_aset when both account "
+                "types are required.",
+                "Average total asset equals avg(nm_tot_aset + fc_pur_aset) at the "
+                "requested customer population and snapshot.",
+                "Daily average asset for an explicit period equals the sum of daily "
+                "total assets divided by that period's inclusive calendar-day count.",
+                "For the official Q1 profit/loss reference, use end normal asset + "
+                "end credit asset - beginning normal asset + beginning credit asset + "
+                "period asset outflow - period asset inflow.",
+                "Transaction amount equals buy_amt + sell_amt unless only buy or sell "
+                "is requested.",
+                "Join product facts with prdt_id, customer facts with pty_id, and "
+                "organizations with org_id.",
+            ]
+        )
         if reference_date:
             rules.append(
                 "For relative-time SQL over this dataset, use the reference_date value below "
@@ -394,18 +348,21 @@ class SchemaContextProvider:
                 if metric.get("metric_code") and metric.get("formula")
             },
             "metric_output_aliases": {
-                "current_total_asset": ["current_total_asset", "total_asset"],
-                "net_asset_inflow_90d": ["net_asset_inflow_90d", "net_flow_amount_90d"],
-                "trade_amount_90d": ["trade_amount_90d", "trade_amount"],
-                "fund_holding_amount": ["fund_holding_amount", "market_value"],
+                "total_asset": ["total_asset", "aset"],
+                "average_total_asset": ["average_total_asset", "avg_total_asset"],
+                "cash_asset": ["cash_asset", "nm_bal", "fc_bal"],
+                "daily_average_asset": ["daily_average_asset", "avg_aset"],
+                "holding_market_value": ["holding_market_value", "mkt_val"],
+                "holding_quantity": ["holding_quantity", "hold_cnt"],
+                "trade_amount": ["trade_amount", "tran_amt", "buy_amt", "sell_amt"],
+                "net_cash_flow": ["net_cash_flow", "cash_in", "cash_out", "tran_in", "tran_out"],
+                "profit_loss": ["profit_loss", "aset_pft"],
             },
             "reference_date": reference_date,
             "sensitive_columns_never_select": sorted(sensitive_columns),
         }
 
-    def _safe_metadata_rows(
-        self, connection: Connection, sql: str
-    ) -> list[dict[str, Any]]:
+    def _safe_metadata_rows(self, connection: Connection, sql: str) -> list[dict[str, Any]]:
         try:
             rows = connection.execute(text(sql)).mappings()
             return [dict(row) for row in rows]

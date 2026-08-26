@@ -20,12 +20,41 @@ class SQLGuardrail:
         sensitive_columns: set[str] | None = None,
         require_limit: bool = True,
         max_limit: int = 1000,
+        allowed_schema: str = "mart",
+        allowed_functions: set[str] | None = None,
     ) -> None:
         self.allowed_tables = allowed_tables or set()
         self.allowed_columns_by_table = allowed_columns_by_table or {}
         self.sensitive_columns = sensitive_columns or set()
         self.require_limit = require_limit
         self.max_limit = max_limit
+        self.allowed_schema = allowed_schema
+        self.allowed_functions = {
+            "abs",
+            "and",
+            "avg",
+            "cast",
+            "case",
+            "ceil",
+            "coalesce",
+            "count",
+            "date_trunc",
+            "extract",
+            "exists",
+            "floor",
+            "if",
+            "lower",
+            "max",
+            "min",
+            "nullif",
+            "round",
+            "str_to_date",
+            "sum",
+            "to_date",
+            "trim",
+            "upper",
+            *(allowed_functions or set()),
+        }
 
     def validate(self, sql: str) -> list[GuardrailFinding]:
         findings: list[GuardrailFinding] = []
@@ -68,6 +97,9 @@ class SQLGuardrail:
         findings.append(self._check_forbidden_expressions(expression))
         findings.append(self._check_no_select_star(expression))
         findings.extend(self._check_allowed_tables(expression))
+        findings.append(self._check_has_business_table(expression))
+        findings.extend(self._check_table_schemas(expression))
+        findings.extend(self._check_allowed_functions(expression))
         findings.extend(self._check_allowed_columns(expression))
         findings.extend(self._check_sensitive_columns(expression))
 
@@ -116,11 +148,9 @@ class SQLGuardrail:
     def _check_no_select_star(self, expression: exp.Expression) -> GuardrailFinding:
         found_star = any(
             isinstance(projection, exp.Star)
-            or (
-                isinstance(projection, exp.Column)
-                and isinstance(projection.this, exp.Star)
-            )
-            for projection in expression.expressions
+            or (isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star))
+            for select in expression.find_all(exp.Select)
+            for projection in select.expressions
         )
         return GuardrailFinding(
             name="select_star",
@@ -167,6 +197,79 @@ class SQLGuardrail:
             )
         return findings
 
+    def _check_has_business_table(self, expression: exp.Expression) -> GuardrailFinding:
+        cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
+        physical_tables = {
+            table.name
+            for table in expression.find_all(exp.Table)
+            if table.name and table.name not in cte_names
+        }
+        return GuardrailFinding(
+            name="business_table_required",
+            passed=bool(physical_tables),
+            message=(
+                "SQL references at least one business table."
+                if physical_tables
+                else "SQL must reference at least one allowed business table."
+            ),
+            severity="info" if physical_tables else "error",
+        )
+
+    def _check_table_schemas(self, expression: exp.Expression) -> list[GuardrailFinding]:
+        cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
+        findings: list[GuardrailFinding] = []
+        for table in expression.find_all(exp.Table):
+            if not table.name or table.name in cte_names:
+                continue
+            schema = table.db
+            catalog = table.catalog
+            passed = schema == self.allowed_schema and not catalog
+            findings.append(
+                GuardrailFinding(
+                    name="schema_whitelist",
+                    passed=passed,
+                    message=(
+                        f"Table `{table.sql(dialect='postgres')}` is in schema "
+                        f"`{self.allowed_schema}`."
+                        if passed
+                        else "Table must be qualified with "
+                        f"`{self.allowed_schema}` and cannot use a catalog: "
+                        f"`{table.sql(dialect='postgres')}`."
+                    ),
+                    severity="info" if passed else "error",
+                )
+            )
+        return findings or [
+            GuardrailFinding(
+                name="schema_whitelist",
+                passed=True,
+                message="No physical table schema was available to validate.",
+                severity="warning",
+            )
+        ]
+
+    def _check_allowed_functions(self, expression: exp.Expression) -> list[GuardrailFinding]:
+        findings: list[GuardrailFinding] = []
+        for function in expression.find_all(exp.Func):
+            function_name = function.sql_name().lower()
+            if function_name in self.allowed_functions:
+                continue
+            findings.append(
+                GuardrailFinding(
+                    name="function_whitelist",
+                    passed=False,
+                    message=f"Function `{function_name}` is not allowed in generated SQL.",
+                    severity="error",
+                )
+            )
+        return findings or [
+            GuardrailFinding(
+                name="function_whitelist",
+                passed=True,
+                message="SQL uses only approved functions.",
+            )
+        ]
+
     def _check_allowed_columns(self, expression: exp.Expression) -> list[GuardrailFinding]:
         if not self.allowed_columns_by_table:
             return [
@@ -188,20 +291,28 @@ class SQLGuardrail:
             if not table_qualifier:
                 continue
 
-            table_name = table_aliases.get(table_qualifier, table_qualifier)
-            allowed_columns = self.allowed_columns_by_table.get(table_name)
-            if allowed_columns is None:
+            table_names = table_aliases.get(table_qualifier, {table_qualifier})
+            allowed_tables = {
+                table_name: self.allowed_columns_by_table.get(table_name)
+                for table_name in table_names
+            }
+            known_tables = {
+                table_name: allowed_columns
+                for table_name, allowed_columns in allowed_tables.items()
+                if allowed_columns is not None
+            }
+            if not known_tables:
                 continue
 
             column_name = column.name
-            if column_name not in allowed_columns:
+            if not any(column_name in columns for columns in known_tables.values()):
                 findings.append(
                     GuardrailFinding(
                         name="column_whitelist",
                         passed=False,
                         message=(
                             f"Column `{table_qualifier}.{column_name}` is not in schema "
-                            f"context for table `{table_name}`."
+                            f"context for tables `{', '.join(sorted(known_tables))}`."
                         ),
                         severity="error",
                     )
@@ -217,17 +328,17 @@ class SQLGuardrail:
             )
         return findings
 
-    def _table_aliases(self, expression: exp.Expression) -> dict[str, str]:
-        aliases: dict[str, str] = {}
+    def _table_aliases(self, expression: exp.Expression) -> dict[str, set[str]]:
+        aliases: dict[str, set[str]] = {}
         cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
         for table in expression.find_all(exp.Table):
             table_name = table.name
             if table_name in cte_names:
                 continue
-            aliases[table_name] = table_name
+            aliases.setdefault(table_name, set()).add(table_name)
             alias = table.alias
             if alias:
-                aliases[alias] = table_name
+                aliases.setdefault(alias, set()).add(table_name)
         return aliases
 
     def _check_sensitive_columns(self, expression: exp.Expression) -> list[GuardrailFinding]:

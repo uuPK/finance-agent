@@ -1,8 +1,8 @@
 # Data Directory
 
-此目录只存放可公开的合成样例数据说明。
+此目录只存放官方数据接入说明，不保存赛事原始数据。
 
 不要提交真实客户数据、原始赛题私有材料或未确认可公开的脱敏数据。
 
-`sample/competition_dataset_manifest.example.json` 是赛事数据的接入映射模板；在装载前使用
-`backend/db/validate_dataset_manifest.py` 校验 CSV 文件、必填字段和目标表映射。
+正式数据由 `backend/db/load_official_dataset.py` 从官方数据包导入。请勿将原始 CSV、
+Q&A 工作簿或可识别个人的信息提交到版本库。

@@ -11,7 +11,6 @@ from app.schemas.review import ReviewDecision
 from app.schemas.sql import SQLDraft
 from app.services.sql_executor import SQLExecutionResult
 
-
 ResultCriticStatus = Literal["reviewed", "failed", "skipped"]
 
 
@@ -197,7 +196,8 @@ _RESULT_CRITIC_SYSTEM_PROMPT = dedent(
     - Result columns 是否能支撑 QueryPlan.output.columns 和用户要求。
     - Result grain 是否符合 QueryPlan.grain，例如客户列表不能只返回汇总数。
     - Result row_count 是否与列表、TopN、汇总等输出目标一致。
-    - Result preview 是否显示关键字段的非空或合理值。
+    - Result preview 是否显示关键字段的非空或合理值。聚合 COUNT、SUM、AVG 查询
+      返回数值 0 是合法业务结果，不能仅因数值为 0 判定失败或要求放宽条件。
     - 空结果是否可能是严格过滤导致；如果用户明确要名单但 row_count=0，应提示可能需要放宽条件。
     - 是否暴露敏感字段或疑似个人身份信息。
 
@@ -216,7 +216,7 @@ _RESULT_CRITIC_SYSTEM_PROMPT = dedent(
 
     正例：
     用户问“查询近三个月交易次数超过3次且当前资产大于50万的客户列表”。
-    QueryPlan grain=customer，结果字段包含 customer_no、total_asset、trade_count_90d，
+    QueryPlan grain=customer，结果字段包含 pty_id、total_asset、trade_amount，
     row_count=90，hard checks 全部通过。
     应输出：
     {
@@ -224,15 +224,14 @@ _RESULT_CRITIC_SYSTEM_PROMPT = dedent(
       "score": 94,
       "stage": "result_review",
       "reason": "结果为客户粒度，字段覆盖客户编号、当前资产和近90天交易次数，可以支撑用户问题。",
-      "evidence": ["grain=customer", "columns: customer_no,total_asset,trade_count_90d", "row_count=90"],
+      "evidence": ["grain=customer", "columns: pty_id,total_asset,trade_amount", "row_count=90"],
       "repair_hint": null,
       "clarification_questions": [],
       "confidence": 0.9
     }
 
     反例：
-    用户要求客户列表，QueryPlan grain=customer，但结果只返回 total_count，没有 customer_id
-    或 customer_no。
+    用户要求客户列表，QueryPlan grain=customer，但结果只返回 total_count，没有 pty_id。
     应输出：
     {
       "passed": false,

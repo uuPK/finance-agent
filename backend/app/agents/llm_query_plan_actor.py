@@ -217,8 +217,11 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     """
     Structured invariants (apply before returning ready):
     - A ready metric_query, customer_segmentation, or ranking_query must include at least one metric.
-    - "by X", "per X", or "grouped by X" means X is the result grain/dimension; never default it to customer grain.
-    - Preserve every explicit threshold, comparison, time window, ranking direction, and requested limit.
+    - “按 X”“按 X 统计”“by X”“per X”或“grouped by X”都表示 X 是结果分组维度；
+      必须将 X 写入 dimensions(role=group_by)，并采用对应的非客户明细 grain。
+    - 用户并列列出的输出指标必须逐项写入 metrics 和 output.columns，例如“客户数、平均总资产和总资产”。
+      仅用于“超过/不少于/大于”等筛选阈值的指标应保留在 filters，不必因此额外作为结果列。
+    - Preserve every explicit threshold, comparison, time window, ranking direction, requested limit, and output metric.
     - Use only metric_code values supplied in Retrieved metadata context. Never invent a legacy code.
     - For a multi-condition customer segment, include a metric or filter representation for every condition.
 
@@ -270,32 +273,32 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     - 如果失败原因是“擅自猜业务定义”，正确修复通常是 needs_clarification。
 
     正例 1：
-    用户问“查询近三个月交易次数超过3次且当前资产大于50万的客户列表”。
+    用户问“查询 2026 年一季度交易金额超过 50 万且总资产大于 50 万的客户列表”。
     好的计划关键字段示例，实际输出必须是完整 QueryPlan：
     {
       "plan_status": "ready",
       "intent": "customer_segmentation",
       "subject": {"name": "客户", "entity_type": "customer", "is_resolved": true},
-      "time_range": {"label": "近三个月", "relative": "last_3_months", "granularity": "day"},
+      "time_range": {"label": "2026年一季度", "start": "20260101", "end": "20260331", "granularity": "quarter"},
       "filters": [
         {
-          "term": "交易次数",
+          "term": "交易金额",
           "operator": ">",
-          "value": {"raw": 3, "normalized": 3, "value_type": "number"},
-          "metric_code": "trade_count_90d",
+          "value": {"raw": "50万", "normalized": 500000, "value_type": "number"},
+          "metric_code": "trade_amount",
           "source": "user",
           "is_resolved": true
         },
         {
-          "term": "当前资产",
+          "term": "总资产",
           "operator": ">",
           "value": {"raw": "50万", "normalized": 500000, "value_type": "number"},
-          "metric_code": "current_total_asset",
+          "metric_code": "total_asset",
           "source": "user",
           "is_resolved": true
         }
       ],
-      "grain": {"level": "customer", "keys": ["customer_id"], "is_resolved": true}
+      "grain": {"level": "customer", "keys": ["pty_id"], "is_resolved": true}
     }
 
     反例 1：
@@ -304,9 +307,9 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     正确做法是 plan_status=needs_clarification，询问高净值客户的资产门槛。
 
     正例 2：
-    用户问“按服务经理统计近30天触达客户数”。
-    正确做法是 subject=服务经理或客户营销触达，grain.level=manager，
-    metrics 包含触达客户数，time_range=近30天，output.format=summary 或 table。
+    用户问“按营业部统计 2026 年一季度交易金额”。
+    正确做法是 subject=营业部，grain.level=organization，metrics 包含交易金额，
+    time_range=2026年一季度，output.format=summary 或 table。
 
     反例 2：
     用户问“把筛选出的客户手机号导出来”。
@@ -314,9 +317,9 @@ _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(
     正确做法是 invalid 或 needs_clarification，说明敏感字段需要脱敏或授权策略。
 
     正例 3：
-    用户问“当前资产大于50万且近90天交易次数超过3次的客户有多少？”
+    用户问“总资产大于50万且 2026 年一季度交易金额超过 50 万的客户有多少？”
     正确做法是 intent=metric_query，metrics 包含 customer_count，
-    filters 保留 current_total_asset > 500000 和 trade_count_90d > 3，
+    filters 保留 total_asset > 500000 和 trade_amount > 500000，
     grain.level=aggregate，output.format=summary，output.columns 包含“客户数量”。
 
     反例 3：

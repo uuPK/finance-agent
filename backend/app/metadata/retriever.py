@@ -10,12 +10,11 @@ from sqlalchemy.engine import Connection
 
 from app.schemas.query_plan import QueryPlan
 
-
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{2,}")
 
 _ALIASES: dict[str, tuple[str, ...]] = {
-    "客户": ("客户",),
-    "客户列表": ("客户列表",),
+    "客户": ("客户", "ads_cust_info_d", "pty_id"),
+    "客户列表": ("客户列表", "ads_cust_info_d", "pty_id"),
     "客户数量": ("customer_count", "客户数量", "客户数"),
     "客户数": ("customer_count", "客户数量", "客户数"),
     "数量": ("customer_count", "客户数量", "总数"),
@@ -24,86 +23,85 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "多少": ("customer_count", "客户数量", "总数"),
     "几个": ("customer_count", "客户数量", "总数"),
     "几位": ("customer_count", "客户数量", "总数"),
-    "资产": ("total_asset", "current_total_asset", "customer_current_asset", "资产"),
-    "当前资产": (
-        "current_total_asset",
-        "total_asset",
-        "customer_current_asset",
-        "当前总资产",
-        "当前资产",
+    "资产": ("total_asset", "dws_cust_aset_d", "nm_tot_aset", "fc_pur_aset", "资产"),
+    "当前资产": ("total_asset", "dws_cust_aset_d", "当前资产"),
+    "总资产": ("total_asset", "dws_cust_aset_d", "总资产"),
+    "平均总资产": (
+        "average_total_asset",
+        "dws_cust_aset_d",
+        "nm_tot_aset",
+        "fc_pur_aset",
+        "平均总资产",
     ),
-    "总资产": ("current_total_asset", "total_asset", "customer_current_asset", "总资产"),
-    "交易": ("customer_trade_90d", "customer_trade", "交易"),
-    "交易次数": ("trade_count_90d", "customer_trade_90d", "近90天交易次数", "交易次数"),
-    "交易金额": ("trade_amount_90d", "customer_trade_90d", "近90天交易金额", "交易金额"),
-    "近三个月": ("90", "90d", "last_90_days", "近90天"),
-    "近3个月": ("90", "90d", "last_90_days", "近90天"),
-    "近90天": ("90", "90d", "last_90_days", "近90天"),
-    "服务经理": (
-        "manager",
-        "service_manager",
-        "service_relationship",
-        "manager_id",
-        "服务经理",
+    "平均资产": (
+        "average_total_asset",
+        "dws_cust_aset_d",
+        "nm_tot_aset",
+        "fc_pur_aset",
+        "平均资产",
     ),
-    "经理": ("manager", "service_manager", "service_relationship", "manager_id", "经理"),
-    "基金": (
-        "fund",
-        "product_info",
-        "customer_position_daily",
-        "fund_holding_amount",
-        "基金",
-    ),
-    "产品": ("product", "product_info", "product_id", "产品"),
-    "净流入": ("net_flow", "net_asset_inflow_90d", "customer_net_flow_90d", "净流入"),
-    "流入": ("net_flow", "net_asset_inflow_90d", "customer_net_flow_90d", "流入"),
-    "活跃": ("活跃客户", "trade_count_90d", "customer_trade_90d"),
-    "高净值": ("高净值客户", "current_total_asset", "customer_current_asset"),
-    "沉默": ("沉默客户", "trade_count_90d", "customer_trade_90d"),
-    "触达": ("marketing_touch", "touch_count", "服务经理", "manager"),
+    "日均资产": ("daily_average_asset", "dws_cust_aset_d", "日均资产", "平均资产"),
+    "持仓": ("holding_market_value", "dwd_cust_hold_d", "mkt_val", "持仓"),
+    "交易": ("trade_amount", "dwd_cust_tran_d", "交易"),
+    "交易量": ("trade_amount", "dwd_cust_tran_d", "buy_amt", "sell_amt", "交易量"),
+    "交易金额": ("trade_amount", "dwd_cust_tran_d", "buy_amt", "sell_amt", "交易金额"),
+    "交易次数": ("dwd_cust_tran_d", "buy_cnt", "sell_cnt", "交易次数"),
+    "产品": ("dim_product", "prdt_id", "prdt_type_name", "产品"),
+    "营业部": ("dim_branch", "org_id", "org_name", "营业部"),
+    "分支机构": ("dim_branch", "org_id", "org_name", "分支机构"),
+    "净流入": ("net_cash_flow", "dws_cust_fin_d", "cash_in", "cash_out", "净流入"),
+    "流入": ("net_cash_flow", "dws_cust_fin_d", "cash_in", "tran_in", "流入"),
+    "盈亏": ("profit_loss", "dws_cust_aset_d", "dws_cust_fin_d", "资产盈亏"),
+    "盈利": ("profit_loss", "dws_cust_aset_d", "dws_cust_fin_d", "资产盈亏"),
+    "账户来源": ("dwd_cust_tran_d", "dws_cust_fin_d", "sys_source", "账户来源"),
+    "账户类型": ("dwd_cust_tran_d", "dws_cust_fin_d", "sys_source", "账户类型"),
+    "币种": ("dwd_cust_tran_d", "dwd_cust_hold_d", "ccy", "币种"),
+    "交易日": ("dwd_cust_tran_d", "data_dt", "交易日"),
+    "科创板": ("dim_product", "prdt_type_name", "科创板"),
+    "股票": ("dim_product", "up_prdt_type_id", "PT040000", "股票"),
+    "钻石卡": ("ads_cust_info_d", "dim_public", "cust_lvl_cd", "钻石卡客户"),
+    "学历": ("ads_cust_info_d", "edu_cd", "dim_public", "学历"),
+    "性别": ("ads_cust_info_d", "gender_cd", "dim_public", "性别"),
 }
 
 _GENERIC_KEYWORDS = {
     "customer",
     "客户",
     "客户列表",
-    "customer_id",
-    "customer_no",
+    "pty_id",
     "查询",
     "列表",
 }
-_GENERIC_TOKEN_PARTS = {"customer", "id", "no", "info"}
+_GENERIC_TOKEN_PARTS = {"cust", "pty", "id", "info"}
 
 _TABLE_HINTS = {
-    "customer_info",
-    "service_manager",
-    "product_info",
-    "service_relationship",
-    "customer_asset_daily",
-    "customer_current_asset",
-    "customer_trade",
-    "customer_trade_90d",
-    "customer_asset_flow",
-    "customer_net_flow_90d",
-    "customer_position_daily",
-    "marketing_campaign",
-    "marketing_touch",
+    "ads_cust_info_d",
+    "dim_branch",
+    "dim_product",
+    "dim_public",
+    "dwd_cust_hold_d",
+    "dwd_cust_tran_d",
+    "dws_cust_aset_d",
+    "dws_cust_fin_d",
 }
 
 _METRIC_TABLES: dict[str, tuple[str, ...]] = {
-    "customer_count": ("customer_info",),
-    "current_total_asset": ("customer_current_asset", "customer_info"),
-    "trade_count_90d": ("customer_trade_90d", "customer_info"),
-    "trade_amount_90d": ("customer_trade_90d", "customer_info"),
-    "net_asset_inflow_90d": ("customer_net_flow_90d", "customer_info"),
-    "fund_holding_amount": ("customer_position_daily", "product_info", "customer_info"),
+    "customer_count": ("ads_cust_info_d",),
+    "total_asset": ("dws_cust_aset_d", "ads_cust_info_d"),
+    "average_total_asset": ("dws_cust_aset_d", "ads_cust_info_d"),
+    "cash_asset": ("dws_cust_aset_d", "ads_cust_info_d"),
+    "daily_average_asset": ("dws_cust_aset_d", "ads_cust_info_d"),
+    "holding_market_value": ("dwd_cust_hold_d", "dim_product", "ads_cust_info_d"),
+    "holding_quantity": ("dwd_cust_hold_d", "dim_product", "ads_cust_info_d"),
+    "trade_amount": ("dwd_cust_tran_d", "dim_product", "ads_cust_info_d"),
+    "net_cash_flow": ("dws_cust_fin_d", "ads_cust_info_d"),
+    "profit_loss": ("dws_cust_aset_d", "dws_cust_fin_d", "ads_cust_info_d"),
 }
 
 _GRAIN_TABLES: dict[str, tuple[str, ...]] = {
-    "customer": ("customer_info",),
-    "manager": ("service_manager", "service_relationship", "customer_info"),
-    "product": ("product_info",),
-    "campaign": ("marketing_campaign", "marketing_touch"),
+    "customer": ("ads_cust_info_d",),
+    "product": ("dim_product",),
+    "organization": ("dim_branch", "ads_cust_info_d"),
 }
 
 
@@ -272,11 +270,7 @@ class MetadataRetriever:
             available_tables={str(row.get("table_name")) for row in tables},
         )
         scored_columns = self._top_scored(
-            [
-                row
-                for row in columns
-                if str(row.get("table_name", "")) in table_names
-            ],
+            [row for row in columns if str(row.get("table_name", "")) in table_names],
             keywords,
             fields=(
                 "table_name",
@@ -327,9 +321,7 @@ class MetadataRetriever:
         except Exception:
             return []
 
-    def _extract_keywords(
-        self, question: str | None, query_plan: QueryPlan | None
-    ) -> list[str]:
+    def _extract_keywords(self, question: str | None, query_plan: QueryPlan | None) -> list[str]:
         keywords: list[str] = []
         if question:
             keywords.extend(self._tokens(question))
@@ -364,9 +356,7 @@ class MetadataRetriever:
     def _strings_from_payload(self, payload: Any) -> list[str]:
         if isinstance(payload, dict):
             return [
-                item
-                for value in payload.values()
-                for item in self._strings_from_payload(value)
+                item for value in payload.values() for item in self._strings_from_payload(value)
             ]
         if isinstance(payload, list):
             return [item for value in payload for item in self._strings_from_payload(value)]
@@ -403,9 +393,7 @@ class MetadataRetriever:
         score = 0
         reasons: list[str] = []
         identity_values = {
-            str(row.get(field, "")).strip().lower()
-            for field in identity_fields
-            if row.get(field)
+            str(row.get(field, "")).strip().lower() for field in identity_fields if row.get(field)
         }
 
         for keyword in keywords:
@@ -459,9 +447,7 @@ class MetadataRetriever:
         if isinstance(value, list):
             return " ".join(self._flatten_text(item) for item in value)
         if isinstance(value, dict):
-            return " ".join(
-                f"{key} {self._flatten_text(item)}" for key, item in value.items()
-            )
+            return " ".join(f"{key} {self._flatten_text(item)}" for key, item in value.items())
         try:
             return json.dumps(value, ensure_ascii=False)
         except TypeError:
@@ -542,8 +528,7 @@ class MetadataRetriever:
             if any(
                 isinstance(reason, str)
                 and (
-                    reason.startswith("exact_identity:")
-                    or reason.startswith("exact:metric_code:")
+                    reason.startswith("exact_identity:") or reason.startswith("exact:metric_code:")
                 )
                 for reason in reasons
             ):
@@ -567,10 +552,7 @@ class MetadataRetriever:
                 reasons = []
             if any(
                 isinstance(reason, str)
-                and (
-                    reason.startswith("exact_identity:")
-                    or reason.startswith("exact:term:")
-                )
+                and (reason.startswith("exact_identity:") or reason.startswith("exact:term:"))
                 for reason in reasons
             ):
                 selected.append(term)
@@ -591,40 +573,68 @@ class MetadataRetriever:
                 selected.append(name)
                 selected_set.add(name)
 
-        if any(name.startswith("customer_") for name in selected_set):
-            add("customer_info")
-        if {"service_manager", "service_relationship"} & selected_set:
-            add("service_manager")
-            add("service_relationship")
-            add("customer_info")
-        if {"product_info", "customer_position_daily"} & selected_set:
-            add("product_info")
-            add("customer_position_daily")
-            add("customer_info")
-        if "customer_current_asset" in selected_set:
-            add("customer_info")
-        if "customer_trade_90d" in selected_set:
-            add("customer_info")
-        if "customer_net_flow_90d" in selected_set:
-            add("customer_info")
-        if any(keyword in {"manager", "服务经理", "经理"} for keyword in keywords):
-            add("service_manager")
-            add("service_relationship")
-            add("customer_info")
-        if any(keyword in {"fund", "基金", "product"} for keyword in keywords):
-            add("product_info")
+        customer_fact_tables = {
+            "dws_cust_aset_d",
+            "dws_cust_fin_d",
+            "dwd_cust_hold_d",
+            "dwd_cust_tran_d",
+        }
+        if customer_fact_tables & selected_set:
+            add("ads_cust_info_d")
+        if {"dwd_cust_hold_d", "dwd_cust_tran_d"} & selected_set:
+            add("dim_product")
+        if "dim_branch" in selected_set:
+            add("ads_cust_info_d")
+        public_dimension_terms = {
+            "学历",
+            "性别",
+            "客户等级",
+            "钻石卡",
+            "男性",
+            "女性",
+            "教育",
+            "gender",
+            "education",
+        }
+        if any(keyword in public_dimension_terms for keyword in keywords):
+            add("dim_public")
+            add("ads_cust_info_d")
+        if any(
+            keyword
+            in {"product", "产品", "基金", "股票", "科创板", "比亚迪", "招商银行", "中国平安"}
+            for keyword in keywords
+        ):
+            add("dim_product")
+        if any(keyword in {"branch", "营业部", "分支机构"} for keyword in keywords):
+            add("dim_branch")
+            add("ads_cust_info_d")
         return selected
 
     def _fallback_table_names(self, keywords: list[str]) -> list[str]:
-        selected = ["customer_info"]
-        if any(keyword in keywords for keyword in ("asset", "资产", "current_total_asset")):
-            selected.append("customer_current_asset")
-        if any(keyword in keywords for keyword in ("trade", "交易", "trade_count_90d")):
-            selected.append("customer_trade_90d")
-        if any(keyword in keywords for keyword in ("net_flow", "净流入")):
-            selected.append("customer_net_flow_90d")
-        if any(keyword in keywords for keyword in ("manager", "服务经理")):
-            selected.extend(["service_manager", "service_relationship"])
+        selected = ["ads_cust_info_d"]
+        if any(
+            keyword in keywords
+            for keyword in (
+                "asset",
+                "资产",
+                "total_asset",
+                "daily_average_asset",
+                "profit_loss",
+                "盈亏",
+                "盈利",
+            )
+        ):
+            selected.append("dws_cust_aset_d")
+        if any(keyword in keywords for keyword in ("profit_loss", "盈亏", "盈利")):
+            selected.append("dws_cust_fin_d")
+        if any(keyword in keywords for keyword in ("hold", "持仓", "holding")):
+            selected.extend(["dwd_cust_hold_d", "dim_product"])
+        if any(keyword in keywords for keyword in ("trade", "交易", "trade_amount")):
+            selected.extend(["dwd_cust_tran_d", "dim_product"])
+        if any(keyword in keywords for keyword in ("net_cash_flow", "净流入", "流入")):
+            selected.append("dws_cust_fin_d")
+        if any(keyword in keywords for keyword in ("branch", "营业部", "分支机构")):
+            selected.append("dim_branch")
         return list(dict.fromkeys(selected))
 
     def _select_join_relationships(

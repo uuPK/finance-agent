@@ -16,9 +16,9 @@ import { getClientId } from "../lib/clientId";
 import type { QueryEvent, QueryExportFormat, QueryRunSnapshot } from "../types/query";
 
 const examples = [
-  "查询当前资产大于50万的客户数量",
-  "查询近三个月交易次数超过3次且当前资产大于50万的客户列表",
-  "找出近三个月资产净流入明显但尚未持有基金产品的客户"
+  "2026年第一季度，客户交易金额合计是多少？",
+  "截至2026年3月31日，持仓市值不少于10万元的客户有多少位？",
+  "截至3月31日总资产不少于30万元且2026年第一季度股票类产品交易金额不少于10万元的客户有多少位？"
 ];
 
 const terminalStatuses = new Set(["completed", "failed", "needs_clarification", "interrupted"]);
@@ -120,9 +120,22 @@ export function QueryWorkbench({
   );
 
   useEffect(() => {
-    if (activeRunId) void loadRun(activeRunId).catch((reason) => setError(String(reason)));
+    if (activeRunId) {
+      void loadRun(activeRunId).catch((reason) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        if (/not found|404/i.test(message)) {
+          setRun(null);
+          setEvents([]);
+          setSelectedId(undefined);
+          onRunChange(null);
+          setError("之前的查询记录已不存在，已自动清除，请重新运行问题。");
+          return;
+        }
+        setError(message);
+      });
+    }
     return () => closeStreamRef.current?.();
-  }, [activeRunId, loadRun]);
+  }, [activeRunId, loadRun, onRunChange]);
 
   async function handleRun() {
     if (!question.trim()) return;

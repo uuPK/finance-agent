@@ -1,8 +1,8 @@
 -- Evaluation, human-review, and dataset-versioning extension.
 
 alter table evaluation.eval_cases
-    add column if not exists dataset_version varchar(64) not null default 'synthetic-v1',
-    add column if not exists source_type varchar(32) not null default 'synthetic',
+    add column if not exists dataset_version varchar(64) not null default 'official-v1',
+    add column if not exists source_type varchar(32) not null default 'official',
     add column if not exists expected_status varchar(32) not null default 'completed',
     add column if not exists tags jsonb not null default '[]'::jsonb;
 

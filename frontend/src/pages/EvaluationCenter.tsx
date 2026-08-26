@@ -219,7 +219,9 @@ export function EvaluationCenter() {
       const created = await createEvaluationRun({
         run_name: `workbench-${new Date().toISOString().slice(0, 19)}`,
         difficulty: difficulty || undefined,
-        limit: difficulty ? 20 : 15,
+        // A full run must cover every active baseline case.  The repository
+        // caps this at 200, so this also remains safe as the benchmark grows.
+        limit: difficulty ? 20 : 200,
         evaluation_mode: difficulty ? "smoke" : "full"
       });
       await loadRun(created.eval_run_id);

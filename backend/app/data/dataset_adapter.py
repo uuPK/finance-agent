@@ -5,6 +5,19 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
+OFFICIAL_TARGET_TABLES = frozenset(
+    {
+        "mart.ads_cust_info_d",
+        "mart.dim_branch",
+        "mart.dim_product",
+        "mart.dim_public",
+        "mart.dwd_cust_hold_d",
+        "mart.dwd_cust_tran_d",
+        "mart.dws_cust_aset_d",
+        "mart.dws_cust_fin_d",
+    }
+)
+
 
 class TableMapping(BaseModel):
     source_file: str = Field(min_length=1)
@@ -12,6 +25,13 @@ class TableMapping(BaseModel):
     # Keys are canonical mart columns; values are external CSV column names.
     columns: dict[str, str] = Field(min_length=1)
     required_source_columns: list[str] = Field(default_factory=list)
+
+    @field_validator("target_table")
+    @classmethod
+    def require_official_table(cls, value: str) -> str:
+        if value not in OFFICIAL_TARGET_TABLES:
+            raise ValueError("Target table must be one of the official competition mart tables.")
+        return value
 
     @field_validator("source_file")
     @classmethod

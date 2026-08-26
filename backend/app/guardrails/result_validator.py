@@ -7,7 +7,6 @@ from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 from app.services.sql_executor import SQLExecutionResult
 
-
 ResultSeverity = Literal["info", "warning", "error"]
 
 
@@ -170,7 +169,7 @@ class ResultHardValidator:
         grain_level = query_plan.grain.level if query_plan.grain else "unknown"
         columns = {column.lower() for column in execution_result.columns}
         if grain_level == "customer":
-            if columns & {"customer_id", "customer_no", "客户编号", "客户id"}:
+            if columns & {"pty_id", "客户标识", "客户id"}:
                 return ResultFinding(
                     name="result_grain",
                     passed=True,
@@ -179,20 +178,20 @@ class ResultHardValidator:
             return ResultFinding(
                 name="wrong_grain",
                 passed=False,
-                message="Customer-grain query result lacks customer_id or customer_no.",
+                message="Customer-grain query result lacks pty_id.",
                 severity="error",
             )
-        if grain_level == "manager":
-            if columns & {"manager_id", "manager_no", "manager_name_masked", "org_code"}:
+        if grain_level == "organization":
+            if columns & {"org_id", "org_name", "up_org_id", "up_org_name"}:
                 return ResultFinding(
                     name="result_grain",
                     passed=True,
-                    message="Manager-grain result includes a manager or org identifier.",
+                    message="Organization-grain result includes an organization identifier.",
                 )
             return ResultFinding(
                 name="wrong_grain",
                 passed=False,
-                message="Manager-grain query result lacks manager or org identifier.",
+                message="Organization-grain query result lacks an organization identifier.",
                 severity="error",
             )
 
