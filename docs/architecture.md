@@ -55,7 +55,7 @@ QueryPlan 是自然语言问题与 SQL 之间的中间协议。它显式描述�
 | `backend/app/services` | 问数编排、运行审计、导出、评测与复核 |
 | `backend/app/api` | FastAPI REST / SSE 接口 |
 | `frontend/src` | 智能问数、历史、元数据、评测工作台 |
-| `backend/db` | 官方数据导入、97 题基线与独立扩展集生成、schema 与迁移 |
+| `backend/db` | 官方数据导入、127 题基线与两组独立题集生成、schema 与迁移 |
 
 ## 数据与评测
 

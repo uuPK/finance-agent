@@ -26,9 +26,10 @@ Finance Agent 不附带赛事原始数据，也不支持以演示合成数据替
 ```powershell
 uv run python .\db\load_official_dataset.py --data-dir "D:\contest-data\htsc"
 uv run python .\db\load_official_benchmark_cases.py
+uv run python .\db\load_official_challenge_cases.py
 ```
 
-第一条命令写入官方业务表、元数据和 7 条官方原始问答；第二条命令在官方表上实跑生成 60 条基础回归题与 30 条独立扩展题及预期结果。完成后应有 97 条激活案例。扩展题不写入检索样例，可在评测中心单独运行。
+第一条命令写入官方业务表、元数据和 7 条官方原始问答；第二、三条命令在官方表上实跑生成 60 条基础回归题与两组各 30 条独立题及预期结果。完成后应有 127 条激活案例。独立题不写入检索样例，可在评测中心单独运行。
 
 ## 数据安全边界
 

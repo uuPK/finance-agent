@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 from app.schemas.metadata import MetadataChangeInput
 
 Difficulty = Literal["simple", "medium", "complex"]
-EvaluationCaseSource = Literal["official", "official_derived", "official_extension"]
+EvaluationCaseSource = Literal[
+    "official",
+    "official_derived",
+    "official_extension",
+    "official_challenge_v2",
+]
 ReviewVerdict = Literal["correct", "incorrect", "needs_clarification", "insufficient_data"]
 ReviewSeverity = Literal["minor", "major", "blocking"]
 

@@ -11,9 +11,10 @@
 | `official` | 7 | 官方 `Q&A.xlsx` 原始问答 |
 | `official_derived` | 60 | 仅使用官方表、由标准 SQL 实跑生成预期结果的回归题 |
 | `official_extension` | 30 | 仅使用官方表、由标准 SQL 实跑生成预期结果的独立扩展题；不进入检索样例 |
-| 合计 | 97 | 核心基线简单 23、中等 31、复杂 6；扩展集简单 14、中等 12、复杂 4 |
+| `official_challenge_v2` | 30 | 第二轮独立挑战题；不进入检索样例，覆盖新的阈值、维度、指标与多事实表交集 |
+| 合计 | 127 | 核心基线简单 23、中等 31、复杂 6；两个独立题集各 30 条 |
 
-60 条派生题和 30 条独立扩展题均可通过 `backend/db/load_official_benchmark_cases.py` 重复生成。题库覆盖客户画像、资产、交易、持仓、资金流和营销分群；它们不是模拟业务记录或虚构答案。扩展题只写入评测表，不写入 `metadata.question_examples`，避免通过精确题目/SQL 样例造成测试泄漏。
+60 条派生题和第一组 30 条独立题可通过 `backend/db/load_official_benchmark_cases.py` 重复生成；第二组 30 条独立题由 `backend/db/load_official_challenge_cases.py` 生成。题库覆盖客户画像、资产、交易、持仓、资金流和营销分群；它们不是模拟业务记录或虚构答案。两组独立题只写入评测表，不写入 `metadata.question_examples`，避免通过精确题目/SQL 样例造成测试泄漏。
 
 ## 评测流程
 
@@ -52,4 +53,4 @@
 
 ## 运行方式
 
-在前端“评测中心”发起完整评测，或通过 `/api/evaluation/runs` 接口启动。评测可传入 `case_source: "official_extension"` 单独运行 30 条扩展集。每次运行会记录数据集、模型与提示词版本字段以及所有逐题结果。完整 97 题运行会调用模型服务并消耗额度，应以评测记录中的真实结果作为是否达到赛题准确率目标的证据。
+在前端“评测中心”发起完整评测，或通过 `/api/evaluation/runs` 接口启动。评测可传入 `case_source: "official_extension"` 或 `"official_challenge_v2"` 单独运行 30 条独立题集。每次运行会记录数据集、模型与提示词版本字段以及所有逐题结果。完整 127 题运行会调用模型服务并消耗额度，应以评测记录中的真实结果作为是否达到赛题准确率目标的证据。

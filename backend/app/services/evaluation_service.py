@@ -140,9 +140,10 @@ class EvaluationRepository:
         self.schema_context_provider = SchemaContextProvider(self.engine)
 
     def create_run(self, run_name: str, mode: str, case_source: str | None = None) -> UUID:
-        dataset_version = (
-            "official-v1-extension" if case_source == "official_extension" else "official-v1"
-        )
+        dataset_version = {
+            "official_extension": "official-v1-extension",
+            "official_challenge_v2": "official-v1-challenge-v2",
+        }.get(case_source, "official-v1")
         with self.engine.begin() as connection:
             return connection.execute(
                 text(

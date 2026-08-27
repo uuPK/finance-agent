@@ -233,11 +233,15 @@ export function EvaluationCenter() {
       const created = await createEvaluationRun({
         run_name: `workbench-${new Date().toISOString().slice(0, 19)}`,
         difficulty: difficulty || undefined,
-        case_source: caseSource === "extension" ? "official_extension" : undefined,
+        case_source: caseSource === "extension"
+          ? "official_extension"
+          : caseSource === "challenge-v2"
+            ? "official_challenge_v2"
+            : undefined,
         // A full run must cover every active baseline case.  The repository
         // caps this at 200, so this also remains safe as the benchmark grows.
-        limit: caseSource === "extension" ? 30 : difficulty ? 20 : 200,
-        evaluation_mode: caseSource === "extension" || !difficulty ? "full" : "smoke"
+        limit: caseSource ? 30 : difficulty ? 20 : 200,
+        evaluation_mode: caseSource || !difficulty ? "full" : "smoke"
       });
       await loadRun(created.eval_run_id);
       await loadOverview();
@@ -342,9 +346,9 @@ export function EvaluationCenter() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select value={caseSource} onChange={(event) => { setCaseSource(event.target.value); if (event.target.value) setDifficulty(""); }} className="h-9 border border-line bg-white px-3 text-sm text-ink">
-              <option value="">全部评测集（97题）</option><option value="extension">新增扩展集（30题）</option>
+              <option value="">全部评测集（127题）</option><option value="extension">扩展集（30题）</option><option value="challenge-v2">第二轮独立挑战集（30题）</option>
             </select>
-            <select value={difficulty} onChange={(event) => { setDifficulty(event.target.value); if (event.target.value) setCaseSource(""); }} disabled={caseSource === "extension"} className="h-9 border border-line bg-white px-3 text-sm text-ink disabled:bg-slate-50">
+            <select value={difficulty} onChange={(event) => { setDifficulty(event.target.value); if (event.target.value) setCaseSource(""); }} disabled={Boolean(caseSource)} className="h-9 border border-line bg-white px-3 text-sm text-ink disabled:bg-slate-50">
               <option value="">完整评测集</option><option value="simple">简单案例冒烟</option><option value="medium">中等案例冒烟</option><option value="complex">复杂案例冒烟</option>
             </select>
             <button type="button" onClick={() => void startEvaluation()} disabled={hasRunningRun} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><Play className="h-4 w-4" />{hasRunningRun ? "评测运行中" : "运行评测"}</button>
