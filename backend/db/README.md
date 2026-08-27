@@ -1,6 +1,6 @@
 # 数据库与官方数据导入
 
-`schema.sql` 创建官方 `mart` 业务表、可治理的 `metadata` 表、Agent 审计表和评测表；它不包含任何业务数据。官方 CSV 与 `Q&A.xlsx` 必须由部署者在本地提供，不能提交到仓库。
+`schema.sql` 创建官方 `mart` 业务表、可治理的 `metadata` 表、Agent 审计表和评测表；版本库中的 `data/official/htsc` 包含已获授权公开的官方脱敏数据及其完整性清单。
 
 ## 新库初始化
 
@@ -12,16 +12,15 @@ Get-Content -Raw .\backend\db\schema.sql |
   docker exec -i finance-agent-postgres psql -U finance_agent -d finance_agent -v ON_ERROR_STOP=1
 ```
 
-随后从 `backend` 目录导入官方包并生成基线：
+随后执行一条可重复初始化命令：
 
 ```powershell
-uv sync --extra dev --frozen
-uv run python .\db\load_official_dataset.py --data-dir "D:\contest-data\htsc"
-uv run python .\db\load_official_benchmark_cases.py
-uv run python .\db\load_official_challenge_cases.py
+.\scripts\bootstrap_official_data.ps1
 ```
 
-数据包必须包含 `表描述.sql`、`Q&A.xlsx` 和 8 个官方 CSV。导入后有 8 张官方 `mart` 表、7 条官方原始问答、60 条官方基础回归题和两组各 30 条独立题。独立题不写入检索样例，可独立运行以衡量泛化表现。
+该命令会创建表、导入 8 个 CSV 与 `Q&A.xlsx`，并生成 217 条激活评测案例：
+7 条官方原始问答、60 条基础回归题、30 条扩展题，以及四轮各 30 条独立挑战题。
+所有独立挑战题均不写入检索样例，可单独运行以衡量泛化表现。
 
 ## 迁移原则
 

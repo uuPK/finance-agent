@@ -14,6 +14,7 @@ EvaluationCaseSource = Literal[
     "official",
     "official_derived",
     "official_extension",
+    "official_challenge",
     "official_challenge_v2",
     "official_challenge_v3",
     "official_challenge_v4",
@@ -26,7 +27,7 @@ class EvaluationRunCreate(BaseModel):
     run_name: str = Field(default="manual-evaluation", min_length=1, max_length=128)
     difficulty: Difficulty | None = None
     case_source: EvaluationCaseSource | None = None
-    limit: int = Field(default=20, ge=1, le=200)
+    limit: int = Field(default=20, ge=1, le=500)
     evaluation_mode: Literal["smoke", "full"] = "full"
 
 

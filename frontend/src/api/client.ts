@@ -222,7 +222,7 @@ export async function getEvaluationRun(runId: string): Promise<EvaluationRunDeta
 export async function createEvaluationRun(payload: {
   run_name: string;
   difficulty?: string;
-  case_source?: "official" | "official_derived" | "official_extension" | "official_challenge_v2" | "official_challenge_v3" | "official_challenge_v4";
+  case_source?: "official" | "official_derived" | "official_extension" | "official_challenge" | "official_challenge_v2" | "official_challenge_v3" | "official_challenge_v4";
   limit: number;
   evaluation_mode: "smoke" | "full";
 }): Promise<{ eval_run_id: string; status: string }> {

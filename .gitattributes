@@ -3,3 +3,7 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+*.csv -text
+*.xlsx -text
+data/official/htsc/*.csv whitespace=-trailing-space
+data/official/htsc/*.sql whitespace=-trailing-space

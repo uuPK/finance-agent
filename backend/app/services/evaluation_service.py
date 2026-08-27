@@ -145,6 +145,7 @@ class EvaluationRepository:
     def create_run(self, run_name: str, mode: str, case_source: str | None = None) -> UUID:
         dataset_version = {
             "official_extension": "official-v1-extension",
+            "official_challenge": "official-v1-challenge",
             "official_challenge_v2": "official-v1-challenge-v2",
             "official_challenge_v3": "official-v1-challenge-v3",
             "official_challenge_v4": "official-v1-challenge-v4",
