@@ -15,6 +15,8 @@ EvaluationCaseSource = Literal[
     "official_derived",
     "official_extension",
     "official_challenge_v2",
+    "official_challenge_v3",
+    "official_challenge_v4",
 ]
 ReviewVerdict = Literal["correct", "incorrect", "needs_clarification", "insufficient_data"]
 ReviewSeverity = Literal["minor", "major", "blocking"]

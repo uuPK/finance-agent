@@ -1,4 +1,5 @@
 import re
+from datetime import date
 
 from app.schemas.query_plan import (
     BusinessEntity,
@@ -36,6 +37,19 @@ class RuleBasedQueryPlanActor:
         grain = self._detect_grain(normalized)
         intent = self._detect_intent(normalized, lower_question)
 
+        unresolved_filters = [
+            query_filter for query_filter in filters if query_filter.requires_clarification
+        ]
+        known_clarification_fields = {item.field for item in clarifications}
+        clarifications.extend(
+            ClarificationQuestion(
+                field=query_filter.term,
+                question=f"请明确“{query_filter.term}”的计算口径或适用时间范围。",
+                reason="该过滤条件尚未解析为可执行的业务口径。",
+            )
+            for query_filter in unresolved_filters
+            if query_filter.term not in known_clarification_fields
+        )
         plan_status = "needs_clarification" if clarifications else "ready"
 
         return QueryPlan(
@@ -179,6 +193,20 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
+        cash_asset_requested = "现金资产" in asset_intent_question
+        if cash_asset_requested:
+            metrics.append(
+                QueryMetric(
+                    name="现金资产",
+                    metric_code="cash_asset",
+                    definition_id="metric:cash_asset",
+                    aggregation="sum",
+                    alias="现金资产",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("cash_asset", "现金资产"),
+                    is_resolved=True,
+                )
+            )
         account_asset_metric: str | None = None
         if "普通账户" in asset_intent_question and "资产" in asset_intent_question:
             account_asset_metric = "normal_total_asset"
@@ -213,6 +241,7 @@ class RuleBasedQueryPlanActor:
             and "日均资产" not in asset_intent_question
             and not any(token in asset_intent_question for token in ("盈亏", "盈利"))
             and account_asset_metric is None
+            and not cash_asset_requested
             and (
                 not has_average_total_asset
                 or asset_intent_question.count("总资产")
@@ -363,6 +392,7 @@ class RuleBasedQueryPlanActor:
             "total_asset": "总资产",
             "daily_average_asset": "日均资产",
             "trade_amount": "交易金额",
+            "trade_fee": "交易费用",
             "holding_market_value": "持仓市值",
         }
         for threshold in self._extract_amount_thresholds(question):
@@ -672,7 +702,7 @@ class RuleBasedQueryPlanActor:
                         is_resolved=True,
                     )
                 )
-        if "年龄" in question:
+        if "年龄" in question and "平均年龄" not in question:
             dimensions.append(
                 QueryDimension(
                     name="客户年龄",
@@ -686,26 +716,47 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
-        if any(token in question for token in ("产品类型", "产品类别", "产品分类", "产品大类")):
-            if "产品大类" in question:
+        explicit_upper_product_terms = ("一级产品分类", "一级产品类别", "一级产品类型")
+        upper_product_terms = ("产品大类", *explicit_upper_product_terms)
+        lower_product_terms = ("二级产品分类", "二级产品类别", "二级产品类型")
+        product_terms = (
+            *upper_product_terms,
+            *lower_product_terms,
+            "产品类型",
+            "产品类别",
+            "产品分类",
+        )
+        if any(token in question for token in product_terms):
+            if any(token in question for token in upper_product_terms):
                 dimensions.append(
                     QueryDimension(
-                        name="产品大类",
+                        name="一级产品分类",
                         dimension_code="up_prdt_type_name",
                         role="group_by",
-                        alias="产品大类",
+                        alias="一级产品分类",
                         is_resolved=True,
                     )
                 )
-            dimensions.append(
-                QueryDimension(
-                    name="产品分类",
-                    dimension_code="prdt_type_name",
-                    role="group_by",
-                    alias="产品分类",
-                    is_resolved=True,
+            # Historical organizer wording “产品大类” asks for the hierarchy
+            # display and remains compatible with its existing two-level output.
+            # Explicit “一级/二级产品分类” is a strict single-level request.
+            if "产品大类" in question or not any(
+                token in question for token in explicit_upper_product_terms
+            ):
+                lower_name = (
+                    "二级产品分类"
+                    if any(token in question for token in lower_product_terms)
+                    else "产品分类"
                 )
-            )
+                dimensions.append(
+                    QueryDimension(
+                        name=lower_name,
+                        dimension_code="prdt_type_name",
+                        role="group_by",
+                        alias=lower_name,
+                        is_resolved=True,
+                    )
+                )
         if "账户来源" in question or "账户类型" in question:
             dimensions.append(
                 QueryDimension(
@@ -767,6 +818,26 @@ class RuleBasedQueryPlanActor:
                 granularity="day",
                 is_resolved=True,
             )
+        explicit_dates = self._extract_explicit_dates(question)
+        if len(explicit_dates) >= 2:
+            start, end = explicit_dates[:2]
+            return TimeRange(
+                label=f"{start[:4]}年{int(start[4:6])}月{int(start[6:])}日至{end[:4]}年{int(end[4:6])}月{int(end[6:])}日",
+                start=start,
+                end=end,
+                granularity="day",
+                is_resolved=True,
+            )
+        if explicit_dates:
+            snapshot_date = explicit_dates[0]
+            return TimeRange(
+                label=f"截至{snapshot_date[:4]}年{int(snapshot_date[4:6])}月{int(snapshot_date[6:])}日",
+                start=snapshot_date,
+                end=snapshot_date,
+                anchor_date=snapshot_date,
+                granularity="day",
+                is_resolved=True,
+            )
         if "26年1月10日" in question and "26年2月15日" in question:
             return TimeRange(
                 label="2026年1月10日至2月15日",
@@ -798,6 +869,30 @@ class RuleBasedQueryPlanActor:
             )
         return None
 
+    @staticmethod
+    def _extract_explicit_dates(question: str) -> list[str]:
+        """Parse calendar dates written with Chinese, hyphen, or slash separators.
+
+        Invalid calendar values are ignored instead of becoming an executable
+        filter.  This makes the parsing reusable for any official snapshot date,
+        rather than encoding one benchmark date in the rule actor.
+        """
+        pattern = re.compile(
+            r"(?P<year>20\d{2})\s*(?:年|-|/)\s*(?P<month>\d{1,2})\s*(?:月|-|/)\s*(?P<day>\d{1,2})(?:日)?"
+        )
+        parsed: list[str] = []
+        for match in pattern.finditer(question):
+            try:
+                value = date(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                )
+            except ValueError:
+                continue
+            parsed.append(value.strftime("%Y%m%d"))
+        return parsed
+
     def _detect_grain(self, question: str) -> QueryGrain:
         if "一级营业部" in question and (
             self._asks_for_grouping(question) or "分布" in question or "统计" in question
@@ -817,12 +912,15 @@ class RuleBasedQueryPlanActor:
             return QueryGrain(
                 level="organization", keys=["org_id"], description="营业部级", is_resolved=True
             )
+        explicit_upper_product_terms = ("一级产品分类", "一级产品类别", "一级产品类型")
         if any(token in question for token in ("产品类型", "产品类别", "产品分类", "产品大类")):
             return QueryGrain(
                 level="product",
                 keys=(
                     ["up_prdt_type_name", "prdt_type_name"]
                     if "产品大类" in question
+                    else ["up_prdt_type_name"]
+                    if any(token in question for token in explicit_upper_product_terms)
                     else ["prdt_type_name"]
                 ),
                 description="产品分类级",
@@ -878,19 +976,23 @@ class RuleBasedQueryPlanActor:
     ) -> QueryOutput:
         metric_columns = [metric.alias or metric.name for metric in metrics]
         dimension_columns = [dimension.alias or dimension.name for dimension in dimensions]
+        limit_match = re.search(r"(?:前\s*|top\s*)(\d+)", question, re.IGNORECASE)
+        limit = int(limit_match.group(1)) if limit_match else 100
         if "日均资产" in question and "产品大类" in question:
             # 日均资产和股票交易量仅用于筛选客户；最终问题询问的是这些
             # 客户在期末持有的产品大类，不能把筛选指标误当作分组输出指标。
             return QueryOutput(
                 format="table",
                 columns=["产品大类", "产品分类", "持仓市值"],
-                limit=100,
+                limit=limit,
             )
         if grain.level == "aggregate" and not dimensions:
-            return QueryOutput(format="summary", columns=metric_columns or ["客户数量"], limit=100)
+            return QueryOutput(
+                format="summary", columns=metric_columns or ["客户数量"], limit=limit
+            )
         columns = dimension_columns or (["客户"] if grain.level == "customer" else [])
         columns.extend(column for column in metric_columns if column not in columns)
-        return QueryOutput(format="table", columns=columns or ["客户数量"], limit=100)
+        return QueryOutput(format="table", columns=columns or ["客户数量"], limit=limit)
 
     def _build_data_requirements(
         self,
@@ -910,6 +1012,7 @@ class RuleBasedQueryPlanActor:
             "average_total_asset",
             "normal_total_asset",
             "credit_total_asset",
+            "cash_asset",
             "daily_average_asset",
         } & all_codes:
             domains.add("asset")
@@ -1071,9 +1174,10 @@ class RuleBasedQueryPlanActor:
             daily_average_position = prefix.rfind("日均资产")
             metric_positions = {
                 "daily_average_asset": daily_average_position,
-                "trade_amount": max(
-                    prefix.rfind(token) for token in ("交易", "成交", "买入", "卖出", "交易量")
-                ),
+            "trade_fee": max(prefix.rfind(token) for token in ("交易费用", "手续费")),
+            "trade_amount": max(
+                prefix.rfind(token) for token in ("交易", "成交", "买入", "卖出", "交易量")
+            ),
                 "holding_market_value": max(prefix.rfind(token) for token in ("持仓", "市值")),
                 # The shorter “资产” token is part of “日均资产”; it must not
                 # override the more specific metric phrase.
@@ -1086,6 +1190,8 @@ class RuleBasedQueryPlanActor:
                 metric_code = nearest_metric
             elif "日均资产" in suffix:
                 metric_code = "daily_average_asset"
+            elif any(token in suffix for token in ("交易费用", "手续费")):
+                metric_code = "trade_fee"
             elif any(token in suffix for token in ("交易", "成交", "买入", "卖出", "交易量")):
                 metric_code = "trade_amount"
             elif any(token in suffix for token in ("持仓", "市值")):

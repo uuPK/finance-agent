@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from textwrap import dedent
 from typing import Any, Literal
 
@@ -225,6 +226,32 @@ class LLMSQLActor:
         if branch_customer_count_draft is not None:
             return branch_customer_count_draft
 
+        average_age_draft = LLMSQLActor._average_customer_age_draft(query_plan)
+        if average_age_draft is not None:
+            return average_age_draft
+
+        cash_asset_draft = LLMSQLActor._cash_asset_draft(query_plan, snapshot_date)
+        if cash_asset_draft is not None:
+            return cash_asset_draft
+
+        threshold_customer_count_draft = LLMSQLActor._threshold_customer_count_draft(
+            query_plan, start, end
+        )
+        if threshold_customer_count_draft is not None:
+            return threshold_customer_count_draft
+
+        holding_product_draft = LLMSQLActor._holding_product_draft(query_plan, snapshot_date)
+        if holding_product_draft is not None:
+            return holding_product_draft
+
+        finance_group_draft = LLMSQLActor._finance_group_draft(query_plan, start, end)
+        if finance_group_draft is not None:
+            return finance_group_draft
+
+        trade_product_draft = LLMSQLActor._trade_product_draft(query_plan, start, end)
+        if trade_product_draft is not None:
+            return trade_product_draft
+
         grouped_asset_draft = LLMSQLActor._grouped_total_asset_draft(
             query_plan=query_plan,
             snapshot_date=snapshot_date,
@@ -239,6 +266,289 @@ class LLMSQLActor:
         if asset_holding_draft is not None:
             return asset_holding_draft
         return None
+
+    @staticmethod
+    def _group_dimensions(query_plan: QueryPlan) -> list[str]:
+        return [
+            item.dimension_code
+            for item in query_plan.dimensions
+            if item.role == "group_by" and item.dimension_code
+        ]
+
+    @staticmethod
+    def _average_customer_age_draft(query_plan: QueryPlan) -> SQLDraft | None:
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        if metric_codes != {"average_customer_age"} or len(dimensions) > 1:
+            return None
+        if not dimensions:
+            return SQLDraft(
+                sql=(
+                    "SELECT AVG(cust_age) AS average_customer_age\n"
+                    "FROM mart.ads_cust_info_d\n"
+                    f"LIMIT {query_plan.output.limit}"
+                ),
+                dialect="postgres",
+                tables=["ads_cust_info_d"],
+                columns=["average_customer_age"],
+                assumptions=["Average age is calculated over the current official customer snapshot."],
+                confidence=0.98,
+            )
+        dimension = dimensions[0]
+        if dimension in {"up_org_name", "org_name"}:
+            select = f"b.{dimension}"
+            from_clause = (
+                "FROM mart.ads_cust_info_d c\n"
+                "JOIN mart.dim_branch b ON b.org_id = c.org_id"
+            )
+            age_column = "c.cust_age"
+            tables = ["ads_cust_info_d", "dim_branch"]
+        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+            select = dimension
+            from_clause = "FROM mart.ads_cust_info_d"
+            age_column = "cust_age"
+            tables = ["ads_cust_info_d"]
+        else:
+            return None
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT {select}, AVG({age_column}) AS average_customer_age
+                {from_clause}
+                GROUP BY {select}
+                ORDER BY average_customer_age DESC NULLS LAST, {select}
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=tables,
+            columns=[dimension, "average_customer_age"],
+            assumptions=["Average age is aggregated at exactly the requested dimension grain."],
+            confidence=0.98,
+        )
+
+    @staticmethod
+    def _cash_asset_draft(query_plan: QueryPlan, snapshot_date: str | None) -> SQLDraft | None:
+        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {"cash_asset"}:
+            return None
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        if len(dimensions) > 1:
+            return None
+        expression = "SUM(COALESCE(a.nm_bal, 0) + COALESCE(a.fc_bal, 0))"
+        if not dimensions:
+            return SQLDraft(
+                sql=dedent(
+                    f"""
+                    SELECT {expression} AS cash_asset
+                    FROM mart.dws_cust_aset_d a
+                    WHERE a.data_dt = '{snapshot_date}'
+                    LIMIT {query_plan.output.limit}
+                    """
+                ).strip(),
+                dialect="postgres",
+                tables=["dws_cust_aset_d"],
+                columns=["cash_asset"],
+                assumptions=["Cash asset uses the official normal-balance plus foreign-currency-balance formula."],
+                confidence=0.98,
+            )
+        dimension = dimensions[0]
+        if dimension in {"up_org_name", "org_name"}:
+            select = f"b.{dimension}"
+            joins = (
+                "JOIN mart.ads_cust_info_d c ON c.pty_id = a.pty_id\n"
+                "JOIN mart.dim_branch b ON b.org_id = c.org_id"
+            )
+            tables = ["dws_cust_aset_d", "ads_cust_info_d", "dim_branch"]
+        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+            select = f"c.{dimension}"
+            joins = "JOIN mart.ads_cust_info_d c ON c.pty_id = a.pty_id"
+            tables = ["dws_cust_aset_d", "ads_cust_info_d"]
+        else:
+            return None
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT {select}, {expression} AS cash_asset
+                FROM mart.dws_cust_aset_d a
+                {joins}
+                WHERE a.data_dt = '{snapshot_date}'
+                GROUP BY {select}
+                ORDER BY cash_asset DESC NULLS LAST, {select}
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=tables,
+            columns=[dimension, "cash_asset"],
+            assumptions=["Cash asset is grouped only after applying the requested asset snapshot."],
+            confidence=0.98,
+        )
+
+    @staticmethod
+    def _threshold_customer_count_draft(
+        query_plan: QueryPlan, start: str | None, end: str | None
+    ) -> SQLDraft | None:
+        """Count customers after a supported cumulative metric threshold."""
+        if not start or not end or "customer_count" not in {metric.metric_code for metric in query_plan.metrics}:
+            return None
+        threshold = next(
+            (
+                item
+                for item in query_plan.filters
+                if item.metric_code == "trade_fee"
+                and item.operator in {">", ">=", "<", "<="}
+                and isinstance(item.value.normalized, (int, float))
+            ),
+            None,
+        )
+        if threshold is None:
+            return None
+        value = Decimal(str(threshold.value.normalized))
+        threshold_sql = str(int(value)) if value == value.to_integral_value() else str(value)
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT COUNT(*) AS customer_count
+                FROM (
+                    SELECT t.pty_id
+                    FROM mart.dwd_cust_tran_d t
+                    WHERE t.data_dt BETWEEN '{start}' AND '{end}'
+                    GROUP BY t.pty_id
+                    HAVING SUM(COALESCE(t.buy_fare, 0) + COALESCE(t.sell_fare, 0)) {threshold.operator} {threshold_sql}
+                ) fee_threshold_customers
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=["dwd_cust_tran_d"],
+            columns=["customer_count"],
+            assumptions=["The cumulative trading-fee threshold is evaluated per customer before counting."],
+            confidence=0.98,
+        )
+
+    @staticmethod
+    def _holding_product_draft(query_plan: QueryPlan, snapshot_date: str | None) -> SQLDraft | None:
+        if not snapshot_date:
+            return None
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        if len(dimensions) != 1 or dimensions[0] not in {"up_prdt_type_name", "prdt_type_name"}:
+            return None
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        dimension = dimensions[0]
+        if "customer_count" in metric_codes:
+            expression = "COUNT(DISTINCT h.pty_id)"
+            alias = "customer_count"
+        elif metric_codes == {"holding_market_value"}:
+            expression = "SUM(COALESCE(h.mkt_val, 0))"
+            alias = "holding_market_value"
+        else:
+            return None
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT p.{dimension}, {expression} AS {alias}
+                FROM mart.dwd_cust_hold_d h
+                JOIN mart.dim_product p ON p.prdt_id = h.prdt_id
+                WHERE h.data_dt = '{snapshot_date}'
+                GROUP BY p.{dimension}
+                ORDER BY {alias} DESC NULLS LAST, p.{dimension}
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=["dwd_cust_hold_d", "dim_product"],
+            columns=[dimension, alias],
+            assumptions=["Product hierarchy is grouped at the explicitly requested single level."],
+            confidence=0.98,
+        )
+
+    @staticmethod
+    def _finance_group_draft(query_plan: QueryPlan, start: str | None, end: str | None) -> SQLDraft | None:
+        if not start or not end or {metric.metric_code for metric in query_plan.metrics} != {"net_cash_flow"}:
+            return None
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        if len(dimensions) != 1:
+            return None
+        dimension = dimensions[0]
+        if dimension in {"up_org_name", "org_name"}:
+            select = f"b.{dimension}"
+            joins = (
+                "JOIN mart.ads_cust_info_d c ON c.pty_id = f.pty_id\n"
+                "JOIN mart.dim_branch b ON b.org_id = c.org_id"
+            )
+            tables = ["dws_cust_fin_d", "ads_cust_info_d", "dim_branch"]
+        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+            select = f"c.{dimension}"
+            joins = "JOIN mart.ads_cust_info_d c ON c.pty_id = f.pty_id"
+            tables = ["dws_cust_fin_d", "ads_cust_info_d"]
+        else:
+            return None
+        expression = (
+            "SUM(COALESCE(f.cash_in, 0) + COALESCE(f.tran_in, 0) + COALESCE(f.assign_in, 0) "
+            "- COALESCE(f.cash_out, 0) - COALESCE(f.tran_out, 0) - COALESCE(f.assign_out, 0))"
+        )
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT {select}, {expression} AS net_cash_flow
+                FROM mart.dws_cust_fin_d f
+                {joins}
+                WHERE f.data_dt BETWEEN '{start}' AND '{end}'
+                GROUP BY {select}
+                ORDER BY net_cash_flow DESC NULLS LAST, {select}
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=tables,
+            columns=[dimension, "net_cash_flow"],
+            assumptions=["Net cash flow follows the official six-leg inflow/outflow definition."],
+            confidence=0.98,
+        )
+
+    @staticmethod
+    def _trade_product_draft(query_plan: QueryPlan, start: str | None, end: str | None) -> SQLDraft | None:
+        if not start or not end or {metric.metric_code for metric in query_plan.metrics} != {"trade_amount"}:
+            return None
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        if len(dimensions) != 1 or dimensions[0] not in {"up_prdt_type_name", "prdt_type_name"}:
+            return None
+        product_filter = next(
+            (
+                item
+                for item in query_plan.filters
+                if item.field_code in {"up_prdt_type_id", "prdt_type_name"}
+                and item.operator == "="
+                and isinstance(item.value.normalized, str)
+            ),
+            None,
+        )
+        filter_sql = ""
+        if product_filter is not None:
+            escaped_value = product_filter.value.normalized.replace("'", "''")
+            filter_sql = (
+                f"\n  AND p.{product_filter.field_code} = '{escaped_value}'"
+            )
+        dimension = dimensions[0]
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT p.{dimension},
+                       SUM(COALESCE(t.buy_amt, 0) + COALESCE(t.sell_amt, 0)) AS trade_amount
+                FROM mart.dwd_cust_tran_d t
+                JOIN mart.dim_product p ON p.prdt_id = t.prdt_id
+                WHERE t.data_dt BETWEEN '{start}' AND '{end}'{filter_sql}
+                GROUP BY p.{dimension}
+                ORDER BY trade_amount DESC NULLS LAST, p.{dimension}
+                LIMIT {query_plan.output.limit}
+                """
+            ).strip(),
+            dialect="postgres",
+            tables=["dwd_cust_tran_d", "dim_product"],
+            columns=[dimension, "trade_amount"],
+            assumptions=["Product filters constrain the fact rows without becoming additional grouping keys."],
+            confidence=0.98,
+        )
 
     @staticmethod
     def _branch_customer_count_draft(query_plan: QueryPlan) -> SQLDraft | None:

@@ -8,7 +8,7 @@ import io
 import json
 from collections.abc import Callable
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -53,7 +53,10 @@ def _canonical(value: Any) -> str:
         # results are deserialized as float.  Normalize both to the same
         # business precision before result comparison.
         if isinstance(item, (float, Decimal)):
-            return round(float(item), 2)
+            return format(
+                Decimal(str(item)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                "f",
+            )
         if isinstance(item, dict):
             return {key: normalize(value) for key, value in sorted(item.items())}
         if isinstance(item, list):
@@ -143,6 +146,8 @@ class EvaluationRepository:
         dataset_version = {
             "official_extension": "official-v1-extension",
             "official_challenge_v2": "official-v1-challenge-v2",
+            "official_challenge_v3": "official-v1-challenge-v3",
+            "official_challenge_v4": "official-v1-challenge-v4",
         }.get(case_source, "official-v1")
         with self.engine.begin() as connection:
             return connection.execute(

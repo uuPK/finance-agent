@@ -237,7 +237,11 @@ export function EvaluationCenter() {
           ? "official_extension"
           : caseSource === "challenge-v2"
             ? "official_challenge_v2"
-            : undefined,
+            : caseSource === "challenge-v3"
+              ? "official_challenge_v3"
+              : caseSource === "challenge-v4"
+                ? "official_challenge_v4"
+              : undefined,
         // A full run must cover every active baseline case.  The repository
         // caps this at 200, so this also remains safe as the benchmark grows.
         limit: caseSource ? 30 : difficulty ? 20 : 200,
@@ -346,7 +350,7 @@ export function EvaluationCenter() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select value={caseSource} onChange={(event) => { setCaseSource(event.target.value); if (event.target.value) setDifficulty(""); }} className="h-9 border border-line bg-white px-3 text-sm text-ink">
-              <option value="">全部评测集（127题）</option><option value="extension">扩展集（30题）</option><option value="challenge-v2">第二轮独立挑战集（30题）</option>
+              <option value="">全部评测集（187题）</option><option value="extension">扩展集（30题）</option><option value="challenge-v2">第二轮独立挑战集（30题）</option><option value="challenge-v3">第三轮独立挑战集（30题）</option><option value="challenge-v4">第四轮独立挑战集（30题）</option>
             </select>
             <select value={difficulty} onChange={(event) => { setDifficulty(event.target.value); if (event.target.value) setCaseSource(""); }} disabled={Boolean(caseSource)} className="h-9 border border-line bg-white px-3 text-sm text-ink disabled:bg-slate-50">
               <option value="">完整评测集</option><option value="simple">简单案例冒烟</option><option value="medium">中等案例冒烟</option><option value="complex">复杂案例冒烟</option>

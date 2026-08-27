@@ -4,14 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from app.agents.llm_query_plan_actor import QueryPlanBuildResult
+from app.agents.llm_query_plan_actor import LLMQueryPlanActor, QueryPlanBuildResult
 from app.agents.llm_result_critic import LLMResultCriticResult
 from app.agents.llm_sql_actor import LLMSQLActor
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.data.dataset_adapter import DatasetAdapter, DatasetManifest
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
 from app.guardrails.sql_guardrail import SQLGuardrail
-from app.schemas.query_plan import QueryGrain, QueryOutput, QueryPlan
+from app.schemas.query_plan import QueryDimension, QueryGrain, QueryOutput, QueryPlan
 from app.schemas.review import ReviewDecision
 from app.services.evaluation_service import _same_result_rows
 from app.services.query_service import QueryService
@@ -108,6 +108,14 @@ def test_evaluation_treats_average_age_aliases_as_equivalent() -> None:
     assert _same_result_rows(
         [{"avg_age": Decimal("42.25")}],
         [{"average_customer_age": 42.25}],
+        {"metrics": [{"metric_code": "average_customer_age"}]},
+    )
+
+
+def test_evaluation_uses_database_compatible_half_up_rounding() -> None:
+    assert _same_result_rows(
+        [{"average_customer_age": Decimal("61.625")}],
+        [{"average_customer_age": 61.63}],
         {"metrics": [{"metric_code": "average_customer_age"}]},
     )
 
@@ -265,6 +273,97 @@ def test_rule_plan_keeps_first_level_branch_as_its_own_grain() -> None:
     assert plan.grain is not None and plan.grain.keys == ["up_org_name"]
     assert [item.dimension_code for item in plan.dimensions] == ["up_org_name"]
     assert "dim_branch" in plan.data_requirements.candidate_tables
+
+
+def test_rule_plan_does_not_group_average_age_by_the_measured_age() -> None:
+    plan = RuleBasedQueryPlanActor().build(
+        "请按一级营业部统计当前客户平均年龄，展示前20个一级营业部。"
+    )
+
+    assert plan.grain is not None and plan.grain.keys == ["up_org_name"]
+    assert [item.dimension_code for item in plan.dimensions] == ["up_org_name"]
+    assert plan.output.limit == 20
+
+
+def test_rule_plan_resolves_cash_asset_and_fee_thresholds() -> None:
+    cash_plan = RuleBasedQueryPlanActor().build("截至2026年3月31日，客户现金资产合计是多少？")
+    fee_plan = RuleBasedQueryPlanActor().build(
+        "2026年第一季度，累计交易费用不少于1000元的去重客户有多少位？"
+    )
+
+    assert {metric.metric_code for metric in cash_plan.metrics} == {"cash_asset"}
+    assert "dws_cust_aset_d" in cash_plan.data_requirements.candidate_tables
+    assert any(
+        item.metric_code == "trade_fee" and item.value.normalized == 1000
+        for item in fee_plan.filters
+    )
+
+
+def test_rule_plan_keeps_explicit_product_hierarchy_as_one_level() -> None:
+    upper = RuleBasedQueryPlanActor().build("按一级产品分类统计持仓客户数。")
+    lower = RuleBasedQueryPlanActor().build("按二级产品分类统计持仓市值。")
+
+    assert upper.grain is not None and upper.grain.keys == ["up_prdt_type_name"]
+    assert [item.dimension_code for item in upper.dimensions] == ["up_prdt_type_name"]
+    assert lower.grain is not None and lower.grain.keys == ["prdt_type_name"]
+    assert [item.dimension_code for item in lower.dimensions] == ["prdt_type_name"]
+
+
+def test_llm_plan_normalizer_preserves_explicit_product_level_and_top_n() -> None:
+    raw_plan = QueryPlan(
+        question="按一级产品分类统计持仓市值，展示前20个。",
+        metrics=[],
+        dimensions=[
+            QueryDimension(name="产品分类", dimension_code="prdt_type_name", role="group_by")
+        ],
+        grain=QueryGrain(level="product", keys=["prdt_type_name"]),
+        output=QueryOutput(columns=["产品分类"], limit=100),
+    )
+
+    normalized = LLMQueryPlanActor._normalize_explicit_request(raw_plan.question or "", raw_plan)
+
+    assert normalized.output.limit == 20
+    assert normalized.grain is not None and normalized.grain.keys == ["up_prdt_type_name"]
+    assert [item.dimension_code for item in normalized.dimensions] == ["up_prdt_type_name"]
+
+
+def test_rule_plan_parses_any_explicit_snapshot_date_for_multi_product_condition() -> None:
+    question = "截至2026年2月17日，至少持有4种不同产品的客户有多少位？"
+    plan = RuleBasedQueryPlanActor().build(question)
+
+    assert plan.plan_status == "ready"
+    assert plan.time_range is not None
+    assert plan.time_range.start == "20260217"
+    assert plan.time_range.end == "20260217"
+    assert any(
+        item.metric_code == "distinct_holding_product_count"
+        and item.value.normalized == 4
+        and item.is_resolved
+        and not item.requires_clarification
+        for item in plan.filters
+    )
+
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.draft is not None
+    assert "h.data_dt = '20260217'" in result.draft.sql
+    assert "COUNT(DISTINCT h.prdt_id) >= 4" in result.draft.sql
+
+
+def test_llm_plan_normalizer_corrects_non_organization_grouping_codes() -> None:
+    raw_plan = QueryPlan(
+        question="按地区汇总资产。",
+        dimensions=[
+            QueryDimension(name="地区", dimension_code="prov_name", role="group_by")
+        ],
+        grain=QueryGrain(level="organization", keys=["prov_name"]),
+    )
+
+    normalized = LLMQueryPlanActor._normalize_explicit_request(raw_plan.question or "", raw_plan)
+
+    assert normalized.grain is not None
+    assert normalized.grain.level == "aggregate"
+    assert normalized.grain.keys == ["prov_name"]
 
 
 def test_rule_plan_keeps_snapshot_day_as_an_explicit_fact_anchor() -> None:
@@ -433,6 +532,67 @@ def test_sql_actor_groups_customer_counts_at_the_requested_branch_level() -> Non
     assert "SELECT b.up_org_name, COUNT(DISTINCT c.pty_id) AS customer_count" in result.draft.sql
     assert "GROUP BY b.up_org_name" in result.draft.sql
     assert "b.org_name" not in result.draft.sql
+
+
+@pytest.mark.parametrize(
+    ("question", "sql_fragment"),
+    [
+        (
+            "请按一级营业部统计当前客户平均年龄，展示前20个一级营业部。",
+            "AVG(c.cust_age) AS average_customer_age",
+        ),
+        (
+            "截至2026年3月31日，请按一级营业部统计客户现金资产，展示前20个一级营业部。",
+            "SUM(COALESCE(a.nm_bal, 0) + COALESCE(a.fc_bal, 0)) AS cash_asset",
+        ),
+        (
+            "2026年第一季度，累计交易费用不少于1000元的去重客户有多少位？",
+            "HAVING SUM(COALESCE(t.buy_fare, 0) + COALESCE(t.sell_fare, 0)) >= 1000",
+        ),
+        (
+            "2026年第一季度，请按一级营业部统计客户净资金流入。",
+            "AS net_cash_flow",
+        ),
+        (
+            "2026年第一季度，请按一级产品分类统计股票类交易金额。",
+            "GROUP BY p.up_prdt_type_name",
+        ),
+    ],
+)
+def test_sql_actor_uses_generic_official_metric_templates(
+    question: str, sql_fragment: str
+) -> None:
+    plan = RuleBasedQueryPlanActor().build(question)
+    result = asyncio.run(LLMSQLActor(llm_service=None).build(question, plan))
+
+    assert result.source == "rule_fallback"
+    assert result.draft is not None
+    assert sql_fragment in result.draft.sql
+
+
+def test_result_validator_accepts_declared_organization_presentation_alias() -> None:
+    plan = QueryPlan(
+        grain=QueryGrain(level="organization", keys=["up_org_name"]),
+        dimensions=[
+            QueryDimension(
+                name="一级营业部",
+                alias="一级营业部",
+                dimension_code="up_org_name",
+                role="group_by",
+            )
+        ],
+    )
+    result = SQLExecutionResult(
+        status="success",
+        sql="SELECT ...",
+        columns=["一级营业部", "net_cash_flow"],
+        rows=[{"一级营业部": "华东", "net_cash_flow": 1}],
+        row_count=1,
+        truncated=False,
+        elapsed_ms=1,
+    )
+
+    assert ResultHardValidator().validate(plan, result).passed
 
 
 def test_sql_actor_keeps_code_only_total_asset_grouping_compact() -> None:

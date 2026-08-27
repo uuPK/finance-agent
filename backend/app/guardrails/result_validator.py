@@ -182,7 +182,15 @@ class ResultHardValidator:
                 severity="error",
             )
         if grain_level == "organization":
-            if columns & {"org_id", "org_name", "up_org_id", "up_org_name"}:
+            canonical_columns = {"org_id", "org_name", "up_org_id", "up_org_name"}
+            declared_org_aliases = {
+                value.lower()
+                for dimension in query_plan.dimensions
+                if dimension.dimension_code in canonical_columns
+                for value in (dimension.name, dimension.alias)
+                if value
+            }
+            if columns & (canonical_columns | declared_org_aliases):
                 return ResultFinding(
                     name="result_grain",
                     passed=True,

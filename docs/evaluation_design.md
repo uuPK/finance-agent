@@ -12,9 +12,11 @@
 | `official_derived` | 60 | 仅使用官方表、由标准 SQL 实跑生成预期结果的回归题 |
 | `official_extension` | 30 | 仅使用官方表、由标准 SQL 实跑生成预期结果的独立扩展题；不进入检索样例 |
 | `official_challenge_v2` | 30 | 第二轮独立挑战题；不进入检索样例，覆盖新的阈值、维度、指标与多事实表交集 |
-| 合计 | 127 | 核心基线简单 23、中等 31、复杂 6；两个独立题集各 30 条 |
+| `official_challenge_v3` | 30 | 第三轮独立挑战题；不进入检索样例，覆盖客户、资产、交易、持仓、资金流、产品、营业部和币种口径 |
+| `official_challenge_v4` | 30 | 第四轮独立挑战题；不进入检索样例，覆盖 2 月末快照、Q1 区间与客户、资产、交易、持仓、资金流、产品和机构维度 |
+| 合计 | 187 | 核心基线简单 23、中等 31、复杂 6；四组独立题集各 30 条 |
 
-60 条派生题和第一组 30 条独立题可通过 `backend/db/load_official_benchmark_cases.py` 重复生成；第二组 30 条独立题由 `backend/db/load_official_challenge_cases.py` 生成。题库覆盖客户画像、资产、交易、持仓、资金流和营销分群；它们不是模拟业务记录或虚构答案。两组独立题只写入评测表，不写入 `metadata.question_examples`，避免通过精确题目/SQL 样例造成测试泄漏。
+60 条派生题和第一组 30 条独立题可通过 `backend/db/load_official_benchmark_cases.py` 重复生成；第二至第四组 30 条独立题分别由 `backend/db/load_official_challenge_cases.py`、`backend/db/load_official_challenge_v3_cases.py`、`backend/db/load_official_challenge_v4_cases.py` 生成。题库覆盖客户画像、资产、交易、持仓、资金流和营销分群；它们不是模拟业务记录或虚构答案。四组独立题只写入评测表，不写入 `metadata.question_examples`，避免通过精确题目/SQL 样例造成测试泄漏。
 
 ## 评测流程
 
@@ -53,4 +55,4 @@
 
 ## 运行方式
 
-在前端“评测中心”发起完整评测，或通过 `/api/evaluation/runs` 接口启动。评测可传入 `case_source: "official_extension"` 或 `"official_challenge_v2"` 单独运行 30 条独立题集。每次运行会记录数据集、模型与提示词版本字段以及所有逐题结果。完整 127 题运行会调用模型服务并消耗额度，应以评测记录中的真实结果作为是否达到赛题准确率目标的证据。
+在前端“评测中心”发起完整评测，或通过 `/api/evaluation/runs` 接口启动。评测可传入 `case_source: "official_extension"`、`"official_challenge_v2"`、`"official_challenge_v3"` 或 `"official_challenge_v4"` 单独运行一组 30 条独立题。每次运行会记录数据集、模型与提示词版本字段以及所有逐题结果。完整 187 题运行会调用模型服务并消耗额度，应以评测记录中的真实结果作为是否达到赛题准确率目标的证据。
