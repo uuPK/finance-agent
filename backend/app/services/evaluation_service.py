@@ -78,6 +78,7 @@ def _normalize_metric_aliases(
         "holding_quantity": {"hold_cnt"},
         "trade_amount": {"buy_amt", "sell_amt", "tran_amt"},
         "net_cash_flow": {"cash_in", "cash_out", "tran_in", "tran_out"},
+        "cash_in_amount": {"cash_in", "cash_inflow"},
     }
     presentation_aliases = {
         "count": "customer_count",
@@ -92,6 +93,11 @@ def _normalize_metric_aliases(
         "总资产": "total_asset",
         "交易金额": "trade_amount",
         "tran_amt": "trade_amount",
+        "现金流入": "cash_in_amount",
+        "现金流入金额": "cash_in_amount",
+        "cash_in": "cash_in_amount",
+        "cash_inflow": "cash_in_amount",
+        "cash_in_amount": "cash_in_amount",
         "持仓市值": "holding_market_value",
         "mkt_val": "holding_market_value",
         "风险等级": "risk_level",
@@ -149,6 +155,9 @@ class EvaluationRepository:
             "official_challenge_v2": "official-v1-challenge-v2",
             "official_challenge_v3": "official-v1-challenge-v3",
             "official_challenge_v4": "official-v1-challenge-v4",
+            "official_challenge_v5": "official-v1-challenge-v5",
+            "official_challenge_v6": "official-v1-challenge-v6",
+            "official_challenge_v7": "official-v1-challenge-v7",
         }.get(case_source, "official-v1")
         with self.engine.begin() as connection:
             return connection.execute(

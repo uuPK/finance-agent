@@ -65,7 +65,7 @@ class RuleBasedQueryPlanActor:
             time_range=time_range,
             grain=grain,
             data_requirements=self._build_data_requirements(metrics, filters, dimensions),
-            output=self._build_output(normalized, grain, metrics, dimensions),
+            output=self._build_output(normalized, grain, metrics, dimensions, filters),
             safety=SafetyRequirement(),
             clarifications=clarifications,
             assumptions=self._detect_assumptions(normalized, clarifications),
@@ -113,7 +113,20 @@ class RuleBasedQueryPlanActor:
         # Remove this date phrase before deciding whether total-asset output was asked for.
         asset_intent_question = question.replace("最新资产日期", "").replace("资产日期", "")
 
-        if "交易费用" in question or "手续费" in question:
+        if "平均交易金额" in question or "平均交易额" in question:
+            metrics.append(
+                QueryMetric(
+                    name="平均交易金额",
+                    metric_code="average_trade_amount",
+                    definition_id="metric:average_trade_amount",
+                    aggregation="avg",
+                    alias="平均交易金额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("average_trade_amount", "平均交易金额"),
+                    is_resolved=True,
+                )
+            )
+        elif "交易费用" in question or "手续费" in question:
             metrics.append(
                 QueryMetric(
                     name="交易费用",
@@ -136,6 +149,19 @@ class RuleBasedQueryPlanActor:
                     alias="成交数量",
                     time_window=time_range,
                     metadata_ref=self._metric_ref("trade_quantity", "成交数量"),
+                    is_resolved=True,
+                )
+            )
+        elif "买入金额" in question:
+            metrics.append(
+                QueryMetric(
+                    name="买入金额",
+                    metric_code="buy_amount",
+                    definition_id="metric:buy_amount",
+                    aggregation="sum",
+                    alias="买入金额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("buy_amount", "买入金额"),
                     is_resolved=True,
                 )
             )
@@ -275,6 +301,19 @@ class RuleBasedQueryPlanActor:
                     is_resolved=True,
                 )
             )
+        elif "现金流入" in question and "现金净流入" not in question:
+            metrics.append(
+                QueryMetric(
+                    name="现金流入金额",
+                    metric_code="cash_in_amount",
+                    definition_id="metric:cash_in_amount",
+                    aggregation="sum",
+                    alias="现金流入金额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("cash_in_amount", "现金流入金额"),
+                    is_resolved=True,
+                )
+            )
         elif "现金净流入" in question:
             metrics.append(
                 QueryMetric(
@@ -328,7 +367,20 @@ class RuleBasedQueryPlanActor:
                 )
             )
 
-        if any(token in question for token in ("持仓", "持有", "持有产品")):
+        if any(token in question for token in ("持有份额", "持仓份额", "持仓数量")):
+            metrics.append(
+                QueryMetric(
+                    name="持有份额",
+                    metric_code="holding_quantity",
+                    definition_id="metric:holding_quantity",
+                    aggregation="sum",
+                    alias="持有份额",
+                    time_window=time_range,
+                    metadata_ref=self._metric_ref("holding_quantity", "持有份额"),
+                    is_resolved=True,
+                )
+            )
+        elif any(token in question for token in ("持仓", "持有", "持有产品")):
             metrics.append(
                 QueryMetric(
                     name="持仓市值",
@@ -382,7 +434,6 @@ class RuleBasedQueryPlanActor:
             metrics = [
                 metric for metric in metrics if metric.metric_code != "holding_market_value"
             ]
-
         return self._dedupe_metrics(metrics)
 
     def _detect_filters(self, question: str, time_range: TimeRange | None) -> list[QueryFilter]:
@@ -394,6 +445,7 @@ class RuleBasedQueryPlanActor:
             "trade_amount": "交易金额",
             "trade_fee": "交易费用",
             "holding_market_value": "持仓市值",
+            "cash_in_amount": "现金流入金额",
         }
         for threshold in self._extract_amount_thresholds(question):
             metric_code = threshold["metric_code"]
@@ -818,6 +870,31 @@ class RuleBasedQueryPlanActor:
                 granularity="day",
                 is_resolved=True,
             )
+        abbreviated_range = re.search(
+            r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<start>\d{1,2})日?\s*(?:至|到)\s*"
+            r"(?:(?P<end_year>20\d{2})年)?(?:(?P<end_month>\d{1,2})月)?(?P<end>\d{1,2})日?",
+            question,
+        )
+        if abbreviated_range:
+            try:
+                year = int(abbreviated_range.group("year"))
+                month = int(abbreviated_range.group("month"))
+                start = date(year, month, int(abbreviated_range.group("start")))
+                end = date(
+                    int(abbreviated_range.group("end_year") or year),
+                    int(abbreviated_range.group("end_month") or month),
+                    int(abbreviated_range.group("end")),
+                )
+            except ValueError:
+                pass
+            else:
+                return TimeRange(
+                    label=f"{start:%Y年%m月%d日}至{end:%Y年%m月%d日}",
+                    start=start.strftime("%Y%m%d"),
+                    end=end.strftime("%Y%m%d"),
+                    granularity="day",
+                    is_resolved=True,
+                )
         explicit_dates = self._extract_explicit_dates(question)
         if len(explicit_dates) >= 2:
             start, end = explicit_dates[:2]
@@ -973,8 +1050,20 @@ class RuleBasedQueryPlanActor:
         grain: QueryGrain,
         metrics: list[QueryMetric],
         dimensions: list[QueryDimension],
+        filters: list[QueryFilter],
     ) -> QueryOutput:
-        metric_columns = [metric.alias or metric.name for metric in metrics]
+        filter_codes = {
+            query_filter.metric_code for query_filter in filters if query_filter.metric_code
+        }
+        asks_for_customer_count = any(
+            token in question
+            for token in ("客户数", "客户数量", "去重客户", "几位客户", "多少位客户", "客户有多少")
+        )
+        metric_columns = [
+            metric.alias or metric.name
+            for metric in metrics
+            if not (asks_for_customer_count and metric.metric_code in filter_codes)
+        ]
         dimension_columns = [dimension.alias or dimension.name for dimension in dimensions]
         limit_match = re.search(r"(?:前\s*|top\s*)(\d+)", question, re.IGNORECASE)
         limit = int(limit_match.group(1)) if limit_match else 100
@@ -1020,18 +1109,31 @@ class RuleBasedQueryPlanActor:
         if {
             "trade_amount",
             "trade_fee",
+            "buy_amount",
+            "average_trade_amount",
             "trade_quantity",
             "bidirectional_trade_customer",
         } & all_codes:
             domains.add("trade")
             candidate_tables.update({"dwd_cust_tran_d", "dim_product"})
-        if {"net_cash_flow", "net_cash_inflow", "transfer_amount", "assignment_amount"} & all_codes:
+        finance_metric_codes = {
+            "net_cash_flow",
+            "net_cash_inflow",
+            "cash_in_amount",
+            "transfer_amount",
+            "assignment_amount",
+        }
+        if finance_metric_codes & all_codes:
             domains.add("finance")
             candidate_tables.add("dws_cust_fin_d")
         if "profit_loss" in all_codes:
             domains.update({"asset", "finance"})
             candidate_tables.update({"dws_cust_aset_d", "dws_cust_fin_d"})
-        if {"holding_market_value", "distinct_holding_product_count"} & all_codes:
+        if {
+            "holding_market_value",
+            "holding_quantity",
+            "distinct_holding_product_count",
+        } & all_codes:
             domains.add("holding")
             candidate_tables.update({"dwd_cust_hold_d", "dim_product"})
 
@@ -1174,10 +1276,12 @@ class RuleBasedQueryPlanActor:
             daily_average_position = prefix.rfind("日均资产")
             metric_positions = {
                 "daily_average_asset": daily_average_position,
-            "trade_fee": max(prefix.rfind(token) for token in ("交易费用", "手续费")),
-            "trade_amount": max(
-                prefix.rfind(token) for token in ("交易", "成交", "买入", "卖出", "交易量")
-            ),
+                "cash_in_amount": prefix.rfind("现金流入"),
+                "trade_fee": max(prefix.rfind(token) for token in ("交易费用", "手续费")),
+                "trade_amount": max(
+                    prefix.rfind(token)
+                    for token in ("交易", "成交", "买入", "卖出", "交易量")
+                ),
                 "holding_market_value": max(prefix.rfind(token) for token in ("持仓", "市值")),
                 # The shorter “资产” token is part of “日均资产”; it must not
                 # override the more specific metric phrase.
@@ -1190,6 +1294,8 @@ class RuleBasedQueryPlanActor:
                 metric_code = nearest_metric
             elif "日均资产" in suffix:
                 metric_code = "daily_average_asset"
+            elif "现金流入" in suffix:
+                metric_code = "cash_in_amount"
             elif any(token in suffix for token in ("交易费用", "手续费")):
                 metric_code = "trade_fee"
             elif any(token in suffix for token in ("交易", "成交", "买入", "卖出", "交易量")):
@@ -1202,7 +1308,8 @@ class RuleBasedQueryPlanActor:
             operator = (
                 ">="
                 if any(
-                    marker in comparison_context for marker in ("不少于", "不低于", "至少", ">=")
+                    marker in comparison_context
+                    for marker in ("不少于", "不低于", "至少", "达到", "达", ">=")
                 )
                 else ">"
             )

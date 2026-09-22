@@ -7,6 +7,7 @@ import pytest
 from app.agents.llm_query_plan_actor import LLMQueryPlanActor, QueryPlanBuildResult
 from app.agents.llm_result_critic import LLMResultCriticResult
 from app.agents.llm_sql_actor import LLMSQLActor
+from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.data.dataset_adapter import DatasetAdapter, DatasetManifest
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
@@ -65,6 +66,43 @@ def test_rule_plan_uses_official_asset_and_trade_tables() -> None:
     assert {"ads_cust_info_d", "dws_cust_aset_d", "dwd_cust_tran_d"} <= set(
         plan.data_requirements.candidate_tables
     )
+
+
+def test_rule_plan_parses_abbreviated_end_date_and_specialized_metrics() -> None:
+    plan = RuleBasedQueryPlanActor().build(
+        "2026年3月16日至31日，请按一级营业部统计买入金额，展示前10个营业部。"
+    )
+    assert plan.time_range is not None
+    assert (plan.time_range.start, plan.time_range.end) == ("20260316", "20260331")
+    assert {metric.metric_code for metric in plan.metrics} == {"buy_amount"}
+
+
+def test_sql_actor_uses_customer_period_average_and_finance_aggregate_templates() -> None:
+    actor = LLMSQLActor(llm_service=None)
+    average_plan = RuleBasedQueryPlanActor().build(
+        "2026年3月16日至31日，发生交易客户的平均交易金额是多少？"
+    )
+    average = asyncio.run(actor.build(average_plan.question, average_plan))
+    assert average.source == "rule_fallback"
+    assert average.draft is not None
+    assert "GROUP BY pty_id" in average.draft.sql
+    assert "AVG(trade_amount)" in average.draft.sql
+
+    finance_plan = RuleBasedQueryPlanActor().build(
+        "2026年3月16日至31日，客户现金流入金额合计是多少？"
+    )
+    finance = asyncio.run(actor.build(finance_plan.question, finance_plan))
+    assert finance.source == "rule_fallback"
+    assert finance.draft is not None
+    assert "SUM(COALESCE(f.cash_in, 0))" in finance.draft.sql
+
+    threshold_plan = RuleBasedQueryPlanActor().build(
+        "2026年3月16日至31日，累计现金流入达到5万元的客户有多少位？"
+    )
+    threshold = asyncio.run(actor.build(threshold_plan.question, threshold_plan))
+    assert threshold.source == "rule_fallback"
+    assert threshold.draft is not None
+    assert "HAVING SUM(COALESCE(f.cash_in, 0)) >= 50000" in threshold.draft.sql
 
 
 def test_rule_plan_understands_official_quarter_and_age_distribution() -> None:
@@ -453,6 +491,35 @@ def test_result_critic_failure_is_advisory_after_hard_result_checks() -> None:
     assert merged.passed
     assert merged.checks[-1].passed
     assert "Advisory ResultCritic finding" in merged.checks[-1].reason
+
+
+def test_query_plan_semantic_warning_is_advisory_but_security_stays_blocking() -> None:
+    semantic_warning = ReviewDecision(
+        passed=False,
+        score=55,
+        stage="query_plan_review",
+        error_type="missing_metadata_context",
+        reason="A synonym was not retrieved.",
+        confidence=0.8,
+    )
+    advisory = QueryService._make_plan_critic_decision_advisory(semantic_warning)
+    assert advisory.passed
+    assert advisory.score == 75
+    assert "Advisory semantic review" in advisory.reason
+
+    security_failure = semantic_warning.model_copy(
+        update={"error_type": "unsafe_sensitive_output"}
+    )
+    assert not QueryService._make_plan_critic_decision_advisory(security_failure).passed
+
+
+def test_low_query_plan_confidence_is_not_a_hard_rejection() -> None:
+    plan = RuleBasedQueryPlanActor().build("统计客户数量").model_copy(
+        update={"confidence": 0.1}
+    )
+    checks = QueryPlanHardValidator().review(plan).hard_checks
+    assert all(check.passed for check in checks)
+    assert any("confidence_advisory" in check.evidence for check in checks)
 
 
 def test_sql_actor_reuses_only_exact_official_qa_reference() -> None:

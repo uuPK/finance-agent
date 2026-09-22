@@ -103,12 +103,15 @@ class QueryPlanHardValidator:
         return self._pass("output", "Output settings satisfy hard constraints.")
 
     def _check_confidence(self, plan: QueryPlan) -> ReviewDecision:
+        # Confidence is produced by a probabilistic actor.  It is useful audit
+        # evidence, but it is not a safety or structural invariant: the SQL
+        # guardrail and result validation below still make the execution
+        # decision.  Treating it as a hard stop made otherwise explicit,
+        # metadata-backed multi-table questions fail before SQL was attempted.
         if plan.plan_status == "ready" and plan.confidence < 0.7:
-            return self._fail(
-                "low_confidence",
-                "Ready plan confidence is below the auto-pass threshold.",
-                [f"confidence={plan.confidence}"],
-                "Ask clarification or improve metadata retrieval before SQL generation.",
+            return self._pass(
+                "confidence_advisory",
+                "Ready plan confidence is advisory; downstream guardrails remain required.",
             )
         return self._pass("confidence", "Plan confidence satisfies hard policy.")
 

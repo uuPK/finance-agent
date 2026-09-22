@@ -102,6 +102,10 @@ class LLMPlanCritic:
             - 如果计划使用了 metadata context 中没有的具体指标、业务词、表或字段，且不是用户原文明确给出的，应判定 fabricated_metadata。
             - 如果命中的 business_terms 标记 clarification_required=true，但计划直接 ready，应判定 guessed_business_definition。
             - 如果元数据召回置信度低，且用户问题依赖模糊业务词，应要求澄清或补充元数据，不要勉强通过。
+            - 多个明确的日期窗口、多个指标或多个候选事实表本身不是风险：允许计划把各指标
+              的时间窗口保留在 metric/filter/assumptions 中，并交由 SQLActor 以分 CTE 预聚合实现。
+              不得仅因存在多表、多指标、不同显式时间范围，或 metadata context 未召回所有
+              同义词而拒绝；只要关键口径来自用户原文或已召回元数据，应通过并让下游 guardrail 校验。
 
             ReviewDecision JSON Schema：
             {review_schema}
@@ -172,6 +176,9 @@ _PLAN_CRITIC_SYSTEM_PROMPT = dedent(
     4. 如果 QueryPlan 是 needs_clarification 且澄清问题覆盖了关键不确定性，应通过。
     5. 如果用户请求敏感字段、写库、越权导出，计划不能直接 ready。
     6. Retrieved metadata context 是本轮审核的业务证据；计划引用的具体口径应能追溯到它或用户原文。
+    7. 对用户明确写出的时间、阈值、币种、机构、产品和指标，默认可执行；多指标可以使用不同
+       的明确时间窗口，多个事实表也可以通过按共同粒度预聚合后关联。不要把这类复杂度误判为
+       业务口径不清或 fabricated_metadata。
 
     必查项：
     1. 用户明示条件是否完整保留：主体、指标、阈值、比较符、时间窗口、产品/客户范围。

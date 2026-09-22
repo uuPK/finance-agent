@@ -1,0 +1,503 @@
+Finance Agent Windows 部署说明
+==============================
+
+文档用途
+--------
+
+本文用于在另一台全新的 Windows 10 或 Windows 11 64 位电脑上安装并运行
+Finance Agent。所有示例命令均在 PowerShell 中执行，示例安装目录为：
+
+    D:\finance-agent
+
+本部署方式适用于本地演示、开发和赛事验收。默认服务地址如下：
+
+    前端页面        http://127.0.0.1:5173
+    后端接口        http://127.0.0.1:8000
+    后端接口文档    http://127.0.0.1:8000/docs
+    PostgreSQL      127.0.0.1:5432
+
+重要说明
+--------
+
+1. 项目数据库使用 Docker 运行，不需要单独安装 PostgreSQL。
+2. 官方脱敏数据已保存在 data\official\htsc 目录中。
+3. .env 文件包含模型密钥，禁止提交到 Git 或发送给无关人员。
+4. 首次初始化会创建数据库结构、导入官方数据，并生成 257 条活跃评测案例。
+5. 本文中的命令应逐段执行。上一条命令成功后再执行下一条。
+
+
+一、安装前准备
+==============
+
+1. 硬件和网络
+--------------
+
+建议配置：
+
+    64 位 Windows 10 或 Windows 11
+    8 GB 或以上内存
+    15 GB 或以上可用磁盘空间
+    可访问 GitHub、Python 软件源、npm 软件源和所选模型服务的网络
+    具备安装软件和启动 Docker Desktop 的权限
+
+2. 安装必要软件
+---------------
+
+以管理员身份打开 PowerShell，执行：
+
+    winget install --id Git.Git --exact --source winget
+    winget install --id Docker.DockerDesktop --exact --source winget
+    winget install --id OpenJS.NodeJS.LTS --exact --source winget
+    winget install --id astral-sh.uv --exact --source winget
+
+安装完成后关闭 PowerShell，再重新打开一个普通 PowerShell 窗口。
+
+如果 Docker Desktop 提示需要 WSL 2，请以管理员身份执行：
+
+    wsl --install
+
+执行完成后重启电脑，然后启动 Docker Desktop，等待界面显示 Engine running。
+
+3. 检查软件是否可用
+-------------------
+
+执行：
+
+    git --version
+    docker --version
+    docker compose version
+    node --version
+    npm --version
+    uv --version
+
+以上命令均应正常显示版本号。推荐使用 Node.js 22 或更新的 LTS 版本。
+
+安装项目使用的 Python 3.13：
+
+    uv python install 3.13
+
+
+二、下载项目
+============
+
+1. 克隆 GitHub 仓库
+------------------
+
+执行：
+
+    Set-Location D:\
+    git clone https://github.com/uuPK/finance-agent.git finance-agent
+    Set-Location D:\finance-agent
+
+检查当前分支和文件状态：
+
+    git status --short --branch
+
+正常情况下应位于 main 分支，且没有本地修改。
+
+2. 检查官方数据文件
+-------------------
+
+执行：
+
+    Test-Path .\data\official\htsc\表描述.sql
+    Test-Path .\data\official\htsc\Q&A.xlsx
+    Get-ChildItem .\data\official\htsc\*.csv | Measure-Object
+
+前两条命令应返回 True，最后一条命令的 Count 应为 8。
+
+
+三、配置环境变量和模型密钥
+==========================
+
+1. 创建本机配置文件
+-------------------
+
+在项目根目录 D:\finance-agent 执行：
+
+    Copy-Item .env.example .env
+    notepad .env
+
+2. 使用 DeepSeek
+---------------
+
+默认配置使用 DeepSeek。至少确认以下内容，并将密钥替换为自己的真实密钥：
+
+    LLM_PROVIDER=deepseek
+    LLM_MODEL=deepseek-chat
+    LLM_BASE_URL=https://api.deepseek.com
+    DEEPSEEK_API_KEY=在此填写真实密钥
+
+密钥值不要添加引号，不要在等号两侧添加空格。
+
+3. 使用 OpenAI 兼容接口
+----------------------
+
+如需改用 OpenAI，将对应配置修改为：
+
+    LLM_PROVIDER=openai
+    LLM_MODEL=填写账号可用的模型名称
+    LLM_BASE_URL=https://api.openai.com/v1
+    OPENAI_API_KEY=在此填写真实密钥
+
+4. 需要网络代理时
+-----------------
+
+只有在模型服务必须经过 HTTP 代理时才填写：
+
+    LLM_PROXY_URL=http://127.0.0.1:7890
+
+不需要代理时保持：
+
+    LLM_PROXY_URL=
+
+保存并关闭记事本。修改 .env 后必须重启后端服务才能生效。
+
+
+四、首次初始化数据库和官方数据
+==============================
+
+推荐使用项目提供的自动初始化脚本。该脚本会完成以下操作：
+
+    启动 PostgreSQL 16 容器
+    创建数据库表结构
+    安装并锁定后端依赖
+    导入 8 个官方 CSV 和 Q&A.xlsx
+    生成基础回归集、扩展集和第一至第五轮挑战集
+    输出各评测集的活跃案例数量
+
+确认 Docker Desktop 已启动，然后在项目根目录执行：
+
+    Set-Location D:\finance-agent
+    Set-ExecutionPolicy -Scope Process Bypass
+    .\scripts\bootstrap_official_data.ps1
+
+首次执行需要下载 PostgreSQL 镜像和 Python 依赖，耗时取决于网络速度。
+命令执行期间不要关闭 PowerShell 或 Docker Desktop。
+
+如果官方数据位于其他已获授权的目录，可执行：
+
+    .\scripts\bootstrap_official_data.ps1 -DataDir "E:\authorized-data\htsc"
+
+指定目录中必须直接包含表描述.sql、Q&A.xlsx 和 8 个 CSV 文件。
+
+
+五、验收数据库初始化结果
+========================
+
+1. 检查容器状态
+---------------
+
+执行：
+
+    Set-Location D:\finance-agent
+    docker compose ps
+
+finance-agent-postgres 的状态应为 running 或 healthy。
+
+2. 检查评测案例总数
+-------------------
+
+执行：
+
+    docker exec finance-agent-postgres psql -U finance_agent -d finance_agent -c "select count(*) as active_cases from evaluation.eval_cases where is_active;"
+
+当前自动初始化版本的预期结果为：
+
+    active_cases = 257
+
+3. 检查各评测集数量
+-------------------
+
+执行：
+
+    docker exec finance-agent-postgres psql -U finance_agent -d finance_agent -c "select source_type, count(*) from evaluation.eval_cases where is_active group by source_type order by source_type;"
+
+预期包含：
+
+    official                  7
+    official_derived         60
+    official_extension       30
+    official_challenge       30
+    official_challenge_v2    30
+    official_challenge_v3    30
+    official_challenge_v4    30
+    official_challenge_v5    40
+
+如果总数或分组数量不正确，请重新执行自动初始化脚本。该脚本按当前官方数据设计，
+可以重复执行。
+
+
+六、安装前端依赖
+================
+
+打开一个新的 PowerShell 窗口，执行：
+
+    Set-Location D:\finance-agent\frontend
+    npm ci
+
+npm ci 会严格按照 package-lock.json 安装依赖。安装成功后不要删除
+package-lock.json。
+
+
+七、启动系统
+============
+
+系统运行时需要保留两个 PowerShell 窗口，分别运行后端和前端。
+
+1. 窗口 A：启动后端
+------------------
+
+执行：
+
+    Set-Location D:\finance-agent\backend
+    uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+看到 Uvicorn running on http://127.0.0.1:8000 后，后端启动成功。
+
+2. 窗口 B：启动前端
+------------------
+
+执行：
+
+    Set-Location D:\finance-agent\frontend
+    npm run dev -- --host 127.0.0.1 --port 5173
+
+看到 Local: http://127.0.0.1:5173 后，前端启动成功。
+
+3. 打开系统
+-----------
+
+在浏览器访问：
+
+    http://127.0.0.1:5173
+
+不要直接使用文件方式打开 frontend 目录中的 HTML。前端必须通过上述 npm 命令运行。
+
+
+八、服务验收
+============
+
+打开第三个 PowerShell 窗口，执行：
+
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+    Invoke-RestMethod http://127.0.0.1:8000/api/llm/status
+
+第一条命令应返回 status 为 ok。
+第二条命令应显示模型提供商、模型名称以及 api_key_configured 为 True。
+
+浏览器中可使用以下问题做一次功能验证：
+
+    2026年第一季度，客户交易金额合计是多少？
+
+页面应显示查询计划、SQL 审核、执行和结果验证过程。模型调用结果会受到网络、
+API 额度和模型服务状态影响。
+
+
+九、日常启动和停止
+==================
+
+1. 日常启动
+-----------
+
+先启动 Docker Desktop，再执行：
+
+    Set-Location D:\finance-agent
+    docker compose up -d postgres
+
+然后分别按第七节启动后端和前端。不需要每天重新导入数据或重新安装依赖。
+
+2. 停止前端和后端
+-----------------
+
+在两个运行窗口中分别按 Ctrl+C。
+
+3. 停止数据库但保留数据
+-----------------------
+
+执行：
+
+    Set-Location D:\finance-agent
+    docker compose stop postgres
+
+4. 禁止误用的数据删除命令
+-------------------------
+
+以下命令会删除 PostgreSQL 数据卷、官方数据导入结果、审计记录和评测记录：
+
+    docker compose down -v
+
+除非已经确认要清空全部本地数据库，否则不要执行该命令。删除后必须重新执行第四节。
+
+
+十、更新项目
+============
+
+更新前先停止前端和后端，并确认没有需要保留的本地代码修改：
+
+    Set-Location D:\finance-agent
+    git status --short
+    git pull --ff-only
+
+更新后同步后端和前端依赖：
+
+    Set-Location D:\finance-agent\backend
+    uv sync --extra dev --frozen
+
+    Set-Location D:\finance-agent\frontend
+    npm ci
+
+如果版本更新说明要求数据库迁移，应先备份数据库，再按说明执行迁移。新电脑首次部署
+只需要运行自动初始化脚本，不要额外逐个执行 migrations 目录中的旧迁移文件。
+
+对于已经部署过官方数据库、只需要补充现金流入和女性客户语义元数据的环境，可在
+确认迁移文件存在并完成备份后执行：
+
+    Set-Location D:\finance-agent
+    Get-Content -Raw .\backend\db\migrations\010_add_cash_inflow_and_gender_terms.sql | docker exec -i finance-agent-postgres psql -U finance_agent -d finance_agent -v ON_ERROR_STOP=1
+
+
+十一、可选的代码质量检查
+========================
+
+后端检查：
+
+    Set-Location D:\finance-agent\backend
+    uv run ruff check app tests
+    uv run pytest
+
+前端检查：
+
+    Set-Location D:\finance-agent\frontend
+    npm run lint
+    npm run build
+
+全部命令成功后，说明依赖、代码和构建环境基本正常。
+
+
+十二、常见故障排查
+==================
+
+1. docker 命令不存在
+--------------------
+
+关闭并重新打开 PowerShell。如果仍然不存在，请确认 Docker Desktop 已正确安装并已
+启动。必要时重启电脑。
+
+2. Docker Desktop 无法启动
+--------------------------
+
+确认 BIOS 中已启用虚拟化，并以管理员身份执行：
+
+    wsl --status
+    wsl --update
+
+更新后重启 Docker Desktop。
+
+3. PostgreSQL 无法连接
+----------------------
+
+执行：
+
+    Set-Location D:\finance-agent
+    docker compose ps
+    docker compose logs postgres --tail 100
+
+如果本机 5432 端口已被其他 PostgreSQL 占用，可修改 docker-compose.yml 中左侧的
+宿主机端口，同时修改 .env 中 DATABASE_URL 的端口。修改后重新启动数据库和后端。
+
+4. PowerShell 禁止执行脚本
+--------------------------
+
+仅为当前 PowerShell 进程临时放行：
+
+    Set-ExecutionPolicy -Scope Process Bypass
+
+然后重新执行：
+
+    .\scripts\bootstrap_official_data.ps1
+
+5. uv sync 下载失败
+-------------------
+
+确认网络可以访问 Python 软件源，然后在 backend 目录重试：
+
+    Set-Location D:\finance-agent\backend
+    uv sync --extra dev --frozen
+
+不要删除 uv.lock，也不要在部署时随意升级依赖版本。
+
+6. npm ci 下载失败
+------------------
+
+确认网络可以访问 npm 软件源，然后重试：
+
+    Set-Location D:\finance-agent\frontend
+    npm cache verify
+    npm ci
+
+不要使用 npm install 改写锁文件。
+
+7. 前端能打开但接口报错
+-----------------------
+
+先执行：
+
+    Invoke-RestMethod http://127.0.0.1:8000/api/health
+
+如果失败，检查后端窗口中的报错。默认前端端口必须为 5173，后端端口必须为 8000，
+这样才能匹配当前 Vite 代理和 CORS 配置。
+
+8. 模型调用失败
+---------------
+
+依次检查：
+
+    .env 中的密钥是否正确且没有引号或多余空格
+    LLM_PROVIDER、LLM_MODEL 和 LLM_BASE_URL 是否互相匹配
+    Invoke-RestMethod http://127.0.0.1:8000/api/llm/status 是否显示密钥已配置
+    当前 API Key 是否有可用额度和模型权限
+    当前网络是否可访问模型服务
+    受限网络环境下 LLM_PROXY_URL 是否正确
+
+修改 .env 后按 Ctrl+C 停止后端，然后重新启动后端。
+
+9. 端口被占用
+-------------
+
+执行：
+
+    Get-NetTCPConnection -LocalPort 5432,8000,5173 -ErrorAction SilentlyContinue | Select-Object LocalPort,State,OwningProcess
+
+确认占用进程后再决定是否关闭。建议优先释放默认端口，避免同时修改数据库连接、
+前端代理和 CORS 配置。
+
+10. 需要完全重新初始化数据库
+----------------------------
+
+警告：以下操作会永久删除当前本地数据库内容。确认不需要保留审计和评测记录后执行：
+
+    Set-Location D:\finance-agent
+    docker compose down -v
+    docker compose up -d postgres
+    .\scripts\bootstrap_official_data.ps1
+
+
+十三、部署完成检查清单
+======================
+
+逐项确认：
+
+    Git、Docker、Node.js、npm 和 uv 均能显示版本号
+    Docker Desktop 显示 Engine running
+    项目已克隆到 D:\finance-agent
+    .env 已创建并填写有效模型密钥
+    官方数据目录包含表描述.sql、Q&A.xlsx 和 8 个 CSV
+    finance-agent-postgres 容器处于 healthy 状态
+    数据库中有 257 条活跃评测案例
+    后端健康检查返回 status 为 ok
+    模型状态显示 api_key_configured 为 True
+    前端页面可以通过 http://127.0.0.1:5173 打开
+    测试问题能够完成查询并显示结果
+
+以上项目全部通过后，安装完成。

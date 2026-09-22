@@ -28,6 +28,7 @@ try {
         uv run python .\db\load_official_challenge_cases.py
         uv run python .\db\load_official_challenge_v3_cases.py
         uv run python .\db\load_official_challenge_v4_cases.py
+        uv run python .\db\load_official_challenge_v5_cases.py
     }
     finally {
         Pop-Location

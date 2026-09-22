@@ -234,6 +234,14 @@ class LLMSQLActor:
         if cash_asset_draft is not None:
             return cash_asset_draft
 
+        trade_metric_draft = LLMSQLActor._trade_metric_draft(query_plan, start, end)
+        if trade_metric_draft is not None:
+            return trade_metric_draft
+
+        holding_quantity_draft = LLMSQLActor._holding_quantity_draft(query_plan, snapshot_date)
+        if holding_quantity_draft is not None:
+            return holding_quantity_draft
+
         threshold_customer_count_draft = LLMSQLActor._threshold_customer_count_draft(
             query_plan, start, end
         )
@@ -385,6 +393,88 @@ class LLMSQLActor:
         )
 
     @staticmethod
+    def _trade_metric_draft(
+        query_plan: QueryPlan, start: str | None, end: str | None
+    ) -> SQLDraft | None:
+        if not start or not end:
+            return None
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        dimensions = LLMSQLActor._group_dimensions(query_plan)
+        limit = query_plan.output.limit
+        if metric_codes == {"average_trade_amount"} and not dimensions:
+            return SQLDraft(
+                sql=dedent(
+                    f"""
+                    SELECT AVG(trade_amount) AS average_trade_amount
+                    FROM (
+                        SELECT pty_id, SUM(COALESCE(buy_amt, 0) + COALESCE(sell_amt, 0)) AS trade_amount
+                        FROM mart.dwd_cust_tran_d
+                        WHERE data_dt BETWEEN '{start}' AND '{end}'
+                        GROUP BY pty_id
+                    ) customer_trade
+                    LIMIT {limit}
+                    """
+                ).strip(),
+                dialect="postgres", tables=["dwd_cust_tran_d"], columns=["average_trade_amount"],
+                assumptions=["Average trade amount is calculated from each transacting customer's period total."], confidence=0.98,
+            )
+        if metric_codes == {"trade_fee"} and dimensions == ["ccy"]:
+            return LLMSQLActor._simple_trade_group_draft(
+                "ccy", "SUM(COALESCE(buy_fare, 0) + COALESCE(sell_fare, 0))", "trade_fee", start, end, limit
+            )
+        if metric_codes == {"buy_amount"} and dimensions == ["up_org_name"]:
+            return SQLDraft(
+                sql=dedent(
+                    f"""
+                    SELECT b.up_org_name, SUM(COALESCE(t.buy_amt, 0)) AS buy_amount
+                    FROM mart.dwd_cust_tran_d t
+                    JOIN mart.ads_cust_info_d c ON c.pty_id = t.pty_id
+                    JOIN mart.dim_branch b ON b.org_id = c.org_id
+                    WHERE t.data_dt BETWEEN '{start}' AND '{end}'
+                    GROUP BY b.up_org_name
+                    ORDER BY buy_amount DESC NULLS LAST, b.up_org_name
+                    LIMIT {limit}
+                    """
+                ).strip(), dialect="postgres",
+                tables=["dwd_cust_tran_d", "ads_cust_info_d", "dim_branch"],
+                columns=["up_org_name", "buy_amount"],
+                assumptions=["Buy amount uses buy_amt only and is grouped by the requested organization level."], confidence=0.98,
+            )
+        return None
+
+    @staticmethod
+    def _simple_trade_group_draft(
+        dimension: str, expression: str, alias: str, start: str, end: str, limit: int
+    ) -> SQLDraft:
+        return SQLDraft(
+            sql=dedent(
+                f"""
+                SELECT {dimension}, {expression} AS {alias}
+                FROM mart.dwd_cust_tran_d
+                WHERE data_dt BETWEEN '{start}' AND '{end}'
+                GROUP BY {dimension}
+                ORDER BY {alias} DESC NULLS LAST, {dimension}
+                LIMIT {limit}
+                """
+            ).strip(), dialect="postgres", tables=["dwd_cust_tran_d"], columns=[dimension, alias],
+            assumptions=["Trade metric is aggregated only after the requested period filter."], confidence=0.98,
+        )
+
+    @staticmethod
+    def _holding_quantity_draft(query_plan: QueryPlan, snapshot_date: str | None) -> SQLDraft | None:
+        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {"holding_quantity"}:
+            return None
+        if LLMSQLActor._group_dimensions(query_plan):
+            return None
+        return SQLDraft(
+            sql=("SELECT SUM(COALESCE(hold_cnt, 0)) AS holding_quantity\n"
+                 "FROM mart.dwd_cust_hold_d\n"
+                 f"WHERE data_dt = '{snapshot_date}'\nLIMIT {query_plan.output.limit}"),
+            dialect="postgres", tables=["dwd_cust_hold_d"], columns=["holding_quantity"],
+            assumptions=["Holding quantity is the sum of hold_cnt at the requested snapshot."], confidence=0.98,
+        )
+
+    @staticmethod
     def _threshold_customer_count_draft(
         query_plan: QueryPlan, start: str | None, end: str | None
     ) -> SQLDraft | None:
@@ -395,7 +485,7 @@ class LLMSQLActor:
             (
                 item
                 for item in query_plan.filters
-                if item.metric_code == "trade_fee"
+                if item.metric_code in {"trade_fee", "cash_in_amount", "net_cash_inflow"}
                 and item.operator in {">", ">=", "<", "<="}
                 and isinstance(item.value.normalized, (int, float))
             ),
@@ -403,6 +493,24 @@ class LLMSQLActor:
         )
         if threshold is None:
             return None
+        expressions = {
+            "trade_fee": (
+                "mart.dwd_cust_tran_d",
+                "t",
+                "SUM(COALESCE(t.buy_fare, 0) + COALESCE(t.sell_fare, 0))",
+            ),
+            "cash_in_amount": (
+                "mart.dws_cust_fin_d",
+                "f",
+                "SUM(COALESCE(f.cash_in, 0))",
+            ),
+            "net_cash_inflow": (
+                "mart.dws_cust_fin_d",
+                "f",
+                "SUM(COALESCE(f.cash_in, 0) - COALESCE(f.cash_out, 0))",
+            ),
+        }
+        table, alias, expression = expressions[threshold.metric_code]
         value = Decimal(str(threshold.value.normalized))
         threshold_sql = str(int(value)) if value == value.to_integral_value() else str(value)
         return SQLDraft(
@@ -410,19 +518,19 @@ class LLMSQLActor:
                 f"""
                 SELECT COUNT(*) AS customer_count
                 FROM (
-                    SELECT t.pty_id
-                    FROM mart.dwd_cust_tran_d t
-                    WHERE t.data_dt BETWEEN '{start}' AND '{end}'
-                    GROUP BY t.pty_id
-                    HAVING SUM(COALESCE(t.buy_fare, 0) + COALESCE(t.sell_fare, 0)) {threshold.operator} {threshold_sql}
+                    SELECT {alias}.pty_id
+                    FROM {table} {alias}
+                    WHERE {alias}.data_dt BETWEEN '{start}' AND '{end}'
+                    GROUP BY {alias}.pty_id
+                    HAVING {expression} {threshold.operator} {threshold_sql}
                 ) fee_threshold_customers
                 LIMIT {query_plan.output.limit}
                 """
             ).strip(),
             dialect="postgres",
-            tables=["dwd_cust_tran_d"],
+            tables=[table.rsplit(".", maxsplit=1)[-1]],
             columns=["customer_count"],
-            assumptions=["The cumulative trading-fee threshold is evaluated per customer before counting."],
+            assumptions=["The cumulative metric threshold is evaluated per customer before counting."],
             confidence=0.98,
         )
 
@@ -464,11 +572,38 @@ class LLMSQLActor:
 
     @staticmethod
     def _finance_group_draft(query_plan: QueryPlan, start: str | None, end: str | None) -> SQLDraft | None:
-        if not start or not end or {metric.metric_code for metric in query_plan.metrics} != {"net_cash_flow"}:
+        if not start or not end:
+            return None
+        metric_codes = {metric.metric_code for metric in query_plan.metrics}
+        if metric_codes not in ({"net_cash_flow"}, {"cash_in_amount"}):
             return None
         dimensions = LLMSQLActor._group_dimensions(query_plan)
-        if len(dimensions) != 1:
+        if len(dimensions) > 1:
             return None
+        if not dimensions:
+            if metric_codes == {"cash_in_amount"}:
+                expression, alias = "SUM(COALESCE(f.cash_in, 0))", "cash_in_amount"
+            else:
+                expression = (
+                    "SUM(COALESCE(f.cash_in, 0) + COALESCE(f.tran_in, 0) + COALESCE(f.assign_in, 0) "
+                    "- COALESCE(f.cash_out, 0) - COALESCE(f.tran_out, 0) - COALESCE(f.assign_out, 0))"
+                )
+                alias = "net_cash_flow"
+            return SQLDraft(
+                sql=dedent(
+                    f"""
+                    SELECT {expression} AS {alias}
+                    FROM mart.dws_cust_fin_d f
+                    WHERE f.data_dt BETWEEN '{start}' AND '{end}'
+                    LIMIT {query_plan.output.limit}
+                    """
+                ).strip(),
+                dialect="postgres",
+                tables=["dws_cust_fin_d"],
+                columns=[alias],
+                assumptions=["Finance aggregation follows the metric definition in the metadata."],
+                confidence=0.98,
+            )
         dimension = dimensions[0]
         if dimension in {"up_org_name", "org_name"}:
             select = f"b.{dimension}"
@@ -483,26 +618,30 @@ class LLMSQLActor:
             tables = ["dws_cust_fin_d", "ads_cust_info_d"]
         else:
             return None
-        expression = (
-            "SUM(COALESCE(f.cash_in, 0) + COALESCE(f.tran_in, 0) + COALESCE(f.assign_in, 0) "
-            "- COALESCE(f.cash_out, 0) - COALESCE(f.tran_out, 0) - COALESCE(f.assign_out, 0))"
-        )
+        if metric_codes == {"cash_in_amount"}:
+            expression, alias = "SUM(COALESCE(f.cash_in, 0))", "cash_in_amount"
+        else:
+            expression = (
+                "SUM(COALESCE(f.cash_in, 0) + COALESCE(f.tran_in, 0) + COALESCE(f.assign_in, 0) "
+                "- COALESCE(f.cash_out, 0) - COALESCE(f.tran_out, 0) - COALESCE(f.assign_out, 0))"
+            )
+            alias = "net_cash_flow"
         return SQLDraft(
             sql=dedent(
                 f"""
-                SELECT {select}, {expression} AS net_cash_flow
+                SELECT {select}, {expression} AS {alias}
                 FROM mart.dws_cust_fin_d f
                 {joins}
                 WHERE f.data_dt BETWEEN '{start}' AND '{end}'
                 GROUP BY {select}
-                ORDER BY net_cash_flow DESC NULLS LAST, {select}
+                ORDER BY {alias} DESC NULLS LAST, {select}
                 LIMIT {query_plan.output.limit}
                 """
             ).strip(),
             dialect="postgres",
             tables=tables,
-            columns=[dimension, "net_cash_flow"],
-            assumptions=["Net cash flow follows the official six-leg inflow/outflow definition."],
+            columns=[dimension, alias],
+            assumptions=["Finance aggregation follows the metric definition in the metadata."],
             confidence=0.98,
         )
 
@@ -868,6 +1007,9 @@ _SQL_ACTOR_SYSTEM_PROMPT = dedent(
       tran_in + tran_out，划拨金额为 assign_in + assign_out。
     - 对“累计交易额/持仓市值超过阈值的客户”，先按 pty_id 聚合，在 HAVING 中应用阈值，
       再关联客户、营业部或持仓事实表；不要对单笔明细直接筛选。
+    - 同时输出来自两个以上事实表的指标，或题目包含不同快照/期间时，必须分别按最终关联粒度
+      （通常为 pty_id）在独立 CTE 中先聚合，再关联这些 CTE；绝不能直接连接两个原始事实表，
+      否则会造成行数相乘和金额重复汇总。CTE 外层只能引用其定义的列别名，不能引用内部表别名。
     - “同时发生过买入和卖出”“持有至少 N 只不同产品”等客户级条件，必须先在 pty_id 粒度
       GROUP BY 并用 HAVING 表达，然后在外层统计 count(*)；不能在明细 WHERE 中同时筛选 buy_amt
       和 sell_amt，也不能把逐客户 GROUP BY 结果直接 LIMIT 1 当作客户总数。

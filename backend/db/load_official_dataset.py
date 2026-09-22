@@ -294,6 +294,15 @@ METRICS = [
         ["dws_cust_fin_d"],
     ),
     (
+        "cash_in_amount",
+        "现金流入金额",
+        "指定资金期间内现金流入金额，只汇总 cash_in，不扣减现金流出、转账或划拨。",
+        "sum(coalesce(dws_cust_fin_d.cash_in, 0))",
+        "sum",
+        "customer-date-source",
+        ["dws_cust_fin_d"],
+    ),
+    (
         "transfer_amount",
         "转账金额",
         "指定资金期间内转入金额与转出金额之和。",
@@ -384,6 +393,18 @@ TERMS = [
         "现金净流入",
         "现金净流入只使用 cash_in - cash_out；净资金流入才包含现金、转账和划拨。",
         ["现金净流", "现金流净流入"],
+        False,
+    ),
+    (
+        "现金流入",
+        "现金流入金额只使用 dws_cust_fin_d.cash_in；不应扣减 cash_out，也不包含转账或划拨。",
+        ["现金流入金额", "现金入账"],
+        False,
+    ),
+    (
+        "女性",
+        "客户性别“女”在 dim_public 中对应 code_type_id='500' 且 code='5000003'；查询客户表时使用 gender_cd='5000003'。",
+        ["女", "女性客户"],
         False,
     ),
     (

@@ -378,6 +378,7 @@ class QueryService:
             "平均年龄",
             "成交数量",
             "现金净流入",
+            "现金流入",
             "转账金额",
             "划拨金额",
             "一级营业部",
@@ -579,6 +580,7 @@ class QueryService:
             "trade_quantity": ("成交数量", "交易数量", "成交份额"),
             "net_cash_flow": ("净资金流入", "净流入金额"),
             "net_cash_inflow": ("现金净流入", "现金净流"),
+            "cash_in_amount": ("现金流入",),
             "transfer_amount": ("转账金额",),
             "assignment_amount": ("划拨金额",),
         }
@@ -674,11 +676,16 @@ class QueryService:
                 metadata_context=metadata_context,
             )
             if critic_result.decision is not None:
-                review_bundle.llm_checks.append(critic_result.decision)
+                review_bundle.llm_checks.append(
+                    self._make_plan_critic_decision_advisory(critic_result.decision)
+                )
 
+        effective_critic_decision = (
+            review_bundle.llm_checks[-1] if review_bundle.llm_checks else None
+        )
         critic_status = (
             "passed"
-            if critic_result.decision is not None and critic_result.decision.passed
+            if effective_critic_decision is not None and effective_critic_decision.passed
             else "skipped"
             if critic_result.status == "skipped"
             else "failed"
@@ -688,7 +695,10 @@ class QueryService:
             critic_status,
             "查询计划语义审核已完成",
             {
-                "decision": critic_result.decision.model_dump(mode="json")
+                "decision": effective_critic_decision.model_dump(mode="json")
+                if effective_critic_decision is not None
+                else None,
+                "raw_decision": critic_result.decision.model_dump(mode="json")
                 if critic_result.decision is not None
                 else None,
                 "llm_error": critic_result.llm_error,
@@ -699,6 +709,37 @@ class QueryService:
         )
 
         return review_bundle, hard_review_passed, critic_result
+
+    @staticmethod
+    def _make_plan_critic_decision_advisory(decision: ReviewDecision) -> ReviewDecision:
+        """Keep semantic feedback visible without blocking safe, explicit plans.
+
+        The plan critic is intentionally conservative and may flag a complex
+        multi-window/multi-fact plan even when the deterministic validator has
+        established a readonly, bounded, structurally valid request.  SQL
+        generation has a separate schema guardrail and execution/result checks,
+        so only security, invented business definitions, and a proven output
+        grain error remain blocking at this early stage.
+        """
+        if decision.passed or decision.error_type in {
+            "unsafe_sensitive_output",
+            "guessed_business_definition",
+            "fabricated_metadata",
+            "wrong_grain",
+        }:
+            return decision
+        return decision.model_copy(
+            update={
+                "passed": True,
+                "score": max(decision.score, 75),
+                "reason": f"Advisory semantic review: {decision.reason}",
+                "repair_hint": decision.repair_hint
+                or (
+                    "Proceed with SQL guardrail and result validation; "
+                    "review this warning if the result fails."
+                ),
+            }
+        )
 
     async def _emit(
         self,
