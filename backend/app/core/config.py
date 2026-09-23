@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     retrieval_dense_top_k: int = 30
     rerank_top_n: int = 30
     final_top_k: int = 16
+    schema_context_budget: int = 10000
+    stage_retrieval_budget: int = 2
+    global_retrieval_budget: int = 3
     model_name: str = "deepseek-chat"
     max_retry: int = 2
     sql_timeout_seconds: int = 30

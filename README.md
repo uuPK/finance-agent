@@ -143,6 +143,12 @@ uv sync --extra dev --frozen
 
 首次 Hybrid 查询会为元数据生成向量并写入 Milvus；后续只更新内容变化的文档。此过程会把元数据文本（包括 schema、指标定义和样例 SQL）发送给智谱，请仅在已授权该数据流向时启用。新部署默认仍是 `legacy`，可以用 `.env` 中的 `ENABLE_RERANKER=false` 做重排消融。修改 `.env` 后重启后端。
 
+### 预算化 Context Engine（Phase 3）
+
+`SchemaContextProvider` 保留完整的数据库元数据和 SQL Guardrail 白名单，但给模型的 `prompt_context` 是独立的工作集。它按指标定义、必需字段、JOIN、业务术语等优先级选择内容，先压缩非关键描述，再淘汰低优先级项；必需证据装不下时失败关闭，不悄悄删掉。`SCHEMA_CONTEXT_BUDGET` 默认 10000，是模型无关的 JSON token **估算值**，不是模型 API 返回的精确 token 用量。`context_stats` 记录预算、已用估算 token、条目数、去重、压缩、淘汰与检索次数。
+
+`SchemaContextProvider.expand(current, MissingContextRequest, question=..., query_plan=...)` 提供按类型定向补充接口：Hybrid 模式在 Milvus 内仅召回请求的文档类型，Legacy 模式使用同类 PostgreSQL 元数据兜底；补充结果重新合并、去重和预算裁剪。`STAGE_RETRIEVAL_BUDGET` 与 `GLOBAL_RETRIEVAL_BUDGET` 限制额外调用。当前阶段**尚未**让 Actor 自动发起扩展或让 Harness 路由失败；那属于后续 QueryPlan/Harness 阶段，现有 API/SSE 行为保持兼容。
+
 ## 本地质量检查与持续集成
 
 ```powershell

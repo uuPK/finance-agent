@@ -5,6 +5,7 @@ from decimal import Decimal
 from textwrap import dedent
 from typing import Any, Literal
 
+from app.context.models import for_prompt
 from app.llm.json_parser import extract_json_object
 from app.llm.protocols import SupportsLLMComplete
 from app.llm.schemas import LLMMessage
@@ -911,7 +912,7 @@ class LLMSQLActor:
             ensure_ascii=False,
             indent=2,
         )
-        metadata_json = json.dumps(metadata_context, ensure_ascii=False, indent=2)
+        metadata_json = json.dumps(for_prompt(metadata_context), ensure_ascii=False, indent=2)
 
         repair_context = ""
         if previous_sql and critic_feedback:

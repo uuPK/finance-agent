@@ -5,11 +5,14 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
+from app.context.builder import ContextBuilder, merge_contexts
+from app.context.targeted import legacy_targeted_retrieval
 from app.core.config import Settings, get_settings
 from app.db.session import engine as default_engine
 from app.metadata.hybrid_retriever import HybridMetadataRetriever
-from app.metadata.retriever import MetadataRetriever
+from app.metadata.retriever import MetadataRetrievalResult, MetadataRetriever
 from app.schemas.query_plan import QueryPlan
+from app.schemas.v2_protocol import MissingContextRequest
 
 
 class SchemaContextProvider:
@@ -31,11 +34,97 @@ class SchemaContextProvider:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    def expand(
+        self,
+        current: dict[str, Any],
+        request: MissingContextRequest,
+        *,
+        question: str | None = None,
+        query_plan: QueryPlan | None = None,
+    ) -> dict[str, Any]:
+        """Run one type-specific lookup and replace the budgeted working set.
+
+        This is a callable Context Engine operation for the future Harness.  It
+        does not let an actor call Milvus directly or bypass retrieval budgets.
+        """
+        if current.get("source") != "database":
+            return {**current, "context_expansion_status": "unavailable"}
+        old_stats = current.get("context_stats") or {}
+        used = int(old_stats.get("context_expansion_count", 0))
+        calls = int(old_stats.get("retrieval_calls", 1))
+        if (
+            used >= max(self.settings.stage_retrieval_budget, 0)
+            or calls >= max(self.settings.global_retrieval_budget, 0)
+        ):
+            return {**current, "context_expansion_status": "budget_exhausted"}
+        try:
+            with self.engine.connect() as connection:
+                retrieval = self._targeted_retrieval(connection, request)
+                kind = "join" if request.type == "join_path" else request.type
+                pinned = {
+                    str(row["doc_id"])
+                    for row in retrieval.evidence
+                    if str(row.get("doc_id", "")).startswith(f"{kind}:")
+                }
+                if not pinned:
+                    result = dict(current)
+                    result["context_stats"] = {
+                        **old_stats,
+                        "context_expansion_count": used + 1,
+                        "retrieval_calls": calls + 1,
+                    }
+                    result["context_expansion_status"] = "not_found"
+                    return result
+                addition = self._load_from_database(
+                    connection, query_plan, question, retrieval_override=retrieval
+                )
+            merged, new_duplicates = merge_contexts(current, addition)
+            bundle = ContextBuilder(self.settings.schema_context_budget).build(
+                merged,
+                question,
+                query_plan,
+                pinned_ids=set(sorted(pinned)[:3]),
+                expansion_count=used + 1,
+                dedup_count=int(old_stats.get("dedup_count", 0)) + new_duplicates,
+            )
+            merged["prompt_context"] = bundle.prompt_context
+            merged["context_stats"] = bundle.stats()
+            merged["context_stats"]["retrieval_calls"] = calls + 1
+            merged["context_bundle"] = {"item_ids": bundle.item_ids}
+            merged["retrieval_trace"] = bundle.retrieval_trace
+            merged["context_expansion_status"] = "expanded"
+            return merged
+        except Exception as exc:
+            result = dict(current)
+            result["context_stats"] = {
+                **old_stats,
+                "context_expansion_count": used + 1,
+                "retrieval_calls": calls + 1,
+            }
+            result["context_expansion_status"] = f"failed:{type(exc).__name__}"
+            return result
+
+    def _targeted_retrieval(
+        self, connection: Connection, request: MissingContextRequest
+    ) -> MetadataRetrievalResult:
+        if self.settings.retriever_mode == "hybrid":
+            try:
+                retriever = HybridMetadataRetriever(connection, self.settings)
+                try:
+                    return retriever.retrieve_targeted(request)
+                finally:
+                    retriever.close()
+            except Exception:
+                if connection.in_transaction():
+                    connection.rollback()
+        return legacy_targeted_retrieval(connection, request)
+
     def _load_from_database(
         self,
         connection: Connection,
         query_plan: QueryPlan | None,
         question: str | None,
+        retrieval_override: MetadataRetrievalResult | None = None,
     ) -> dict[str, Any]:
         physical_tables = self._load_physical_tables(connection)
         physical_columns = self._load_physical_columns(connection)
@@ -45,7 +134,9 @@ class SchemaContextProvider:
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
         reference_date = self._load_reference_date(connection)
-        if self.settings.retriever_mode == "hybrid" and question:
+        if retrieval_override is not None:
+            retrieval = retrieval_override
+        elif self.settings.retriever_mode == "hybrid" and question:
             try:
                 hybrid = HybridMetadataRetriever(connection, self.settings)
                 try:
@@ -89,7 +180,9 @@ class SchemaContextProvider:
 
         for table in physical_tables:
             table_name = table["table_name"]
-            if selected_table_names and table_name not in selected_table_names:
+            if (
+                selected_table_names or retrieval_override is not None
+            ) and table_name not in selected_table_names:
                 continue
 
             key = (table["table_schema"], table["table_name"])
@@ -132,7 +225,8 @@ class SchemaContextProvider:
         selected_metrics = [
             metric
             for metric in metrics
-            if not selected_metric_codes or metric.get("metric_code") in selected_metric_codes
+            if (selected_metric_codes or retrieval_override is None)
+            and (not selected_metric_codes or metric.get("metric_code") in selected_metric_codes)
         ]
         selected_business_terms = [
             term for term in business_terms if selected_terms and term.get("term") in selected_terms
@@ -140,7 +234,7 @@ class SchemaContextProvider:
         selected_join_relationships = [
             relationship
             for relationship in join_relationships
-            if not selected_join_pairs
+            if (not selected_join_pairs and retrieval_override is None)
             or (
                 relationship.get("left_table"),
                 relationship.get("left_column"),
@@ -158,7 +252,7 @@ class SchemaContextProvider:
             if not selected_examples or example.get("question") in selected_examples
         ]
 
-        return {
+        context = {
             "version": "1.0",
             "source": "database",
             "query_intent": query_plan.intent if query_plan else None,
@@ -188,6 +282,15 @@ class SchemaContextProvider:
                 "Customer name is sensitive and must never be selected or returned.",
             ],
         }
+        bundle = ContextBuilder(self.settings.schema_context_budget).build(
+            context, question, query_plan
+        )
+        context["prompt_context"] = bundle.prompt_context
+        context["context_stats"] = bundle.stats()
+        context["context_stats"]["retrieval_calls"] = 1
+        context["context_bundle"] = {"item_ids": bundle.item_ids}
+        context["retrieval_trace"] = bundle.retrieval_trace
+        return context
 
     @staticmethod
     def _required_semantic_tables(question: str | None, query_plan: QueryPlan | None) -> set[str]:
@@ -301,6 +404,7 @@ class SchemaContextProvider:
             connection,
             """
             select
+                id,
                 left_schema,
                 left_table,
                 left_column,

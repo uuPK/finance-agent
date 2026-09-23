@@ -17,8 +17,12 @@ from app.metadata.query_analysis import analyze_query
 from app.metadata.retriever import MetadataRetrievalResult
 from app.metadata.zhipu_retrieval import RerankerProtocol, ZhipuRetrievalClient
 from app.schemas.query_plan import QueryPlan
+from app.schemas.v2_protocol import MissingContextRequest
 
-_FORMULA_COLUMN_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z][A-Za-z0-9_]*)\b")
+_FORMULA_COLUMN_RE = re.compile(
+    r"\b(?:[A-Za-z][A-Za-z0-9_]*\.)?([A-Za-z][A-Za-z0-9_]*)\."
+    r"([A-Za-z][A-Za-z0-9_]*)\b"
+)
 
 
 class HybridMetadataRetriever:
@@ -61,7 +65,8 @@ class HybridMetadataRetriever:
                 close()
 
     def retrieve(
-        self, question: str, query_plan: QueryPlan | None = None
+        self, question: str, query_plan: QueryPlan | None = None,
+        target_request: MissingContextRequest | None = None,
     ) -> MetadataRetrievalResult:
         if not question.strip():
             raise ValueError("Hybrid retrieval requires a non-empty question")
@@ -70,19 +75,34 @@ class HybridMetadataRetriever:
             raise RuntimeError("No active metadata documents exist in PostgreSQL")
         by_id = {doc.doc_id: doc for doc in documents}
         analysis = analyze_query(question)
-        expression = candidate_filter(analysis)
+        target_type = (
+            "join" if target_request and target_request.type == "join_path"
+            else target_request.type if target_request else None
+        )
+        expression = (
+            f'doc_type == "{target_type}"' if target_type else candidate_filter(analysis)
+        )
         index_sync = self.store.sync(documents)
         lexical_query = " ".join((analysis.rewritten_query, *analysis.keywords))[:4096]
-        bm25_ids = self.store.search_bm25(
-            lexical_query, self.settings.retrieval_bm25_top_k, expression
-        )
-        dense_ids = self.store.search_dense(
-            analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression
-        )
+        if target_request:
+            bm25_ids = self.store.search_bm25(
+                lexical_query, self.settings.retrieval_bm25_top_k, expression, False
+            )
+            dense_ids = self.store.search_dense(
+                analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression, False
+            )
+        else:
+            bm25_ids = self.store.search_bm25(
+                lexical_query, self.settings.retrieval_bm25_top_k, expression
+            )
+            dense_ids = self.store.search_dense(
+                analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression
+            )
         ranked = [
             item
             for item in reciprocal_rank_fusion(bm25_ids, dense_ids)
             if item.doc_id in by_id
+            and (not target_request or self._target_matches(by_id[item.doc_id], target_request))
         ]
         if not ranked:
             raise RuntimeError("Milvus returned no metadata candidates")
@@ -162,7 +182,31 @@ class HybridMetadataRetriever:
             index_sync=index_sync,
             query_plan=query_plan,
             rerank_error=rerank_error,
+            require_table=target_request is None,
         )
+
+    def retrieve_targeted(self, request: MissingContextRequest) -> MetadataRetrievalResult:
+        query = " ".join(
+            part for part in (request.concept, request.from_table, request.to_table) if part
+        )
+        return self.retrieve(query, target_request=request)
+
+    @staticmethod
+    def _target_matches(doc: MetadataDocument, request: MissingContextRequest) -> bool:
+        kind = "join" if request.type == "join_path" else request.type
+        if doc.doc_type != kind:
+            return False
+        row = doc.metadata
+        if request.type == "column" and request.from_table:
+            return row.get("table_name") == request.from_table
+        if request.type == "join_path":
+            endpoints = {row.get("left_table"), row.get("right_table")}
+            return all(
+                endpoint in endpoints
+                for endpoint in (request.from_table, request.to_table)
+                if endpoint
+            )
+        return True
 
     def _materialize(
         self,
@@ -173,6 +217,7 @@ class HybridMetadataRetriever:
         index_sync: dict[str, int],
         query_plan: QueryPlan | None,
         rerank_error: str | None,
+        require_table: bool = True,
     ) -> MetadataRetrievalResult:
         by_id = {doc.doc_id: doc for doc in documents}
         selected_ids = {item.doc_id for item in selected}
@@ -192,9 +237,10 @@ class HybridMetadataRetriever:
 
         # QueryAnalysis domains are hints, not exclusions.  Ground one physical table
         # per explicitly detected domain even when examples dominate rerank scores.
-        for doc in documents:
-            if doc.doc_type == "table" and doc.domain in analysis["domains"]:
-                add(doc.doc_id, "query_domain_anchor")
+        if require_table:
+            for doc in documents:
+                if doc.doc_type == "table" and doc.domain in analysis["domains"]:
+                    add(doc.doc_id, "query_domain_anchor")
 
         # Grounded dependency expansion: metrics/columns/joins need their physical tables.
         # Example SQL is advisory and must not widen the executable table allowlist.
@@ -218,14 +264,15 @@ class HybridMetadataRetriever:
             for doc_id in selected_ids
             if by_id[doc_id].doc_type == "table"
         }
-        if not table_names:
+        if not table_names and require_table:
             raise RuntimeError("Hybrid retrieval selected no grounded physical tables")
-        for doc in documents:
-            if doc.doc_type != "join":
-                continue
-            row = doc.metadata
-            if row["left_table"] in table_names and row["right_table"] in table_names:
-                add(doc.doc_id, "join_path_closure")
+        if require_table:
+            for doc in documents:
+                if doc.doc_type != "join":
+                    continue
+                row = doc.metadata
+                if row["left_table"] in table_names and row["right_table"] in table_names:
+                    add(doc.doc_id, "join_path_closure")
 
         ordered_ids = [item.doc_id for item in selected]
         ordered_ids.extend(sorted(selected_ids - set(ordered_ids)))

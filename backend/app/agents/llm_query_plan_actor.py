@@ -5,6 +5,7 @@ from textwrap import dedent
 from typing import Any, Literal
 
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
+from app.context.models import for_prompt
 from app.llm.json_parser import extract_json_object
 from app.llm.protocols import SupportsLLMComplete
 from app.llm.schemas import LLMMessage
@@ -236,6 +237,7 @@ class LLMQueryPlanActor:
         ]
 
     def _metadata_summary(self, metadata_context: dict[str, Any]) -> dict[str, Any]:
+        metadata_context = for_prompt(metadata_context)
         retrieval = metadata_context.get("retrieval")
         tables = metadata_context.get("tables")
         metrics = metadata_context.get("metrics")

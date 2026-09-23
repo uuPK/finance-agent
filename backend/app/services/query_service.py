@@ -152,7 +152,9 @@ class QueryService:
                 **self._build_actor_details(build_result, build_results),
             },
         )
-        metadata_context = self._load_metadata_context(request.question, query_plan)
+        metadata_context = self._load_metadata_context(
+            request.question, query_plan, previous_context=metadata_context
+        )
         review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
             query_plan, metadata_context, attempt=0
         )
@@ -200,7 +202,9 @@ class QueryService:
             )
 
             query_plan = build_result.plan
-            metadata_context = self._load_metadata_context(request.question, query_plan)
+            metadata_context = self._load_metadata_context(
+                request.question, query_plan, previous_context=metadata_context
+            )
             if build_result.source != "llm":
                 review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
                     query_plan, metadata_context, attempt=repair_count
@@ -240,7 +244,9 @@ class QueryService:
             status = "needs_clarification"
             answer = "当前问题需要进一步明确后才能生成可靠查询。"
         else:
-            sql_loop_result = await self._run_sql_loop(query_id, request.question, query_plan)
+            sql_loop_result = await self._run_sql_loop(
+                query_id, request.question, query_plan, metadata_context
+            )
             if sql_loop_result.passed:
                 if sql_loop_result.execution_result is None:
                     status = "failed"
@@ -820,10 +826,12 @@ class QueryService:
         ]
 
     async def _run_sql_loop(
-        self, query_id: UUID, question: str, query_plan: QueryPlan
+        self, query_id: UUID, question: str, query_plan: QueryPlan,
+        metadata_context: dict[str, object] | None = None,
     ) -> SQLLoopResult:
         await self._emit("load_schema_context", "running", "正在加载 SQL 生成所需的数据结构")
-        metadata_context = self._load_metadata_context(question, query_plan)
+        if metadata_context is None:
+            metadata_context = self._load_metadata_context(question, query_plan)
         await self._emit(
             "load_schema_context",
             "passed" if metadata_context.get("source") == "database" else "failed",
@@ -1095,10 +1103,11 @@ class QueryService:
         )
 
     def _load_metadata_context(
-        self, question: str, query_plan: QueryPlan | None = None
+        self, question: str, query_plan: QueryPlan | None = None,
+        previous_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         try:
-            return self.schema_context_provider.load(
+            context = self.schema_context_provider.load(
                 query_plan=query_plan,
                 question=question,
             )
@@ -1106,8 +1115,19 @@ class QueryService:
             if "question" not in str(exc):
                 raise
             if query_plan is not None:
-                return self.schema_context_provider.load(query_plan)
-            return self.schema_context_provider.load()
+                context = self.schema_context_provider.load(query_plan)
+            else:
+                context = self.schema_context_provider.load()
+        if previous_context and isinstance(context.get("context_stats"), dict):
+            old_stats = previous_context.get("context_stats")
+            if isinstance(old_stats, dict):
+                context["context_stats"]["retrieval_calls"] = (
+                    int(old_stats.get("retrieval_calls", 1)) + 1
+                )
+                context["context_stats"]["context_expansion_count"] = int(
+                    old_stats.get("context_expansion_count", 0)
+                )
+        return context
 
     async def _review_sql_draft(
         self,
@@ -1537,6 +1557,7 @@ class QueryService:
             "tables": table_allowlist,
             "metrics": metric_codes,
             "retrieval": retrieval_summary,
+            "context_stats": metadata_context.get("context_stats"),
         }
 
     def _build_sql_repair_step(self, result: SQLLoopResult) -> AgentStep:

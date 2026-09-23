@@ -132,6 +132,7 @@ class MilvusMetadataStore:
         metric_type: str,
         limit: int,
         expression: str | None,
+        soft_filter: bool = True,
     ) -> list[str]:
         def run(filter_expression: str | None) -> list[str]:
             result = self.client.search(
@@ -149,16 +150,22 @@ class MilvusMetadataStore:
             ]
 
         filtered = run(expression)
-        if not expression or len(filtered) >= limit:
+        if not expression or not soft_filter or len(filtered) >= limit:
             return filtered
         # Filter is only candidate narrowing.  Recover recall from the whole collection.
         return list(dict.fromkeys(filtered + run(None)))[:limit]
 
-    def search_bm25(self, query: str, limit: int, expression: str | None = None) -> list[str]:
-        return self._search([query], "sparse", "BM25", limit, expression)
+    def search_bm25(
+        self, query: str, limit: int, expression: str | None = None,
+        soft_filter: bool = True,
+    ) -> list[str]:
+        return self._search([query], "sparse", "BM25", limit, expression, soft_filter)
 
-    def search_dense(self, query: str, limit: int, expression: str | None = None) -> list[str]:
+    def search_dense(
+        self, query: str, limit: int, expression: str | None = None,
+        soft_filter: bool = True,
+    ) -> list[str]:
         vector = self.embedder.embed([query])[0]
         if len(vector) != self.dimensions:
             raise ValueError("Query embedding vector dimension does not match Milvus schema")
-        return self._search([vector], "dense", "COSINE", limit, expression)
+        return self._search([vector], "dense", "COSINE", limit, expression, soft_filter)
