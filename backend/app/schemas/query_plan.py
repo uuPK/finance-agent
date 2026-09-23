@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.v2_protocol import EvidenceRef
+
 PlanStatus = Literal["draft", "ready", "needs_clarification", "invalid"]
 QueryIntent = Literal[
     "customer_segmentation",
@@ -63,6 +65,7 @@ class TimeRange(BaseModel):
     granularity: TimeGranularity = "none"
     anchor_date: str | None = None
     is_resolved: bool = False
+    provenance: list[EvidenceRef] | None = None
 
 
 class QueryValue(BaseModel):
@@ -83,6 +86,7 @@ class QueryFilter(BaseModel):
     metadata_ref: MetadataReference | None = None
     is_resolved: bool = False
     requires_clarification: bool = False
+    provenance: list[EvidenceRef] | None = None
 
 
 class QueryMetric(BaseModel):
@@ -96,6 +100,7 @@ class QueryMetric(BaseModel):
     metadata_ref: MetadataReference | None = None
     is_resolved: bool = False
     requires_clarification: bool = False
+    provenance: list[EvidenceRef] | None = None
 
 
 class QueryDimension(BaseModel):
@@ -105,6 +110,7 @@ class QueryDimension(BaseModel):
     alias: str | None = None
     metadata_ref: MetadataReference | None = None
     is_resolved: bool = False
+    provenance: list[EvidenceRef] | None = None
 
 
 class QueryGrain(BaseModel):
@@ -156,6 +162,7 @@ class PlanAssumption(BaseModel):
     value: Any
     reason: str
     source: FilterSource = "default"
+    provenance: list[EvidenceRef] | None = None
 
 
 class QueryPlan(BaseModel):

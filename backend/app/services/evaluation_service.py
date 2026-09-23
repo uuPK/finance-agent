@@ -1096,7 +1096,8 @@ class EvaluationManager:
                     response = await self.service_factory().run(
                         QueryRequest(
                             question=case["question"], user_id="evaluation", include_debug=True
-                        )
+                        ),
+                        include_evaluation_artifact=True,
                     )
                 except Exception as exc:  # The failure becomes an auditable evaluation result.
                     error = exc
@@ -1141,13 +1142,18 @@ class EvaluationManager:
         status_match = response.status == expected_status
         executable = response.status == "completed" and bool(response.sql)
         expected_result = dict(case["expected_result"] or {})
+        execution_artifact = response._evaluation_execution_artifact
         result_correct = (
             status_match
             if expected_status == "needs_clarification"
             else (
                 executable
+                and execution_artifact is not None
+                and execution_artifact.status == "success"
+                and not execution_artifact.truncated
+                and execution_artifact.row_count == len(execution_artifact.rows)
                 and _same_result_rows(
-                    response.result_preview, expected_result.get("rows", []), generated_plan
+                    execution_artifact.rows, expected_result.get("rows", []), generated_plan
                 )
             )
         )

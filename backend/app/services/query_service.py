@@ -17,7 +17,13 @@ from app.guardrails.result_validator import ResultHardValidator, ResultValidatio
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
 from app.llm.protocols import SupportsLLMComplete
 from app.metadata.schema_context import SchemaContextProvider
-from app.schemas.query import AgentStep, GuardrailCheck, QueryRequest, QueryResponse
+from app.schemas.query import (
+    AgentStep,
+    EvaluationExecutionArtifact,
+    GuardrailCheck,
+    QueryRequest,
+    QueryResponse,
+)
 from app.schemas.query_plan import QueryDimension, QueryMetric, QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
@@ -100,6 +106,7 @@ class QueryService:
         query_id: UUID | None = None,
         start_audit: bool = True,
         previous_plan: QueryPlan | None = None,
+        include_evaluation_artifact: bool = False,
     ) -> QueryResponse:
         started_at = perf_counter()
         query_id = query_id or uuid4()
@@ -337,6 +344,19 @@ class QueryService:
             retry_count=total_retry_count,
             elapsed_ms=elapsed_ms,
         )
+        if (
+            include_evaluation_artifact
+            and sql_loop_result is not None
+            and sql_loop_result.execution_result is not None
+        ):
+            execution_result = sql_loop_result.execution_result
+            response._evaluation_execution_artifact = EvaluationExecutionArtifact(
+                status=execution_result.status,
+                columns=execution_result.columns,
+                rows=execution_result.rows,
+                row_count=execution_result.row_count,
+                truncated=execution_result.truncated,
+            )
         failed_check = next((check for check in all_checks if not check.passed), None)
         self.audit_logger.finish_query_run(
             query_id=query_id,
