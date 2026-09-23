@@ -5,7 +5,9 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
+from app.core.config import Settings, get_settings
 from app.db.session import engine as default_engine
+from app.metadata.hybrid_retriever import HybridMetadataRetriever
 from app.metadata.retriever import MetadataRetriever
 from app.schemas.query_plan import QueryPlan
 
@@ -13,8 +15,9 @@ from app.schemas.query_plan import QueryPlan
 class SchemaContextProvider:
     """Build a compact SQL generation context from PostgreSQL and metadata tables."""
 
-    def __init__(self, engine: Engine | None = None) -> None:
+    def __init__(self, engine: Engine | None = None, settings: Settings | None = None) -> None:
         self.engine = engine or default_engine
+        self.settings = settings or get_settings()
 
     def load(
         self, query_plan: QueryPlan | None = None, question: str | None = None
@@ -42,7 +45,24 @@ class SchemaContextProvider:
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
         reference_date = self._load_reference_date(connection)
-        retrieval = MetadataRetriever(connection).retrieve(question=question, query_plan=query_plan)
+        if self.settings.retriever_mode == "hybrid" and question:
+            try:
+                hybrid = HybridMetadataRetriever(connection, self.settings)
+                try:
+                    retrieval = hybrid.retrieve(question=question, query_plan=query_plan)
+                finally:
+                    hybrid.close()
+            except Exception as exc:
+                if connection.in_transaction():
+                    connection.rollback()
+                retrieval = MetadataRetriever(connection).retrieve(
+                    question=question, query_plan=query_plan
+                )
+                retrieval.fallback_reason = f"hybrid unavailable: {type(exc).__name__}: {exc}"
+        else:
+            retrieval = MetadataRetriever(connection).retrieve(
+                question=question, query_plan=query_plan
+            )
         selected_table_names = set(retrieval.table_names)
         selected_table_names.update(self._required_semantic_tables(question, query_plan))
         selected_metric_codes = set(retrieval.metric_codes)
@@ -151,6 +171,7 @@ class SchemaContextProvider:
             "business_terms": selected_business_terms,
             "join_relationships": selected_join_relationships,
             "question_examples": selected_question_examples,
+            "rule_constraints": retrieval.matched_rule_constraints,
             "table_allowlist": sorted(table_allowlist),
             "sensitive_columns": sorted(sensitive_columns),
             "allowed_columns_by_table": allowed_columns_by_table,

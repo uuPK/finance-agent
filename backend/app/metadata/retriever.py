@@ -190,11 +190,18 @@ class MetadataRetrievalResult:
     matched_business_terms: list[dict[str, Any]] = field(default_factory=list)
     matched_join_relationships: list[dict[str, Any]] = field(default_factory=list)
     matched_question_examples: list[dict[str, Any]] = field(default_factory=list)
+    matched_rule_constraints: list[dict[str, Any]] = field(default_factory=list)
     confidence: float = 0.0
+    strategy: str = "structured_keyword_retrieval"
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    query_analysis: dict[str, Any] | None = None
+    metadata_filter: str | None = None
+    index_sync: dict[str, int] | None = None
+    fallback_reason: str | None = None
 
     def to_context(self) -> dict[str, Any]:
         return {
-            "strategy": "structured_keyword_retrieval",
+            "strategy": self.strategy,
             "keywords": self.keywords,
             "table_names": self.table_names,
             "metric_codes": self.metric_codes,
@@ -206,6 +213,12 @@ class MetadataRetrievalResult:
             "matched_columns": self.matched_columns,
             "matched_join_relationships": self.matched_join_relationships,
             "matched_question_examples": self.matched_question_examples,
+            "matched_rule_constraints": self.matched_rule_constraints,
+            "evidence": self.evidence,
+            "query_analysis": self.query_analysis,
+            "metadata_filter": self.metadata_filter,
+            "index_sync": self.index_sync,
+            "fallback_reason": self.fallback_reason,
         }
 
 

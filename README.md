@@ -23,7 +23,7 @@
 
 ```text
 自然语言问题
-  -> 官方元数据召回
+  -> 元数据召回（legacy 或 Milvus Hybrid）
   -> QueryPlan 生成与硬校验
   -> Plan Critic / 修复
   -> SQL 生成
@@ -129,6 +129,19 @@ npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
 浏览器打开 `http://127.0.0.1:5173`。
+
+### Milvus Hybrid 元数据检索（Phase 2）
+
+`RETRIEVER_MODE=hybrid` 时，后端将 PostgreSQL 中启用的表、字段、指标、术语、关联、样例和规则统一投影为 `MetadataDocument`，增量同步到同一个 Milvus collection。Milvus 内置 BM25 稀疏索引与智谱 `embedding-3` Dense 索引分别召回；QueryAnalysis 和软 Metadata Filter 缩小候选，RRF 融合后调用智谱 `rerank` 对 TopN 重排。检索证据记录两路名次、融合分数、重排分数和入选原因。旧 Retriever 保留，Hybrid 不可用时会回退并记录原因。
+
+```powershell
+docker compose up -d postgres milvus
+# 在本地 .env 填写 ZHIPU_RETRIEVAL_API_KEY，并设 RETRIEVER_MODE=hybrid
+cd backend
+uv sync --extra dev --frozen
+```
+
+首次 Hybrid 查询会为元数据生成向量并写入 Milvus；后续只更新内容变化的文档。此过程会把元数据文本（包括 schema、指标定义和样例 SQL）发送给智谱，请仅在已授权该数据流向时启用。新部署默认仍是 `legacy`，可以用 `.env` 中的 `ENABLE_RERANKER=false` 做重排消融。修改 `.env` 后重启后端。
 
 ## 本地质量检查与持续集成
 
