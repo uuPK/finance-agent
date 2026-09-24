@@ -220,6 +220,11 @@ class LLMQueryPlanActor:
             - 如果用户使用了模糊业务词，而 metadata context 未给出明确口径，应返回 needs_clarification。
             - 如果 business_terms 中 clarification_required=true，除非用户已经给出口径，否则应返回 needs_clarification。
             - 不要编造 metadata context 中不存在的 metric_code、field_code、table、column 或 join_path。
+            - 对关键指标、筛选阈值和时间口径填写 provenance：用户明示用 user_explicit，
+              已召回元数据定义用 metadata_definition（source_id 指向 metric:<code> 或
+              term:<term>）。不得把模型猜测写成这两种来源。
+            - 业务词若有结构化 default_plan_fragment，可按该定义补全；只有文字描述但无可执行
+              阈值时，不能自行从中猜出筛选数值，应请求澄清。
 
             QueryPlan JSON Schema：
             {schema}
@@ -242,6 +247,7 @@ class LLMQueryPlanActor:
         tables = metadata_context.get("tables")
         metrics = metadata_context.get("metrics")
         business_terms = metadata_context.get("business_terms")
+        joins = metadata_context.get("join_relationships")
         examples = metadata_context.get("question_examples")
         return {
             "source": metadata_context.get("source"),
@@ -249,6 +255,12 @@ class LLMQueryPlanActor:
             "retrieval": retrieval if isinstance(retrieval, dict) else {},
             "table_allowlist": metadata_context.get("table_allowlist", []),
             "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
+            "columns_by_table": self._column_codes(tables),
+            "join_relationships": self._compact_items(
+                joins,
+                ("id", "left_table", "left_column", "right_table", "right_column"),
+                limit=12,
+            ),
             "metrics": self._compact_items(
                 metrics,
                 (
@@ -287,6 +299,23 @@ class LLMQueryPlanActor:
                 continue
             compacted.append({key: item.get(key) for key in keys if key in item})
         return compacted
+
+    @staticmethod
+    def _column_codes(tables: object) -> list[dict[str, Any]]:
+        if not isinstance(tables, list):
+            return []
+        return [
+            {
+                "table": table.get("name"),
+                "columns": [
+                    column.get("name")
+                    for column in (table.get("columns") or [])[:24]
+                    if isinstance(column, dict) and column.get("name")
+                ],
+            }
+            for table in tables[:8]
+            if isinstance(table, dict)
+        ]
 
 
 _QUERY_PLAN_ACTOR_SYSTEM_PROMPT = dedent(

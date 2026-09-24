@@ -13,6 +13,7 @@ from app.agents.llm_sql_critic import LLMSQLCritic, LLMSQLCriticResult
 from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.core.config import get_settings
+from app.guardrails.plan_grounding import ground_query_plan
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
 from app.llm.protocols import SupportsLLMComplete
@@ -143,20 +144,24 @@ class QueryService:
         build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
         query_plan = build_result.plan
         build_results = [build_result]
+        metadata_context = self._load_metadata_context(
+            request.question, query_plan, previous_context=metadata_context
+        )
+        query_plan, metadata_context = self._ground_plan_with_context(
+            request.question, query_plan, metadata_context
+        )
+        build_result.plan = query_plan
         await self._emit(
             "build_query_plan",
             "passed",
-            "查询计划已生成",
+            "查询计划已生成并核对证据来源",
             {
                 "query_plan": query_plan.model_dump(mode="json", exclude_none=True),
                 **self._build_actor_details(build_result, build_results),
             },
         )
-        metadata_context = self._load_metadata_context(
-            request.question, query_plan, previous_context=metadata_context
-        )
         review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-            query_plan, metadata_context, attempt=0
+            query_plan, metadata_context, attempt=0, original_question=request.question
         )
         review_history = [
             self._build_review_details(
@@ -188,26 +193,31 @@ class QueryService:
             )
             build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
             build_results.append(build_result)
-
+            query_plan = build_result.plan
+            metadata_context = self._load_metadata_context(
+                request.question, query_plan, previous_context=metadata_context
+            )
+            query_plan, metadata_context = self._ground_plan_with_context(
+                request.question, query_plan, metadata_context
+            )
+            build_result.plan = query_plan
             await self._emit(
                 "repair_query_plan",
                 "passed" if build_result.source == "llm" else "failed",
                 f"第 {repair_count} 次查询计划修复已完成",
                 {
-                    "query_plan": build_result.plan.model_dump(mode="json", exclude_none=True),
+                    "query_plan": query_plan.model_dump(mode="json", exclude_none=True),
                     "actor_source": build_result.source,
                     "llm_error": build_result.llm_error,
                 },
                 attempt=repair_count,
             )
-
-            query_plan = build_result.plan
-            metadata_context = self._load_metadata_context(
-                request.question, query_plan, previous_context=metadata_context
-            )
             if build_result.source != "llm":
                 review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                    query_plan, metadata_context, attempt=repair_count
+                    query_plan,
+                    metadata_context,
+                    attempt=repair_count,
+                    original_question=request.question,
                 )
                 review_history.append(
                     self._build_review_details(
@@ -219,7 +229,10 @@ class QueryService:
                 )
                 break
             review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                query_plan, metadata_context, attempt=repair_count
+                query_plan,
+                metadata_context,
+                attempt=repair_count,
+                original_question=request.question,
             )
             review_history.append(
                 self._build_review_details(
@@ -458,10 +471,7 @@ class QueryService:
                 llm_model=build_result.llm_model,
                 llm_provider=build_result.llm_provider,
             )
-        if (
-            llm_plan.plan_status == "ready"
-            and deterministic_plan.plan_status == "ready"
-        ):
+        if llm_plan.plan_status == "ready" and deterministic_plan.plan_status == "ready":
             grouped_dimensions = [
                 dimension
                 for dimension in deterministic_plan.dimensions
@@ -474,9 +484,7 @@ class QueryService:
                 and (
                     llm_plan.grain is None
                     or llm_plan.grain.level != deterministic_plan.grain.level
-                    or not set(deterministic_plan.grain.keys).issubset(
-                        set(llm_plan.grain.keys)
-                    )
+                    or not set(deterministic_plan.grain.keys).issubset(set(llm_plan.grain.keys))
                 )
             )
             required_output_metrics = QueryService._required_output_metrics(
@@ -511,16 +519,12 @@ class QueryService:
                 safe_plan = llm_plan.model_copy(
                     update={
                         "grain": (
-                            deterministic_plan.grain
-                            if needs_grouping_safeguard
-                            else llm_plan.grain
+                            deterministic_plan.grain if needs_grouping_safeguard else llm_plan.grain
                         ),
                         "dimensions": merged_dimensions,
                         "metrics": merged_metrics,
                         "data_requirements": deterministic_plan.data_requirements,
-                        "output": llm_plan.output.model_copy(
-                            update={"columns": output_columns}
-                        ),
+                        "output": llm_plan.output.model_copy(update={"columns": output_columns}),
                     }
                 )
                 safeguards = []
@@ -663,6 +667,7 @@ class QueryService:
         query_plan: QueryPlan,
         metadata_context: dict[str, object] | None = None,
         attempt: int = 0,
+        original_question: str | None = None,
     ) -> tuple[ReviewBundle, bool, LLMPlanCriticResult]:
         await self._emit(
             "query_plan_hard_review",
@@ -670,7 +675,9 @@ class QueryService:
             "正在检查查询计划结构与安全约束",
             attempt=attempt,
         )
-        review_bundle = self.plan_validator.review(query_plan)
+        review_bundle = self.plan_validator.review(
+            query_plan, original_question=original_question, metadata_context=metadata_context
+        )
         hard_review_passed = all(check.passed for check in review_bundle.hard_checks)
         await self._emit(
             "query_plan_hard_review",
@@ -700,6 +707,7 @@ class QueryService:
                 query_plan,
                 review_bundle.hard_checks,
                 metadata_context=metadata_context,
+                original_question=original_question,
             )
             if critic_result.decision is not None:
                 review_bundle.llm_checks.append(
@@ -744,14 +752,18 @@ class QueryService:
         multi-window/multi-fact plan even when the deterministic validator has
         established a readonly, bounded, structurally valid request.  SQL
         generation has a separate schema guardrail and execution/result checks,
-        so only security, invented business definitions, and a proven output
-        grain error remain blocking at this early stage.
+        so only security, unsupported business definitions, omitted user
+        conditions, wrong metric/time semantics and grain errors block here.
         """
         if decision.passed or decision.error_type in {
             "unsafe_sensitive_output",
             "guessed_business_definition",
             "fabricated_metadata",
             "wrong_grain",
+            "missing_user_condition",
+            "wrong_metric",
+            "wrong_time",
+            "wrong_filter",
         }:
             return decision
         return decision.model_copy(
@@ -826,7 +838,10 @@ class QueryService:
         ]
 
     async def _run_sql_loop(
-        self, query_id: UUID, question: str, query_plan: QueryPlan,
+        self,
+        query_id: UUID,
+        question: str,
+        query_plan: QueryPlan,
         metadata_context: dict[str, object] | None = None,
     ) -> SQLLoopResult:
         await self._emit("load_schema_context", "running", "正在加载 SQL 生成所需的数据结构")
@@ -1103,7 +1118,9 @@ class QueryService:
         )
 
     def _load_metadata_context(
-        self, question: str, query_plan: QueryPlan | None = None,
+        self,
+        question: str,
+        query_plan: QueryPlan | None = None,
         previous_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         try:
@@ -1128,6 +1145,18 @@ class QueryService:
                     old_stats.get("context_expansion_count", 0)
                 )
         return context
+
+    def _ground_plan_with_context(
+        self, question: str, plan: QueryPlan, context: dict[str, object]
+    ) -> tuple[QueryPlan, dict[str, object]]:
+        grounded = ground_query_plan(plan, question, context)
+        new_tables = set(grounded.data_requirements.candidate_tables) - set(
+            plan.data_requirements.candidate_tables
+        )
+        if new_tables:
+            context = self._load_metadata_context(question, grounded, previous_context=context)
+            grounded = ground_query_plan(grounded, question, context)
+        return grounded, context
 
     async def _review_sql_draft(
         self,

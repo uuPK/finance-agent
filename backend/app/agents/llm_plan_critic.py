@@ -34,6 +34,7 @@ class LLMPlanCritic:
         plan: QueryPlan,
         hard_checks: list[ReviewDecision],
         metadata_context: dict[str, Any] | None = None,
+        original_question: str | None = None,
     ) -> LLMPlanCriticResult:
         if self.llm_service is None:
             return LLMPlanCriticResult(
@@ -43,7 +44,9 @@ class LLMPlanCritic:
 
         try:
             response = await self.llm_service.complete(
-                messages=self._build_messages(plan, hard_checks, metadata_context),
+                messages=self._build_messages(
+                    plan, hard_checks, metadata_context, original_question=original_question
+                ),
                 temperature=0.0,
                 max_tokens=1800,
                 response_format={"type": "json_object"},
@@ -70,6 +73,7 @@ class LLMPlanCritic:
         plan: QueryPlan,
         hard_checks: list[ReviewDecision],
         metadata_context: dict[str, Any] | None = None,
+        original_question: str | None = None,
     ) -> list[LLMMessage]:
         review_schema = json.dumps(ReviewDecision.model_json_schema(), ensure_ascii=False)
         plan_json = json.dumps(
@@ -89,6 +93,9 @@ class LLMPlanCritic:
         )
         user_prompt = dedent(
             f"""
+            原始用户问题（以此为准，不依赖 QueryPlan.question）：
+            {original_question if original_question is not None else plan.question or ""}
+
             待审核 QueryPlan：
             {plan_json}
 
@@ -129,6 +136,7 @@ class LLMPlanCritic:
         tables = metadata_context.get("tables")
         metrics = metadata_context.get("metrics")
         business_terms = metadata_context.get("business_terms")
+        joins = metadata_context.get("join_relationships")
         return {
             "source": metadata_context.get("source"),
             "error": metadata_context.get("error"),
@@ -136,7 +144,15 @@ class LLMPlanCritic:
             "table_allowlist": metadata_context.get("table_allowlist", []),
             "metrics": self._compact_items(
                 metrics,
-                ("metric_code", "metric_name", "description", "grain", "required_filters"),
+                (
+                    "metric_code",
+                    "metric_name",
+                    "description",
+                    "formula",
+                    "grain",
+                    "source_tables",
+                    "required_filters",
+                ),
             ),
             "business_terms": self._compact_items(
                 business_terms,
@@ -149,6 +165,23 @@ class LLMPlanCritic:
                 ),
             ),
             "tables": self._compact_items(tables, ("name", "display_name", "domain", "grain")),
+            "columns_by_table": [
+                {
+                    "table": table.get("name"),
+                    "columns": [
+                        column.get("name")
+                        for column in (table.get("columns") or [])[:24]
+                        if isinstance(column, dict) and column.get("name")
+                    ],
+                }
+                for table in (tables[:8] if isinstance(tables, list) else [])
+                if isinstance(table, dict)
+            ],
+            "join_relationships": self._compact_items(
+                joins,
+                ("id", "left_table", "left_column", "right_table", "right_column"),
+                limit=12,
+            ),
         }
 
     def _compact_items(

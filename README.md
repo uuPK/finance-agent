@@ -147,7 +147,13 @@ uv sync --extra dev --frozen
 
 `SchemaContextProvider` 保留完整的数据库元数据和 SQL Guardrail 白名单，但给模型的 `prompt_context` 是独立的工作集。它按指标定义、必需字段、JOIN、业务术语等优先级选择内容，先压缩非关键描述，再淘汰低优先级项；必需证据装不下时失败关闭，不悄悄删掉。`SCHEMA_CONTEXT_BUDGET` 默认 10000，是模型无关的 JSON token **估算值**，不是模型 API 返回的精确 token 用量。`context_stats` 记录预算、已用估算 token、条目数、去重、压缩、淘汰与检索次数。
 
-`SchemaContextProvider.expand(current, MissingContextRequest, question=..., query_plan=...)` 提供按类型定向补充接口：Hybrid 模式在 Milvus 内仅召回请求的文档类型，Legacy 模式使用同类 PostgreSQL 元数据兜底；补充结果重新合并、去重和预算裁剪。`STAGE_RETRIEVAL_BUDGET` 与 `GLOBAL_RETRIEVAL_BUDGET` 限制额外调用。当前阶段**尚未**让 Actor 自动发起扩展或让 Harness 路由失败；那属于后续 QueryPlan/Harness 阶段，现有 API/SSE 行为保持兼容。
+`SchemaContextProvider.expand(current, MissingContextRequest, question=..., query_plan=...)` 提供按类型定向补充接口：Hybrid 模式在 Milvus 内仅召回请求的文档类型，Legacy 模式使用同类 PostgreSQL 元数据兜底；补充结果重新合并、去重和预算裁剪。`STAGE_RETRIEVAL_BUDGET` 与 `GLOBAL_RETRIEVAL_BUDGET` 限制额外调用。当前阶段**尚未**让 Actor 自动发起扩展或让 Harness 路由失败；那属于后续 Harness 阶段，现有 API/SSE 行为保持兼容。
+
+### QueryPlan 证据约束与澄清（Phase 4）
+
+Plan Actor 提议业务解释后，服务端重新核对原始用户问题与召回的指标、术语、表、字段和 JOIN 元数据，不信任模型自己填写的 `provenance`。指标和阈值会标记为 `user_explicit`、`metadata_definition` 或 `llm_inferred`；没有证据的关键阈值会从计划中移除并变为具体澄清问题，不能以 `ready` 进入 SQL。模糊业务词只有在用户明确给出口径，或元数据含可执行的结构化 `default_plan_fragment` 时才可自动解析。时间范围、物理代码与关联路径也在硬校验中核对。Plan Critic 同时接收**原始用户问题**、QueryPlan 和元数据证据；遗漏用户条件、错误指标或时间不再只作为提示。
+
+例如治理“高净值”术语时，可在 `metadata.business_terms.default_plan_fragment` 填入 `{"metric_code":"total_asset","operator":">=","value":1000000}` 并设置 `clarification_required=false`；对应 `metric_code` 必须存在于已召回的指标元数据。仅写“高净值”文字说明却没有可执行门槛时，系统会请求澄清，不猜测 100 万。此阶段未改 SQL Guardrail、API/SSE 协议或 Harness 路由。
 
 ## 本地质量检查与持续集成
 
