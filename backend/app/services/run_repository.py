@@ -149,8 +149,9 @@ class RunRepository:
                 .mappings()
                 .one()
             )
-            connection.execute(
-                text(
+            if not event_type.startswith("trace."):
+                connection.execute(
+                    text(
                     """
                     insert into agent.query_steps
                         (query_id, step_name, attempt, clarification_round, stage_attempt,
@@ -173,25 +174,25 @@ class RunRepository:
                         payload = excluded.payload,
                         finished_at = excluded.finished_at
                     """
-                ),
-                {
-                    "query_id": str(query_id),
-                    "stage": stage,
-                    "attempt": attempt,
-                    "clarification_round": trace_event.clarification_round,
-                    "stage_attempt": trace_event.stage_attempt,
-                    "schema_version": trace_event.schema_version,
-                    "span_id": trace_event.span_id,
-                    "parent_span_id": trace_event.parent_span_id,
-                    "duration_ms": trace_event.duration_ms,
-                    "status": status,
-                    "is_running": status == "running",
-                    "summary": summary,
-                    "payload": json.dumps(payload, ensure_ascii=False),
-                },
-            )
-            connection.execute(
-                text(
+                    ),
+                    {
+                        "query_id": str(query_id),
+                        "stage": stage,
+                        "attempt": attempt,
+                        "clarification_round": trace_event.clarification_round,
+                        "stage_attempt": trace_event.stage_attempt,
+                        "schema_version": trace_event.schema_version,
+                        "span_id": trace_event.span_id,
+                        "parent_span_id": trace_event.parent_span_id,
+                        "duration_ms": trace_event.duration_ms,
+                        "status": status,
+                        "is_running": status == "running",
+                        "summary": summary,
+                        "payload": json.dumps(payload, ensure_ascii=False),
+                    },
+                )
+                connection.execute(
+                    text(
                     """
                     update agent.query_runs
                     set current_stage = :stage,
@@ -199,13 +200,13 @@ class RunRepository:
                         updated_at = now()
                     where query_id = :query_id
                     """
-                ),
-                {
-                    "query_id": str(query_id),
-                    "stage": stage,
-                    "run_status": run_status,
-                },
-            )
+                    ),
+                    {
+                        "query_id": str(query_id),
+                        "stage": stage,
+                        "run_status": run_status,
+                    },
+                )
         return QueryEvent(
             event_id=row["event_id"],
             query_id=query_id,

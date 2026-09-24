@@ -154,3 +154,47 @@ def test_repair_and_clarification_round_do_not_overwrite_each_other() -> None:
                 text("delete from agent.query_runs where query_id = :query_id"),
                 {"query_id": str(query_id)},
             )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_TRACE_DB_TESTS") != "1",
+    reason="requires local PostgreSQL with schema.sql or migration 011 applied",
+)
+def test_trace_telemetry_is_append_only_and_does_not_replace_stage_view() -> None:
+    repository = RunRepository()
+    query_id = uuid4()
+    repository.create_run(query_id, "trace telemetry regression", "trace-test")
+    try:
+        started = repository.append_event(
+            query_id, "stage.started", "generate_sql", "running", "stage started",
+            span_id=uuid4(),
+        )
+        telemetry = repository.append_event(
+            query_id, "trace.llm_call", "generate_sql", "passed", "llm_call",
+            {"prompt_tokens": 12, "completion_tokens": 4},
+            span_id=uuid4(), parent_span_id=started.span_id,
+        )
+        assert telemetry.parent_span_id == started.span_id
+        with repository.engine.connect() as connection:
+            step_rows = connection.execute(
+                text("""
+                    select summary from agent.query_steps
+                    where query_id = :query_id and step_name = 'generate_sql'
+                """),
+                {"query_id": str(query_id)},
+            ).all()
+            run_stage = connection.execute(
+                text("select current_stage from agent.query_runs where query_id = :query_id"),
+                {"query_id": str(query_id)},
+            ).scalar_one()
+        assert step_rows == [("stage started",)]
+        assert run_stage == "generate_sql"
+        assert [event.type for event in repository.list_events(query_id)] == [
+            "stage.started", "trace.llm_call"
+        ]
+    finally:
+        with repository.engine.begin() as connection:
+            connection.execute(
+                text("delete from agent.query_runs where query_id = :query_id"),
+                {"query_id": str(query_id)},
+            )

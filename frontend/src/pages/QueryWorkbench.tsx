@@ -52,7 +52,12 @@ export function QueryWorkbench({
   );
   const timelineEvents = useMemo(() => {
     const latestByStage = new Map<string, QueryEvent>();
-    events.forEach((event) => latestByStage.set(`${event.attempt}:${event.stage}`, event));
+    events.filter((event) => !event.type.startsWith("trace.")).forEach((event) => {
+      const identity = event.schema_version && event.schema_version >= 2
+        ? `${event.clarification_round}:${event.stage_attempt}:${event.stage}`
+        : `legacy:${event.attempt}:${event.stage}`;
+      latestByStage.set(identity, event);
+    });
     return [...latestByStage.values()].sort((left, right) => left.event_id - right.event_id);
   }, [events]);
 

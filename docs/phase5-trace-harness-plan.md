@@ -33,16 +33,22 @@ Trace 不能反向决定流程。检索、Context、Plan、SQL、执行、结果
 
 ## 实施子步
 
-### Phase 5.0：协议和兼容性迁移（本次下一步）
+### Phase 5.0：协议和兼容性迁移（已完成，`9971590`）
 
 1. 定义带校验的 Trace 事件/阶段模型与字段语义；所有新字段可选或有安全默认值，不破坏旧请求和事件读取。
 2. 为现有 `query_events`、`query_steps` 增量增加轮次、阶段尝试、span 和耗时字段；步骤唯一键改为 `(query_id, clarification_round, step_name, stage_attempt)`。历史记录保留原值并标记旧版本，不猜测无法恢复的轮次。
 3. 让当前事件发布链路明确传递轮次和阶段尝试，修正两者相加造成的碰撞；原有 SSE 结构保持可消费。
 4. 测试同一运行中的“首轮修复 1 次”与“澄清后首轮”不互相覆盖、迁移可重复应用、旧记录仍可读取。
 
-### Phase 5.1：TraceRecorder 和阶段适配
+### Phase 5.1：TraceRecorder 和阶段适配（已实现，待用户验收）
 
 复用 `query_events` 作为追加日志、`query_steps` 作为兼容的阶段视图；记录检索排名/入选原因、Context 取舍、Plan 证据、校验结果、模型实际 token 与单调时钟耗时。沿用 SQL 执行明细表，以 `query_id`/`execution_id` 引用，不复制结果行。
+
+实现边界：`trace.context_selection`、`trace.plan_evidence`、`trace.validation`、`trace.llm_call` 和 `trace.sql_execution` 是仅追加的遥测事件，不更新阶段视图或运行状态；阶段开始/结束事件复用同一 `span_id`，遥测以 `parent_span_id` 指向当前阶段。模型用量仅取 API 响应；未返回时为 `null`。遥测落库失败不重试模型或 SQL，下一条阶段事件带 `trace_warning`。
+
+兼容边界：原有阶段事件和前端调试面板仍使用完整 QueryPlan、SQL、结果预览；新 `trace.*` 事件只记录引用和摘要，不复制完整 Prompt、元数据正文、SQL 或结果行。若未来要求统一缩减旧事件载荷，必须同步迁移前端读取方式；不能将旧载荷的存在误认为新 Trace 已覆盖所有历史数据的脱敏。
+
+真实链路验收使用 `RUN_TRACE_LIVE_TESTS=1` 运行 `backend/tests/test_trace_live_integration.py`：调用当前配置的真实模型与 Milvus/智谱检索，只在测试进程内存保留响应和事件，不写入运行审计表。普通全量测试默认跳过它，避免意外调用付费 API。
 
 ### Phase 5.2：HarnessState 与 QueryService facade
 

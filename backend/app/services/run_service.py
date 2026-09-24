@@ -98,6 +98,7 @@ class QueryRunManager:
         attempt: int,
         previous_plan: QueryPlan | None = None,
     ) -> None:
+        service: QueryService | None = None
         try:
             service = QueryService(
                 event_sink=lambda event: self.publish(query_id, event),
@@ -145,6 +146,8 @@ class QueryRunManager:
                 },
             )
         except Exception as exc:
+            if service is not None and service.trace_recorder is not None:
+                await service.trace_recorder.close_open_spans(type(exc).__name__)
             await self.publish(
                 query_id,
                 {

@@ -30,6 +30,8 @@ from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
 from app.services.audit_logger import QueryAuditLogger
 from app.services.sql_executor import SQLExecutionResult, SQLExecutor
+from app.services.trace_facts import context_facts, plan_facts, validation_facts
+from app.services.trace_recorder import TraceRecorder, TracingLLMService
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -68,6 +70,12 @@ class QueryService:
         event_attempt: int = 0,
     ) -> None:
         self.settings = get_settings()
+        self.event_sink = event_sink
+        # event_attempt is the legacy constructor name for the clarification round.
+        self.event_attempt = max(0, event_attempt)
+        self.trace_recorder = (
+            TraceRecorder(event_sink, self.event_attempt) if event_sink is not None else None
+        )
         self.rule_based_actor = RuleBasedQueryPlanActor()
         self.plan_validator = QueryPlanHardValidator()
         self.llm_unavailable_reason: str | None = None
@@ -82,6 +90,8 @@ class QueryService:
         elif not enable_llm:
             self.llm_unavailable_reason = "LLM is disabled for this QueryService instance."
         self.llm_enabled = resolved_llm_service is not None
+        if resolved_llm_service is not None and self.trace_recorder is not None:
+            resolved_llm_service = TracingLLMService(resolved_llm_service, self.trace_recorder)
 
         self.query_plan_actor = LLMQueryPlanActor(
             llm_service=resolved_llm_service,
@@ -96,9 +106,6 @@ class QueryService:
         self.sql_executor = sql_executor or SQLExecutor()
         self.result_validator = result_validator
         self.audit_logger = audit_logger or QueryAuditLogger()
-        self.event_sink = event_sink
-        # event_attempt is the legacy constructor name for the clarification round.
-        self.event_attempt = max(0, event_attempt)
         self.result_preview_rows = max(1, result_preview_rows or self.settings.result_preview_rows)
 
     async def run(
@@ -119,6 +126,7 @@ class QueryService:
                 user_id=request.user_id,
             )
 
+        await self._emit("receive_question", "running", "正在接收业务问题")
         await self._emit(
             "receive_question",
             "passed",
@@ -128,6 +136,7 @@ class QueryService:
 
         await self._emit("retrieve_metadata", "running", "正在检索相关元数据")
         metadata_context = self._load_metadata_context(request.question)
+        await self._record_trace("context_selection", lambda: context_facts(metadata_context))
         await self._emit(
             "retrieve_metadata",
             "passed" if metadata_context.get("source") == "database" else "failed",
@@ -152,6 +161,8 @@ class QueryService:
             request.question, query_plan, metadata_context
         )
         build_result.plan = query_plan
+        await self._record_trace("context_selection", lambda: context_facts(metadata_context))
+        await self._record_trace("plan_evidence", lambda: plan_facts(query_plan))
         await self._emit(
             "build_query_plan",
             "passed",
@@ -202,6 +213,10 @@ class QueryService:
                 request.question, query_plan, metadata_context
             )
             build_result.plan = query_plan
+            await self._record_trace(
+                "context_selection", lambda context=metadata_context: context_facts(context)
+            )
+            await self._record_trace("plan_evidence", lambda plan=query_plan: plan_facts(plan))
             await self._emit(
                 "repair_query_plan",
                 "passed" if build_result.source == "llm" else "failed",
@@ -267,6 +282,7 @@ class QueryService:
                     answer = "SQL execution result is unavailable after validation."
                 else:
                     status = "completed"
+                    await self._emit("render_answer", "running", "正在整理回答")
                     answer_result = self.answer_actor.render(
                         question=request.question,
                         query_plan=query_plan,
@@ -680,6 +696,13 @@ class QueryService:
             query_plan, original_question=original_question, metadata_context=metadata_context
         )
         hard_review_passed = all(check.passed for check in review_bundle.hard_checks)
+        await self._record_trace(
+            "validation",
+            lambda: {
+                "validator": "query_plan_hard_review",
+                **validation_facts(review_bundle.hard_checks),
+            },
+        )
         await self._emit(
             "query_plan_hard_review",
             "passed" if hard_review_passed else "failed",
@@ -725,6 +748,14 @@ class QueryService:
             if critic_result.status == "skipped"
             else "failed"
         )
+        if effective_critic_decision is not None:
+            await self._record_trace(
+                "validation",
+                lambda: {
+                    "validator": "query_plan_llm_review",
+                    **validation_facts([effective_critic_decision]),
+                },
+            )
         await self._emit(
             "query_plan_llm_review",
             critic_status,
@@ -790,32 +821,32 @@ class QueryService:
         attempt: int | None = None,
         event_type: str | None = None,
     ) -> None:
-        if self.event_sink is None:
+        if self.trace_recorder is None:
             return
-        stage_attempt = attempt or 0
-        # Keep the legacy display field; it must never be used as a step key.
-        resolved_attempt = self.event_attempt + stage_attempt
-        resolved_type = event_type
-        if resolved_type is None:
-            resolved_type = (
-                "stage.started"
-                if status == "running"
-                else "stage.failed"
-                if status == "failed"
-                else "stage.completed"
-            )
-        await self.event_sink(
-            {
-                "type": resolved_type,
-                "stage": stage,
-                "status": status,
-                "attempt": resolved_attempt,
-                "clarification_round": self.event_attempt,
-                "stage_attempt": stage_attempt,
-                "summary": summary,
-                "output": output or {},
-            }
+        await self.trace_recorder.emit_stage(
+            stage,
+            status,
+            summary,
+            output,
+            stage_attempt=attempt or 0,
+            event_type=event_type,
         )
+
+    async def _record_trace(
+        self,
+        kind: str,
+        payload: dict[str, Any] | Callable[[], dict[str, Any]],
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        if self.trace_recorder is None:
+            return
+        try:
+            facts = payload() if callable(payload) else payload
+        except Exception:
+            self.trace_recorder.telemetry_projection_failures += 1
+            return
+        await self.trace_recorder.record(kind, facts, duration_ms=duration_ms)
 
     def _should_repair(
         self,
@@ -852,6 +883,7 @@ class QueryService:
         await self._emit("load_schema_context", "running", "正在加载 SQL 生成所需的数据结构")
         if metadata_context is None:
             metadata_context = self._load_metadata_context(question, query_plan)
+        await self._record_trace("context_selection", lambda: context_facts(metadata_context))
         await self._emit(
             "load_schema_context",
             "passed" if metadata_context.get("source") == "database" else "failed",
@@ -960,10 +992,16 @@ class QueryService:
                     attempt=build_result.repair_attempt,
                     result=execution_result,
                 )
-                result_hard_validation = self._validate_execution_result(
-                    query_plan=query_plan,
-                    execution_result=execution_result,
-                    metadata_context=metadata_context,
+                await self._record_trace(
+                    "sql_execution",
+                    {
+                        "execution_id": execution_id,
+                        "execution_status": execution_result.status,
+                        "row_count": execution_result.row_count,
+                        "truncated": execution_result.truncated,
+                        "error_type": execution_result.error_type,
+                    },
+                    duration_ms=execution_result.elapsed_ms,
                 )
                 await self._emit(
                     "execute_sql",
@@ -980,6 +1018,24 @@ class QueryService:
                         "result_preview": execution_result.rows[: self.result_preview_rows],
                     },
                     attempt=build_result.repair_attempt,
+                )
+                await self._emit(
+                    "result_hard_review",
+                    "running",
+                    "正在检查查询结果硬规则",
+                    attempt=build_result.repair_attempt,
+                )
+                result_hard_validation = self._validate_execution_result(
+                    query_plan=query_plan,
+                    execution_result=execution_result,
+                    metadata_context=metadata_context,
+                )
+                await self._record_trace(
+                    "validation",
+                    lambda result=result_hard_validation: {
+                        "validator": "result_hard_review",
+                        **validation_facts(result.checks),
+                    },
                 )
                 await self._emit(
                     "result_hard_review",
@@ -1019,6 +1075,14 @@ class QueryService:
                     if result_critic_result.status == "skipped"
                     else "failed"
                 )
+                if result_critic_result.decision is not None:
+                    await self._record_trace(
+                        "validation",
+                        lambda result=result_critic_result: {
+                            "validator": "result_llm_review",
+                            **validation_facts([result.decision]),
+                        },
+                    )
                 await self._emit(
                     "result_llm_review",
                     result_critic_status,
@@ -1182,6 +1246,10 @@ class QueryService:
         ]
         review_bundle = ReviewBundle(hard_checks=hard_checks)
         hard_review_passed = all(check.passed for check in hard_checks)
+        await self._record_trace(
+            "validation",
+            lambda: {"validator": "sql_hard_review", **validation_facts(hard_checks)},
+        )
         await self._emit(
             "sql_hard_review",
             "passed" if hard_review_passed else "failed",
@@ -1219,6 +1287,14 @@ class QueryService:
             if not hard_review_passed
             else "failed"
         )
+        if critic_result.decision is not None:
+            await self._record_trace(
+                "validation",
+                lambda: {
+                    "validator": "sql_llm_review",
+                    **validation_facts([critic_result.decision]),
+                },
+            )
         await self._emit(
             "sql_llm_review",
             critic_status,

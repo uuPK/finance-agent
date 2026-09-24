@@ -153,6 +153,12 @@ export interface QueryEvent {
   stage: string;
   status: AgentStep["status"];
   attempt: number;
+  schema_version?: number;
+  clarification_round?: number | null;
+  stage_attempt?: number | null;
+  span_id?: string | null;
+  parent_span_id?: string | null;
+  duration_ms?: number | null;
   summary: string;
   output: Record<string, unknown>;
   occurred_at: string;
