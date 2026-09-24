@@ -155,6 +155,8 @@ Plan Actor 提议业务解释后，服务端重新核对原始用户问题与召
 
 例如治理“高净值”术语时，可在 `metadata.business_terms.default_plan_fragment` 填入 `{"metric_code":"total_asset","operator":">=","value":1000000}` 并设置 `clarification_required=false`；对应 `metric_code` 必须存在于已召回的指标元数据。仅写“高净值”文字说明却没有可执行门槛时，系统会请求澄清，不猜测 100 万。此阶段未改 SQL Guardrail、API/SSE 协议或 Harness 路由。
 
+Phase 5–6 将先定义运行 Trace，再让 Harness 消费同一套状态、预算与事件契约；澄清轮次和阶段修复尝试会分开记录。详见 [Trace 与 Harness 联动实施计划](docs/phase5-trace-harness-plan.md)。
+
 ## 本地质量检查与持续集成
 
 ```powershell
