@@ -210,6 +210,12 @@ create table if not exists agent.query_steps (
     query_id uuid not null references agent.query_runs(query_id) on delete cascade,
     step_name varchar(64) not null,
     attempt integer not null default 0,
+    clarification_round integer default 0,
+    stage_attempt integer default 0,
+    schema_version integer not null default 2,
+    span_id uuid,
+    parent_span_id uuid,
+    duration_ms integer,
     step_status varchar(32) not null,
     summary text not null default '',
     payload jsonb not null default '{}'::jsonb,
@@ -219,8 +225,8 @@ create table if not exists agent.query_steps (
 
 create index if not exists idx_query_steps_query on agent.query_steps(query_id);
 create index if not exists idx_query_steps_name on agent.query_steps(step_name);
-create unique index if not exists uq_query_steps_run_stage_attempt
-    on agent.query_steps(query_id, step_name, attempt);
+create unique index if not exists uq_query_steps_run_round_stage_attempt
+    on agent.query_steps(query_id, clarification_round, step_name, stage_attempt);
 
 create table if not exists agent.query_events (
     event_id bigint generated always as identity primary key,
@@ -229,6 +235,12 @@ create table if not exists agent.query_events (
     stage_name varchar(64) not null,
     step_status varchar(32) not null,
     attempt integer not null default 0,
+    clarification_round integer default 0,
+    stage_attempt integer default 0,
+    schema_version integer not null default 2,
+    span_id uuid,
+    parent_span_id uuid,
+    duration_ms integer,
     summary text not null default '',
     payload jsonb not null default '{}'::jsonb,
     created_at timestamptz not null default now()

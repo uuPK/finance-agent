@@ -26,7 +26,15 @@ Get-Content -Raw .\backend\db\schema.sql |
 
 - 新库只需执行 `schema.sql`，不要手工补跑已被 schema 覆盖的旧迁移。
 - 已部署的官方数据版本可按版本说明执行增量元数据迁移，例如 `007`、`008`、`009`。
+- 已有数据库升级到 Phase 5.0 时，执行一次 `011_trace_event_contract.sql`；脚本可重复执行，不删除旧事件。新库的 `schema.sql` 已包含这些字段，不需再补跑 `011`。
 - `006_replace_synthetic_with_official_dataset.sql` 会重建 `mart` schema，只适用于明确要从废弃合成数据迁移的本地环境；执行前必须备份并确认影响。
 - 业务表与列结构是赛事数据边界；语义元数据的人工维护必须通过应用 API 和校验规则完成。
+
+```powershell
+Get-Content -Raw .\backend\db\migrations\011_trace_event_contract.sql |
+  docker exec -i finance-agent-postgres psql -U finance_agent -d finance_agent -v ON_ERROR_STOP=1
+```
+
+旧事件的 `clarification_round` / `stage_attempt` 为 `null`（未知），原有 `attempt` 保留；新事件显式写入两个坐标，SSE 仍保留旧字段。
 
 完整 Windows 步骤、验收 SQL、升级和故障排查见项目根目录的 [部署步骤.md](../../部署步骤.md)。

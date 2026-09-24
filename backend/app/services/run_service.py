@@ -27,6 +27,8 @@ class QueryRunManager:
                 "stage": "receive_question",
                 "status": "running",
                 "attempt": 0,
+                "clarification_round": 0,
+                "stage_attempt": 0,
                 "summary": "已接收问题，正在启动可信问数流程",
                 "output": {"question": question},
             },
@@ -54,6 +56,8 @@ class QueryRunManager:
                 "stage": "clarification_received",
                 "status": "passed",
                 "attempt": attempt,
+                "clarification_round": attempt,
+                "stage_attempt": 0,
                 "summary": "已合并用户补充信息，继续生成查询计划",
                 "output": {"answers": answers},
             },
@@ -79,6 +83,11 @@ class QueryRunManager:
             event["summary"],
             event.get("output") or {},
             event.get("attempt", 0),
+            clarification_round=event.get("clarification_round", 0),
+            stage_attempt=event.get("stage_attempt"),
+            span_id=event.get("span_id"),
+            parent_span_id=event.get("parent_span_id"),
+            duration_ms=event.get("duration_ms"),
         )
 
     async def _execute(
@@ -109,6 +118,8 @@ class QueryRunManager:
                         "stage": "clarification",
                         "status": "passed",
                         "attempt": attempt,
+                        "clarification_round": attempt,
+                        "stage_attempt": 0,
                         "summary": "需要补充业务口径后才能继续查询",
                         "output": {
                             "questions": response.query_plan.clarifications
@@ -127,6 +138,8 @@ class QueryRunManager:
                     "stage": "final_response",
                     "status": terminal_status,
                     "attempt": attempt,
+                    "clarification_round": attempt,
+                    "stage_attempt": 0,
                     "summary": "查询已完成" if response.status == "completed" else "查询未能完成",
                     "output": {"response": response.model_dump(mode="json")},
                 },
@@ -139,6 +152,8 @@ class QueryRunManager:
                     "stage": "runtime",
                     "status": "failed",
                     "attempt": attempt,
+                    "clarification_round": attempt,
+                    "stage_attempt": 0,
                     "summary": "运行过程中发生错误",
                     "output": {"error_type": type(exc).__name__, "error_message": str(exc)},
                 },

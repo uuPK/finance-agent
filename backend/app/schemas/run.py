@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.schemas.query import QueryResponse
+from app.schemas.trace import TraceEvent, TraceStatus
 
 RunStatus = Literal[
     "received",
@@ -16,7 +17,7 @@ RunStatus = Literal[
     "needs_clarification",
     "interrupted",
 ]
-StepStatus = Literal["pending", "running", "passed", "failed", "skipped"]
+StepStatus = TraceStatus
 
 
 class QueryRunCreate(BaseModel):
@@ -30,15 +31,14 @@ class QueryRunCreated(BaseModel):
     stream_url: str
 
 
-class QueryEvent(BaseModel):
+class QueryEvent(TraceEvent):
     event_id: int
-    query_id: UUID
-    type: str
-    stage: str
-    status: StepStatus
+    # Missing trace fields in pre-5.0 API payloads represent a legacy event.
+    schema_version: int = Field(default=1, ge=1)
+    clarification_round: int | None = Field(default=None, ge=0)
+    stage_attempt: int | None = Field(default=None, ge=0)
+    # Deprecated display field. It is not a stable stage identity.
     attempt: int = 0
-    summary: str
-    output: dict[str, Any] = Field(default_factory=dict)
     occurred_at: datetime
 
 

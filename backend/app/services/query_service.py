@@ -97,6 +97,7 @@ class QueryService:
         self.result_validator = result_validator
         self.audit_logger = audit_logger or QueryAuditLogger()
         self.event_sink = event_sink
+        # event_attempt is the legacy constructor name for the clarification round.
         self.event_attempt = max(0, event_attempt)
         self.result_preview_rows = max(1, result_preview_rows or self.settings.result_preview_rows)
 
@@ -791,7 +792,9 @@ class QueryService:
     ) -> None:
         if self.event_sink is None:
             return
-        resolved_attempt = self.event_attempt + (attempt or 0)
+        stage_attempt = attempt or 0
+        # Keep the legacy display field; it must never be used as a step key.
+        resolved_attempt = self.event_attempt + stage_attempt
         resolved_type = event_type
         if resolved_type is None:
             resolved_type = (
@@ -807,6 +810,8 @@ class QueryService:
                 "stage": stage,
                 "status": status,
                 "attempt": resolved_attempt,
+                "clarification_round": self.event_attempt,
+                "stage_attempt": stage_attempt,
                 "summary": summary,
                 "output": output or {},
             }

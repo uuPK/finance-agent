@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 from app.db.session import engine as default_engine
 from app.schemas.query import QueryResponse
 from app.schemas.run import QueryEvent, QueryRunSnapshot
+from app.schemas.trace import TraceEvent
 
 _BLOCKED_KEYS = {
     "api_key",
@@ -90,8 +91,28 @@ class RunRepository:
         summary: str,
         output: dict[str, Any] | None = None,
         attempt: int = 0,
+        *,
+        clarification_round: int = 0,
+        stage_attempt: int | None = None,
+        span_id: UUID | None = None,
+        parent_span_id: UUID | None = None,
+        duration_ms: int | None = None,
     ) -> QueryEvent:
-        payload = sanitize_event_payload(output or {})
+        # Old callers still supply only attempt; interpret it as a stage attempt.
+        trace_event = TraceEvent(
+            query_id=query_id,
+            type=event_type,
+            stage=stage,
+            status=status,
+            summary=summary,
+            output=sanitize_event_payload(output or {}),
+            clarification_round=clarification_round,
+            stage_attempt=attempt if stage_attempt is None else stage_attempt,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            duration_ms=duration_ms,
+        )
+        payload = trace_event.output
         run_status = self._run_status(event_type, status)
         with self.engine.begin() as connection:
             row = (
@@ -99,10 +120,13 @@ class RunRepository:
                     text(
                         """
                     insert into agent.query_events
-                        (query_id, event_type, stage_name, step_status, attempt, summary, payload)
+                        (query_id, event_type, stage_name, step_status, attempt,
+                         clarification_round, stage_attempt, schema_version, span_id,
+                         parent_span_id, duration_ms, summary, payload)
                     values
-                        (:query_id, :event_type, :stage, :status, :attempt, :summary,
-                         cast(:payload as jsonb))
+                        (:query_id, :event_type, :stage, :status, :attempt,
+                         :clarification_round, :stage_attempt, :schema_version, :span_id,
+                         :parent_span_id, :duration_ms, :summary, cast(:payload as jsonb))
                     returning event_id, created_at
                     """
                     ),
@@ -112,6 +136,12 @@ class RunRepository:
                         "stage": stage,
                         "status": status,
                         "attempt": attempt,
+                        "clarification_round": trace_event.clarification_round,
+                        "stage_attempt": trace_event.stage_attempt,
+                        "schema_version": trace_event.schema_version,
+                        "span_id": trace_event.span_id,
+                        "parent_span_id": trace_event.parent_span_id,
+                        "duration_ms": trace_event.duration_ms,
                         "summary": summary,
                         "payload": json.dumps(payload, ensure_ascii=False),
                     },
@@ -123,12 +153,21 @@ class RunRepository:
                 text(
                     """
                     insert into agent.query_steps
-                        (query_id, step_name, attempt, step_status, summary, payload,
-                         started_at, finished_at)
+                        (query_id, step_name, attempt, clarification_round, stage_attempt,
+                         schema_version, span_id, parent_span_id, duration_ms,
+                         step_status, summary, payload, started_at, finished_at)
                     values
-                        (:query_id, :stage, :attempt, :status, :summary, cast(:payload as jsonb),
+                        (:query_id, :stage, :attempt, :clarification_round, :stage_attempt,
+                         :schema_version, :span_id, :parent_span_id, :duration_ms,
+                         :status, :summary, cast(:payload as jsonb),
                          now(), case when :is_running then null else now() end)
-                    on conflict (query_id, step_name, attempt) do update set
+                    on conflict (query_id, clarification_round, step_name, stage_attempt)
+                    do update set
+                        attempt = excluded.attempt,
+                        schema_version = excluded.schema_version,
+                        span_id = excluded.span_id,
+                        parent_span_id = excluded.parent_span_id,
+                        duration_ms = excluded.duration_ms,
                         step_status = excluded.step_status,
                         summary = excluded.summary,
                         payload = excluded.payload,
@@ -139,6 +178,12 @@ class RunRepository:
                     "query_id": str(query_id),
                     "stage": stage,
                     "attempt": attempt,
+                    "clarification_round": trace_event.clarification_round,
+                    "stage_attempt": trace_event.stage_attempt,
+                    "schema_version": trace_event.schema_version,
+                    "span_id": trace_event.span_id,
+                    "parent_span_id": trace_event.parent_span_id,
+                    "duration_ms": trace_event.duration_ms,
                     "status": status,
                     "is_running": status == "running",
                     "summary": summary,
@@ -168,6 +213,12 @@ class RunRepository:
             stage=stage,
             status=status,
             attempt=attempt,
+            clarification_round=trace_event.clarification_round,
+            stage_attempt=trace_event.stage_attempt,
+            schema_version=trace_event.schema_version,
+            span_id=trace_event.span_id,
+            parent_span_id=trace_event.parent_span_id,
+            duration_ms=trace_event.duration_ms,
             summary=summary,
             output=payload,
             occurred_at=row["created_at"],
@@ -208,7 +259,8 @@ class RunRepository:
                     text(
                         """
                     select event_id, query_id, event_type, stage_name, step_status,
-                           attempt, summary, payload, created_at
+                           attempt, clarification_round, stage_attempt, schema_version,
+                           span_id, parent_span_id, duration_ms, summary, payload, created_at
                     from agent.query_events
                     where query_id = :query_id and event_id > :after
                     order by event_id
@@ -342,6 +394,12 @@ class RunRepository:
             stage=row["stage_name"],
             status=row["step_status"],
             attempt=row["attempt"],
+            clarification_round=row["clarification_round"],
+            stage_attempt=row["stage_attempt"],
+            schema_version=row["schema_version"],
+            span_id=row["span_id"],
+            parent_span_id=row["parent_span_id"],
+            duration_ms=row["duration_ms"],
             summary=row["summary"],
             output=dict(row["payload"] or {}),
             occurred_at=row["created_at"],
