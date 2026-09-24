@@ -29,8 +29,10 @@ from app.schemas.query_plan import QueryDimension, QueryMetric, QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
 from app.services.audit_logger import QueryAuditLogger
+from app.services.harness_state import HarnessState
+from app.services.query_harness import QueryHarness
 from app.services.sql_executor import SQLExecutionResult, SQLExecutor
-from app.services.trace_facts import context_facts, plan_facts, validation_facts
+from app.services.trace_facts import context_facts, validation_facts
 from app.services.trace_recorder import TraceRecorder, TracingLLMService
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -73,9 +75,8 @@ class QueryService:
         self.event_sink = event_sink
         # event_attempt is the legacy constructor name for the clarification round.
         self.event_attempt = max(0, event_attempt)
-        self.trace_recorder = (
-            TraceRecorder(event_sink, self.event_attempt) if event_sink is not None else None
-        )
+        self.trace_recorder = TraceRecorder(self._accept_trace_event, self.event_attempt)
+        self.harness_state: HarnessState | None = None
         self.rule_based_actor = RuleBasedQueryPlanActor()
         self.plan_validator = QueryPlanHardValidator()
         self.llm_unavailable_reason: str | None = None
@@ -90,7 +91,7 @@ class QueryService:
         elif not enable_llm:
             self.llm_unavailable_reason = "LLM is disabled for this QueryService instance."
         self.llm_enabled = resolved_llm_service is not None
-        if resolved_llm_service is not None and self.trace_recorder is not None:
+        if resolved_llm_service is not None:
             resolved_llm_service = TracingLLMService(resolved_llm_service, self.trace_recorder)
 
         self.query_plan_actor = LLMQueryPlanActor(
@@ -119,6 +120,13 @@ class QueryService:
     ) -> QueryResponse:
         started_at = perf_counter()
         query_id = query_id or uuid4()
+        self.harness_state = HarnessState(
+            query_id=query_id,
+            clarification_round=self.event_attempt,
+            max_plan_repairs=self.max_repair_attempts,
+            max_sql_repairs=self.max_repair_attempts,
+        )
+        harness = QueryHarness(self, self.harness_state)
         if start_audit:
             self.audit_logger.start_query_run(
                 query_id=query_id,
@@ -126,139 +134,17 @@ class QueryService:
                 user_id=request.user_id,
             )
 
-        await self._emit("receive_question", "running", "正在接收业务问题")
-        await self._emit(
-            "receive_question",
-            "passed",
-            "已接收业务问题",
-            {"question": request.question},
-        )
+        plan_phase = await harness.prepare_plan(request.question, previous_plan)
+        query_plan = plan_phase.query_plan
+        metadata_context = plan_phase.metadata_context
+        build_result = plan_phase.build_result
+        build_results = plan_phase.build_results
+        review_bundle = plan_phase.review_bundle
+        hard_review_passed = plan_phase.hard_review_passed
+        critic_result = plan_phase.critic_result
+        review_history = plan_phase.review_history
 
-        await self._emit("retrieve_metadata", "running", "正在检索相关元数据")
-        metadata_context = self._load_metadata_context(request.question)
-        await self._record_trace("context_selection", lambda: context_facts(metadata_context))
-        await self._emit(
-            "retrieve_metadata",
-            "passed" if metadata_context.get("source") == "database" else "failed",
-            "已完成元数据检索",
-            self._metadata_context_summary(metadata_context),
-        )
-        await self._emit("build_query_plan", "running", "正在生成结构化查询计划")
-        build_result = await self.query_plan_actor.build(
-            request.question,
-            fallback_plan=previous_plan,
-            previous_plan=previous_plan,
-            metadata_context=metadata_context,
-        )
-        deterministic_plan = self.rule_based_actor.build(request.question)
-        build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
-        query_plan = build_result.plan
-        build_results = [build_result]
-        metadata_context = self._load_metadata_context(
-            request.question, query_plan, previous_context=metadata_context
-        )
-        query_plan, metadata_context = self._ground_plan_with_context(
-            request.question, query_plan, metadata_context
-        )
-        build_result.plan = query_plan
-        await self._record_trace("context_selection", lambda: context_facts(metadata_context))
-        await self._record_trace("plan_evidence", lambda: plan_facts(query_plan))
-        await self._emit(
-            "build_query_plan",
-            "passed",
-            "查询计划已生成并核对证据来源",
-            {
-                "query_plan": query_plan.model_dump(mode="json", exclude_none=True),
-                **self._build_actor_details(build_result, build_results),
-            },
-        )
-        review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-            query_plan, metadata_context, attempt=0, original_question=request.question
-        )
-        review_history = [
-            self._build_review_details(
-                build_result.repair_attempt,
-                review_bundle,
-                hard_review_passed,
-                critic_result,
-            )
-        ]
-
-        repair_count = 0
-        while self._should_repair(query_plan, review_bundle, repair_count):
-            repair_feedback = self._failed_review_feedback(review_bundle)
-            repair_count += 1
-            await self._emit(
-                "repair_query_plan",
-                "running",
-                f"正在进行第 {repair_count} 次查询计划修复",
-                {"feedback": [item.model_dump(mode="json") for item in repair_feedback]},
-                attempt=repair_count,
-            )
-            build_result = await self.query_plan_actor.build(
-                request.question,
-                fallback_plan=query_plan,
-                previous_plan=query_plan,
-                critic_feedback=repair_feedback,
-                metadata_context=metadata_context,
-                repair_attempt=repair_count,
-            )
-            build_result = self._apply_rule_plan_safeguards(build_result, deterministic_plan)
-            build_results.append(build_result)
-            query_plan = build_result.plan
-            metadata_context = self._load_metadata_context(
-                request.question, query_plan, previous_context=metadata_context
-            )
-            query_plan, metadata_context = self._ground_plan_with_context(
-                request.question, query_plan, metadata_context
-            )
-            build_result.plan = query_plan
-            await self._record_trace(
-                "context_selection", lambda context=metadata_context: context_facts(context)
-            )
-            await self._record_trace("plan_evidence", lambda plan=query_plan: plan_facts(plan))
-            await self._emit(
-                "repair_query_plan",
-                "passed" if build_result.source == "llm" else "failed",
-                f"第 {repair_count} 次查询计划修复已完成",
-                {
-                    "query_plan": query_plan.model_dump(mode="json", exclude_none=True),
-                    "actor_source": build_result.source,
-                    "llm_error": build_result.llm_error,
-                },
-                attempt=repair_count,
-            )
-            if build_result.source != "llm":
-                review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                    query_plan,
-                    metadata_context,
-                    attempt=repair_count,
-                    original_question=request.question,
-                )
-                review_history.append(
-                    self._build_review_details(
-                        build_result.repair_attempt,
-                        review_bundle,
-                        hard_review_passed,
-                        critic_result,
-                    )
-                )
-                break
-            review_bundle, hard_review_passed, critic_result = await self._review_query_plan(
-                query_plan,
-                metadata_context,
-                attempt=repair_count,
-                original_question=request.question,
-            )
-            review_history.append(
-                self._build_review_details(
-                    build_result.repair_attempt,
-                    review_bundle,
-                    hard_review_passed,
-                    critic_result,
-                )
-            )
-
+        repair_count = self.harness_state.plan_repairs_used
         review_passed = review_bundle.passed
         sql_loop_result: SQLLoopResult | None = None
         answer_result: AnswerRenderResult | None = None
@@ -273,7 +159,7 @@ class QueryService:
             status = "needs_clarification"
             answer = "当前问题需要进一步明确后才能生成可靠查询。"
         else:
-            sql_loop_result = await self._run_sql_loop(
+            sql_loop_result = await harness.run_sql(
                 query_id, request.question, query_plan, metadata_context
             )
             if sql_loop_result.passed:
@@ -326,9 +212,7 @@ class QueryService:
             and sql_loop_result.execution_result is not None
             else []
         )
-        total_retry_count = repair_count + (
-            sql_loop_result.repair_count if sql_loop_result is not None else 0
-        )
+        total_retry_count = self.harness_state.total_retries
 
         elapsed_ms = int((perf_counter() - started_at) * 1000)
         all_checks = [
@@ -821,8 +705,6 @@ class QueryService:
         attempt: int | None = None,
         event_type: str | None = None,
     ) -> None:
-        if self.trace_recorder is None:
-            return
         await self.trace_recorder.emit_stage(
             stage,
             status,
@@ -832,6 +714,17 @@ class QueryService:
             event_type=event_type,
         )
 
+    async def _accept_trace_event(self, event: dict[str, Any]) -> None:
+        """Mirror successfully published Trace facts into the run-scoped state."""
+        if self.event_sink is not None:
+            await self.event_sink(event)
+        if self.harness_state is None:
+            return
+        if event["type"].startswith("trace."):
+            self.harness_state.observe_telemetry(event)
+        else:
+            self.harness_state.observe_stage(event)
+
     async def _record_trace(
         self,
         kind: str,
@@ -839,32 +732,12 @@ class QueryService:
         *,
         duration_ms: int | None = None,
     ) -> None:
-        if self.trace_recorder is None:
-            return
         try:
             facts = payload() if callable(payload) else payload
         except Exception:
             self.trace_recorder.telemetry_projection_failures += 1
             return
         await self.trace_recorder.record(kind, facts, duration_ms=duration_ms)
-
-    def _should_repair(
-        self,
-        query_plan: QueryPlan,
-        review_bundle: ReviewBundle,
-        repair_count: int,
-    ) -> bool:
-        if review_bundle.passed:
-            return False
-        if repair_count >= self.max_repair_attempts:
-            return False
-        if not self.llm_enabled:
-            return False
-        if query_plan.plan_status == "invalid":
-            return False
-        if getattr(query_plan, "plan_status", None) == "needs_clarification":
-            return bool(self._failed_review_feedback(review_bundle))
-        return True
 
     def _failed_review_feedback(self, review_bundle: ReviewBundle) -> list[ReviewDecision]:
         return [
@@ -879,6 +752,8 @@ class QueryService:
         question: str,
         query_plan: QueryPlan,
         metadata_context: dict[str, object] | None = None,
+        *,
+        harness: QueryHarness,
     ) -> SQLLoopResult:
         await self._emit("load_schema_context", "running", "正在加载 SQL 生成所需的数据结构")
         if metadata_context is None:
@@ -941,7 +816,7 @@ class QueryService:
                 failure_reason=build_result.llm_error or "SQL generation failed.",
             )
 
-        repair_count = 0
+        repair_count = harness.state.sql_repairs_used
         review_bundle = ReviewBundle()
         hard_review_passed = False
         critic_result = LLMSQLCriticResult(status="failed")
@@ -1108,12 +983,12 @@ class QueryService:
                     )
                 )
 
-            if not self._should_repair_sql_attempt(review_bundle, result_validation, repair_count):
+            if not harness.should_repair_sql(review_bundle, result_validation):
                 break
 
             repair_feedback = self._failed_sql_attempt_feedback(review_bundle, result_validation)
             previous_sql = build_result.draft.sql
-            repair_count += 1
+            repair_count = harness.state.reserve_repair("sql")
             await self._emit(
                 "repair_sql",
                 "running",
@@ -1163,6 +1038,14 @@ class QueryService:
                 break
 
         passed = bool(review_bundle.passed and result_validation and result_validation.passed)
+        if not passed and not harness.state.can_repair("sql"):
+            await self._emit(
+                "sql_repair_budget",
+                "failed",
+                "SQL 修复预算已耗尽",
+                harness.state.budget_facts("sql"),
+                event_type="budget.exhausted",
+            )
         sql = build_result.draft.sql if passed and build_result.draft is not None else None
         failure_reason = self._sql_loop_failure_reason(
             review_bundle, execution_result, result_validation
@@ -1463,24 +1346,6 @@ class QueryService:
         if not isinstance(value, dict):
             return {}
         return {key: item for key, item in value.items() if isinstance(key, str)}
-
-    def _should_repair_sql_attempt(
-        self,
-        review_bundle: ReviewBundle,
-        result_validation: ResultValidationResult | None,
-        repair_count: int,
-    ) -> bool:
-        if review_bundle.passed and result_validation is not None and result_validation.passed:
-            return False
-        if repair_count >= self.max_repair_attempts:
-            return False
-        if not self.llm_enabled:
-            return False
-        if not review_bundle.passed:
-            return bool(self._failed_review_feedback(review_bundle))
-        if result_validation is not None:
-            return bool(self._failed_result_feedback(result_validation))
-        return False
 
     def _failed_sql_attempt_feedback(
         self,

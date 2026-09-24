@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.schemas.run import QueryEvent
 from app.schemas.trace import TraceEvent
+from app.services.harness_state import HarnessState
 from app.services.query_service import QueryService
 from app.services.run_repository import RunRepository
 
@@ -74,6 +75,33 @@ def test_query_service_emits_round_and_stage_attempt_separately() -> None:
 
     assert [(e["clarification_round"], e["stage_attempt"]) for e in events] == [(1, 0), (1, 1)]
     assert [e["attempt"] for e in events] == [1, 2]  # Legacy SSE field remains.
+
+
+def test_direct_recorder_telemetry_updates_harness_state() -> None:
+    events: list[dict] = []
+
+    async def sink(event: dict) -> None:
+        events.append(event)
+
+    service = QueryService(enable_llm=False, event_sink=sink)
+    state = HarnessState(uuid4(), clarification_round=0, max_plan_repairs=2, max_sql_repairs=2)
+    service.harness_state = state
+
+    async def record() -> None:
+        await service._emit("build_query_plan", "running", "start")
+        await service.trace_recorder.record(
+            "llm_call", {"prompt_tokens": 42, "completion_tokens": 7}
+        )
+        await service._emit("build_query_plan", "passed", "done")
+
+    asyncio.run(record())
+    assert [event["type"] for event in events] == [
+        "stage.started", "trace.llm_call", "stage.completed"
+    ]
+    assert state.llm_calls == 1
+    assert state.prompt_tokens == 42
+    assert state.completion_tokens == 7
+    assert state.stages[("build_query_plan", 0)].span_id == events[0]["span_id"]
 
 
 @pytest.mark.skipif(

@@ -40,7 +40,7 @@ Trace 不能反向决定流程。检索、Context、Plan、SQL、执行、结果
 3. 让当前事件发布链路明确传递轮次和阶段尝试，修正两者相加造成的碰撞；原有 SSE 结构保持可消费。
 4. 测试同一运行中的“首轮修复 1 次”与“澄清后首轮”不互相覆盖、迁移可重复应用、旧记录仍可读取。
 
-### Phase 5.1：TraceRecorder 和阶段适配（已实现，待用户验收）
+### Phase 5.1：TraceRecorder 和阶段适配（已完成，`254cf76`）
 
 复用 `query_events` 作为追加日志、`query_steps` 作为兼容的阶段视图；记录检索排名/入选原因、Context 取舍、Plan 证据、校验结果、模型实际 token 与单调时钟耗时。沿用 SQL 执行明细表，以 `query_id`/`execution_id` 引用，不复制结果行。
 
@@ -50,9 +50,13 @@ Trace 不能反向决定流程。检索、Context、Plan、SQL、执行、结果
 
 真实链路验收使用 `RUN_TRACE_LIVE_TESTS=1` 运行 `backend/tests/test_trace_live_integration.py`：调用当前配置的真实模型与 Milvus/智谱检索，只在测试进程内存保留响应和事件，不写入运行审计表。普通全量测试默认跳过它，避免意外调用付费 API。
 
-### Phase 5.2：HarnessState 与 QueryService facade
+### Phase 5.2：HarnessState 与 QueryService facade（已实现，待用户验收）
 
-引入统一状态和预算，逐阶段搬迁编排，阶段输入/输出与 Trace span 一一对应。迁移期间旧 API、SSE、SQL Guardrail 和规则保护保持工作；不在此子步实现新的失败路由。
+引入统一状态和预算，逐阶段搬迁编排；用相同的阶段坐标关联 Trace span 与已有的输入/输出证据引用。迁移期间旧 API、SSE、SQL Guardrail 和规则保护保持工作；不在此子步实现新的失败路由。
+
+当前落地边界：每次 `QueryService.run` 创建一个仅驻留内存的 `HarnessState`，按澄清轮次维护阶段 `(stage, stage_attempt)`、Trace span、引用 ID、真实模型用量，以及独立的 Plan/SQL 修复预算。所有阶段事件和直接由模型包装器发出的遥测均经过同一事件出口：外部 sink 成功后才同步到状态；无 SSE sink 的直接查询 API 也维护相同状态。`QueryHarness` 接管接收问题、元数据检索、QueryPlan 生成/审核/修复的现有顺序，并给 SQL 修复预留预算；SQL 执行与结果校验仍沿用原逻辑。
+
+预算耗尽时追加 `budget.exhausted` 事件，保留计数和上限，但不复制 Prompt、SQL 或结果行。此步只收拢运行状态与预算控制，不增加新的失败域路由，不删除原有规则生成兜底、硬校验或 SQL Guardrail，也不引入模拟模型。
 
 ### Phase 6：Failure-Domain Router
 

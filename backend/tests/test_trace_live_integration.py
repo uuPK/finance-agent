@@ -71,6 +71,11 @@ def test_real_model_and_hybrid_retrieval_emit_trace_without_saving_results() -> 
         and not event["type"].startswith("trace.")
     )
     assert response.status in {"completed", "needs_clarification", "failed"}
+    state = service.harness_state
+    assert state is not None and state.query_id == response.query_id
+    assert state.stages[("build_query_plan", 0)].span_id is not None
+    assert state.llm_calls >= 1
+    assert state.prompt_tokens is not None and state.prompt_tokens > 0
     # No response, SQL text, prompt, or rows are written to a file or database here.
     for event in events:
         if event["type"].startswith("trace."):
