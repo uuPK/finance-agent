@@ -13,6 +13,7 @@ from app.agents.llm_sql_critic import LLMSQLCritic, LLMSQLCriticResult
 from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
 from app.core.config import get_settings
+from app.guardrails.empty_result_diagnostic import EmptyResultDiagnosticValidator
 from app.guardrails.plan_grounding import ground_query_plan
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
@@ -20,6 +21,7 @@ from app.llm.protocols import SupportsLLMComplete
 from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.query import (
     AgentStep,
+    EmptyResultDiagnosis,
     EvaluationExecutionArtifact,
     GuardrailCheck,
     QueryRequest,
@@ -54,6 +56,7 @@ class SQLLoopResult:
     result_hard_validation: ResultValidationResult | None = None
     result_validation: ResultValidationResult | None = None
     result_critic_result: LLMResultCriticResult | None = None
+    empty_result_diagnosis: EmptyResultDiagnosis | None = None
     execution_history: list[dict[str, object]] | None = None
     failure_reason: str | None = None
 
@@ -106,6 +109,10 @@ class QueryService:
         self.answer_actor = AnswerActor()
         self.schema_context_provider = schema_context_provider or SchemaContextProvider()
         self.sql_executor = sql_executor or SQLExecutor()
+        self.empty_result_validator = EmptyResultDiagnosticValidator(
+            engine=getattr(self.sql_executor, "engine", None),
+            timeout_seconds=self.settings.empty_result_diagnostic_timeout_seconds,
+        )
         self.result_validator = result_validator
         self.audit_logger = audit_logger or QueryAuditLogger()
         self.result_preview_rows = max(1, result_preview_rows or self.settings.result_preview_rows)
@@ -178,6 +185,7 @@ class QueryService:
                         query_plan=query_plan,
                         execution_result=sql_loop_result.execution_result,
                         preview_rows=self._response_preview_rows(sql_loop_result.execution_result),
+                        empty_result_diagnosis=sql_loop_result.empty_result_diagnosis,
                     )
                     answer = answer_result.answer
                     await self._emit(
@@ -229,6 +237,19 @@ class QueryService:
         response = QueryResponse(
             query_id=query_id,
             status=status,
+            result_status=(
+                "EMPTY_RESULT"
+                if status == "completed"
+                and sql_loop_result is not None
+                and sql_loop_result.execution_result is not None
+                and sql_loop_result.execution_result.row_count == 0
+                else "HAS_ROWS"
+                if status == "completed"
+                else None
+            ),
+            empty_result_diagnosis=(
+                sql_loop_result.empty_result_diagnosis if sql_loop_result is not None else None
+            ),
             answer=answer,
             query_plan=query_plan,
             sql=sql,
@@ -839,6 +860,7 @@ class QueryService:
         execution_result: SQLExecutionResult | None = None
         result_hard_validation: ResultValidationResult | None = None
         result_validation: ResultValidationResult | None = None
+        empty_result_diagnosis: EmptyResultDiagnosis | None = None
         result_critic_result = LLMResultCriticResult(
             status="skipped",
             llm_error="Result review has not run.",
@@ -869,6 +891,7 @@ class QueryService:
             execution_result = None
             result_hard_validation = None
             result_validation = None
+            empty_result_diagnosis = None
             result_critic_result = LLMResultCriticResult(
                 status="skipped",
                 llm_error="Result review skipped before SQL execution.",
@@ -952,6 +975,40 @@ class QueryService:
                     },
                     attempt=sql_stage_attempt,
                 )
+                if (
+                    execution_result.status == "success"
+                    and execution_result.row_count == 0
+                    and result_hard_validation.passed
+                ):
+                    await self._emit(
+                        "diagnose_empty_result",
+                        "running",
+                        "正在检查简单筛选条件为何没有交集",
+                        attempt=sql_stage_attempt,
+                    )
+                    try:
+                        empty_result_diagnosis = self.empty_result_validator.diagnose(
+                            build_result.draft.sql, metadata_context
+                        )
+                    except Exception:
+                        empty_result_diagnosis = EmptyResultDiagnosis(
+                            status="probe_failed", reason_code="diagnostic_exception"
+                        )
+                    await self._record_trace(
+                        "empty_result_diagnosis",
+                        lambda result=empty_result_diagnosis: result.model_dump(mode="json"),
+                    )
+                    await self._emit(
+                        "diagnose_empty_result",
+                        "skipped"
+                        if empty_result_diagnosis.status == "unsupported"
+                        else "failed"
+                        if empty_result_diagnosis.status == "probe_failed"
+                        else "passed",
+                        "空结果诊断已结束，未改变原 SQL 或筛选条件",
+                        empty_result_diagnosis.model_dump(mode="json"),
+                        attempt=sql_stage_attempt,
+                    )
                 await self._emit(
                     "result_llm_review",
                     "running" if result_hard_validation.passed else "skipped",
@@ -1215,6 +1272,7 @@ class QueryService:
             result_hard_validation=result_hard_validation,
             result_validation=result_validation,
             result_critic_result=result_critic_result,
+            empty_result_diagnosis=empty_result_diagnosis,
             execution_history=execution_history,
             failure_reason=failure_reason,
         )
@@ -1654,6 +1712,22 @@ class QueryService:
             self._build_sql_critic_step(result.critic_result),
             self._build_sql_execution_step(result),
             self._build_result_validation_step(result),
+            *(
+                [
+                    AgentStep(
+                        name="diagnose_empty_result",
+                        status="skipped"
+                        if result.empty_result_diagnosis.status == "unsupported"
+                        else "failed"
+                        if result.empty_result_diagnosis.status == "probe_failed"
+                        else "passed",
+                        summary="Diagnosed zero-row AND filters without changing the SQL.",
+                        details=result.empty_result_diagnosis.model_dump(mode="json"),
+                    )
+                ]
+                if result.empty_result_diagnosis is not None
+                else []
+            ),
             self._build_result_critic_step(result),
         ]
 

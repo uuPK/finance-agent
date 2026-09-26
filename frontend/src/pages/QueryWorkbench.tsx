@@ -268,6 +268,9 @@ export function QueryWorkbench({
                   </select>
                 </label>
               ) : null}
+              {run?.response?.result_status === "EMPTY_RESULT" ? (
+                <span className="border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800">结果为空</span>
+              ) : null}
               {run ? <StatusBadge status={run.status} /> : null}
             </div>
           </div>

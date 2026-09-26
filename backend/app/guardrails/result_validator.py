@@ -62,9 +62,7 @@ class ResultHardValidator:
             self._check_empty_result(execution_result),
         ]
         checks = [self._to_review_decision(finding) for finding in findings]
-        failed_errors = [
-            check for check in checks if not check.passed and check.error_type
-        ]
+        failed_errors = [check for check in checks if not check.passed and check.error_type]
         passed = not failed_errors
         score = self._score(checks)
         primary_failure = failed_errors[0] if failed_errors else None
@@ -76,9 +74,7 @@ class ResultHardValidator:
             repair_hint=primary_failure.repair_hint if primary_failure else None,
         )
 
-    def _check_execution_success(
-        self, execution_result: SQLExecutionResult
-    ) -> ResultFinding:
+    def _check_execution_success(self, execution_result: SQLExecutionResult) -> ResultFinding:
         if execution_result.status == "success":
             return ResultFinding(
                 name="execution_success",
@@ -137,9 +133,7 @@ class ResultHardValidator:
             message="SQL returned a non-empty column schema.",
         )
 
-    def _check_sensitive_columns(
-        self, execution_result: SQLExecutionResult
-    ) -> ResultFinding:
+    def _check_sensitive_columns(self, execution_result: SQLExecutionResult) -> ResultFinding:
         returned = {column.lower() for column in execution_result.columns}
         sensitive = returned & self.sensitive_columns
         if sensitive:
@@ -222,8 +216,8 @@ class ResultHardValidator:
                 name="empty_result",
                 passed=True,
                 message=(
-                    "SQL returned zero rows. This may be valid for restrictive filters; "
-                    "semantic result review can decide whether repair is needed."
+                    "SQL returned zero rows. This is not a hard failure; bounded "
+                    "diagnosis may explain the filters without modifying SQL."
                 ),
                 severity="warning",
             )

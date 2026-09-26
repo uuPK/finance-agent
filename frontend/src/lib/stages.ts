@@ -12,6 +12,7 @@ export const stageLabels: Record<string, string> = {
   repair_sql: "修复 SQL",
   execute_sql: "执行 SQL",
   result_hard_review: "结果硬规则检查",
+  diagnose_empty_result: "空结果诊断",
   result_llm_review: "结果语义审核",
   render_answer: "生成回答",
   clarification: "补充业务口径",

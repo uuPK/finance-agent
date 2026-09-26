@@ -200,7 +200,8 @@ _RESULT_CRITIC_SYSTEM_PROMPT = dedent(
     - Result row_count 是否与列表、TopN、汇总等输出目标一致。
     - Result preview 是否显示关键字段的非空或合理值。聚合 COUNT、SUM、AVG 查询
       返回数值 0 是合法业务结果，不能仅因数值为 0 判定失败或要求放宽条件。
-    - 空结果是否可能是严格过滤导致；如果用户明确要名单但 row_count=0，应提示可能需要放宽条件。
+    - row_count=0 本身不是错误；严格条件可能合理地得到空结果。不要仅因零行建议放宽条件、
+      修改 WHERE 或重生成 SQL；只有独立证据表明 SQL 偏离 QueryPlan 时才报告具体问题。
     - 是否暴露敏感字段或疑似个人身份信息。
 
     评分和 passed 规则：

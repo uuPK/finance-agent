@@ -128,6 +128,14 @@ export interface AgentStep {
 export interface QueryResponse {
   query_id: string;
   status: "planned" | "completed" | "failed" | "needs_clarification";
+  result_status?: "HAS_ROWS" | "EMPTY_RESULT" | null;
+  empty_result_diagnosis?: {
+    status: "plausible_valid_empty" | "predicate_empty" | "inconclusive" | "unsupported" | "probe_failed";
+    reason_code: string;
+    predicate_count: number;
+    individual_nonempty: boolean[];
+    prefix_nonempty: boolean[];
+  } | null;
   answer: string;
   query_plan?: QueryPlan;
   sql?: string;

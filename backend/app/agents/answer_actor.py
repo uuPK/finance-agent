@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.schemas.query import EmptyResultDiagnosis
 from app.schemas.query_plan import QueryPlan
 from app.services.sql_executor import SQLExecutionResult
 
@@ -41,6 +42,7 @@ class AnswerActor:
         query_plan: QueryPlan,
         execution_result: SQLExecutionResult,
         preview_rows: list[dict[str, Any]],
+        empty_result_diagnosis: EmptyResultDiagnosis | None = None,
     ) -> AnswerRenderResult:
         columns = list(execution_result.columns)
         grain = query_plan.grain.level if query_plan.grain else None
@@ -59,7 +61,24 @@ class AnswerActor:
             )
 
         if row_count == 0:
-            answer = "查询已完成，未找到满足条件的数据。"
+            if (
+                empty_result_diagnosis is not None
+                and empty_result_diagnosis.status == "plausible_valid_empty"
+            ):
+                answer = "当前条件组合下没有符合条件的数据。"
+            elif (
+                empty_result_diagnosis is not None
+                and empty_result_diagnosis.status == "predicate_empty"
+            ):
+                answer = "当前筛选条件下没有符合条件的数据；至少一个单独条件也没有匹配记录。"
+            elif empty_result_diagnosis is not None and empty_result_diagnosis.status in {
+                "unsupported",
+                "probe_failed",
+                "inconclusive",
+            }:
+                answer = "查询未返回记录；自动空结果诊断未能确认原因，系统没有调整筛选条件。"
+            else:
+                answer = "查询已完成，未找到满足条件的数据。"
         else:
             total_count, total_count_column = self._extract_total_count(
                 preview_rows=preview_rows,
@@ -122,9 +141,7 @@ class AnswerActor:
             parts.append(f"结果摘要：{single_row_summary}。")
 
         if truncated:
-            parts.append(
-                f"结果超过系统最大返回行数，当前仅保留前 {row_count} 条用于安全预览。"
-            )
+            parts.append(f"结果超过系统最大返回行数，当前仅保留前 {row_count} 条用于安全预览。")
         elif preview_row_count < row_count:
             parts.append(f"当前响应展示前 {preview_row_count} 条预览，明细见 result_preview。")
         elif preview_row_count > 0:

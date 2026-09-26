@@ -157,6 +157,10 @@ Plan Actor 提议业务解释后，服务端重新核对原始用户问题与召
 
 Phase 5–6 已建立 Trace、HarnessState 与失败域路由：澄清轮次和阶段修复尝试分开记录；实时结构与 Context 不一致时可在内存中有界刷新，连接/锁等瞬时故障有界退避重试，SQL 执行超时走优化修复，无法验证的故障保守终止。详细路由、预算与验收边界见 [Trace 与 Harness 联动实施计划](docs/phase5-trace-harness-plan.md)。
 
+### 空结果诊断（Phase 7）
+
+成功但零行的查询保持 `status=completed`，并以独立 `result_status=EMPTY_RESULT` 标识。单表、简单 AND 条件下，系统用一条受 Guardrail 保护的限时只读聚合 SQL 检查各条件及其交集；条件组合没有匹配数据时直接说明，不自动放宽筛选或修复 SQL。复杂查询或探针失败仅报告诊断未确认。详见 [Phase 7 实施与验收边界](docs/phase7-empty-result-diagnosis.md)。
+
 ## 本地质量检查与持续集成
 
 ```powershell

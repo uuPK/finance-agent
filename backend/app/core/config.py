@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     model_name: str = "deepseek-chat"
     max_retry: int = 2
     sql_timeout_seconds: int = 30
+    empty_result_diagnostic_timeout_seconds: int = 3
     max_result_rows: int = 1000
     result_preview_rows: int = 100
     export_max_rows: int = 100000

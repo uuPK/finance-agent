@@ -7,6 +7,7 @@ from app.schemas.query_plan import QueryFilter, QueryMetric, QueryPlan
 
 __all__ = [
     "AgentStep",
+    "EmptyResultDiagnosis",
     "GuardrailCheck",
     "QueryFilter",
     "QueryMetric",
@@ -46,13 +47,23 @@ class EvaluationExecutionArtifact(BaseModel):
     truncated: bool = False
 
 
+class EmptyResultDiagnosis(BaseModel):
+    status: Literal[
+        "plausible_valid_empty", "predicate_empty", "inconclusive", "unsupported", "probe_failed"
+    ]
+    reason_code: str
+    predicate_count: int = 0
+    individual_nonempty: list[bool] = Field(default_factory=list)
+    prefix_nonempty: list[bool] = Field(default_factory=list)
+
+
 class QueryResponse(BaseModel):
-    _evaluation_execution_artifact: EvaluationExecutionArtifact | None = PrivateAttr(
-        default=None
-    )
+    _evaluation_execution_artifact: EvaluationExecutionArtifact | None = PrivateAttr(default=None)
 
     query_id: UUID = Field(default_factory=uuid4)
     status: Literal["planned", "completed", "failed", "needs_clarification"] = "planned"
+    result_status: Literal["HAS_ROWS", "EMPTY_RESULT"] | None = None
+    empty_result_diagnosis: EmptyResultDiagnosis | None = None
     answer: str
     query_plan: QueryPlan | None = None
     sql: str | None = None
