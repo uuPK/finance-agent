@@ -37,6 +37,7 @@ class HarnessState:
     completion_tokens: int | None = None
     context_tokens_estimated: int | None = None
     retrieval_calls: int = 0
+    route_count: int = 0
 
     def __post_init__(self) -> None:
         if self.clarification_round < 0 or self.max_plan_repairs < 0 or self.max_sql_repairs < 0:
@@ -60,6 +61,10 @@ class HarnessState:
             return self.plan_repairs_used
         self.sql_repairs_used += 1
         return self.sql_repairs_used
+
+    def next_route_attempt(self) -> int:
+        self.route_count += 1
+        return self.route_count
 
     @property
     def total_retries(self) -> int:

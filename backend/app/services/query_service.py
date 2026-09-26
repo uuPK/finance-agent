@@ -28,6 +28,7 @@ from app.schemas.query import (
 from app.schemas.query_plan import QueryDimension, QueryMetric, QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
 from app.schemas.sql import SQLDraft
+from app.schemas.v2_protocol import HarnessAction
 from app.services.audit_logger import QueryAuditLogger
 from app.services.harness_state import HarnessState
 from app.services.query_harness import QueryHarness
@@ -789,6 +790,7 @@ class QueryService:
         )
 
         if build_result.draft is None:
+            await harness.route_sql_generation_failure("generate_sql", 0)
             review_bundle = ReviewBundle(
                 hard_checks=[self._sql_actor_failure_decision(build_result)]
             )
@@ -983,12 +985,32 @@ class QueryService:
                     )
                 )
 
-            if not harness.should_repair_sql(review_bundle, result_validation):
+            passed = bool(review_bundle.passed and result_validation and result_validation.passed)
+            if passed:
+                break
+
+            failure = harness.sql_failure(review_bundle, result_validation, execution_result)
+            if failure.stage == "sql":
+                source_stage = (
+                    "sql_hard_review"
+                    if any(not item.passed for item in review_bundle.hard_checks)
+                    else "sql_llm_review"
+                )
+            elif failure.stage == "execution":
+                source_stage = "execute_sql"
+            else:
+                source_stage = "result_hard_review"
+            route = await harness.route_failure(
+                failure,
+                source_stage=source_stage,
+                source_attempt=build_result.repair_attempt,
+            )
+            if route.final_action != HarnessAction.SQL_REPAIR:
                 break
 
             repair_feedback = self._failed_sql_attempt_feedback(review_bundle, result_validation)
             previous_sql = build_result.draft.sql
-            repair_count = harness.state.reserve_repair("sql")
+            repair_count = harness.state.sql_repairs_used
             await self._emit(
                 "repair_sql",
                 "running",
@@ -1005,6 +1027,9 @@ class QueryService:
                 repair_attempt=repair_count,
             )
             build_results.append(build_result)
+            await harness.record_route_execution(
+                route, "applied" if build_result.draft is not None else "failed"
+            )
             await self._emit(
                 "repair_sql",
                 "passed" if build_result.draft is not None else "failed",
@@ -1019,6 +1044,7 @@ class QueryService:
             )
 
             if build_result.draft is None:
+                await harness.route_sql_generation_failure("repair_sql", repair_count)
                 review_bundle = ReviewBundle(
                     hard_checks=[self._sql_actor_failure_decision(build_result)]
                 )
@@ -1038,14 +1064,6 @@ class QueryService:
                 break
 
         passed = bool(review_bundle.passed and result_validation and result_validation.passed)
-        if not passed and not harness.state.can_repair("sql"):
-            await self._emit(
-                "sql_repair_budget",
-                "failed",
-                "SQL 修复预算已耗尽",
-                harness.state.budget_facts("sql"),
-                event_type="budget.exhausted",
-            )
         sql = build_result.draft.sql if passed and build_result.draft is not None else None
         failure_reason = self._sql_loop_failure_reason(
             review_bundle, execution_result, result_validation

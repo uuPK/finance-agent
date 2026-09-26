@@ -96,7 +96,9 @@ def test_direct_recorder_telemetry_updates_harness_state() -> None:
 
     asyncio.run(record())
     assert [event["type"] for event in events] == [
-        "stage.started", "trace.llm_call", "stage.completed"
+        "stage.started",
+        "trace.llm_call",
+        "stage.completed",
     ]
     assert state.llm_calls == 1
     assert state.prompt_tokens == 42
@@ -194,13 +196,22 @@ def test_trace_telemetry_is_append_only_and_does_not_replace_stage_view() -> Non
     repository.create_run(query_id, "trace telemetry regression", "trace-test")
     try:
         started = repository.append_event(
-            query_id, "stage.started", "generate_sql", "running", "stage started",
+            query_id,
+            "stage.started",
+            "generate_sql",
+            "running",
+            "stage started",
             span_id=uuid4(),
         )
         telemetry = repository.append_event(
-            query_id, "trace.llm_call", "generate_sql", "passed", "llm_call",
+            query_id,
+            "trace.llm_call",
+            "generate_sql",
+            "passed",
+            "llm_call",
             {"prompt_tokens": 12, "completion_tokens": 4},
-            span_id=uuid4(), parent_span_id=started.span_id,
+            span_id=uuid4(),
+            parent_span_id=started.span_id,
         )
         assert telemetry.parent_span_id == started.span_id
         with repository.engine.connect() as connection:
@@ -218,8 +229,52 @@ def test_trace_telemetry_is_append_only_and_does_not_replace_stage_view() -> Non
         assert step_rows == [("stage started",)]
         assert run_stage == "generate_sql"
         assert [event.type for event in repository.list_events(query_id)] == [
-            "stage.started", "trace.llm_call"
+            "stage.started",
+            "trace.llm_call",
         ]
+    finally:
+        with repository.engine.begin() as connection:
+            connection.execute(
+                text("delete from agent.query_runs where query_id = :query_id"),
+                {"query_id": str(query_id)},
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_TRACE_DB_TESTS") != "1",
+    reason="requires local PostgreSQL with schema.sql or migration 011 applied",
+)
+def test_failure_route_decision_and_execution_are_persisted_in_order() -> None:
+    repository = RunRepository()
+    query_id = uuid4()
+    route_id = str(uuid4())
+    repository.create_run(query_id, "failure route persistence regression", "trace-test")
+    try:
+        repository.append_event(
+            query_id,
+            "route.decided",
+            "failure_router",
+            "passed",
+            "route decided",
+            {"route_id": route_id, "candidate_action": "SQL_REPAIR", "final_action": "SQL_REPAIR"},
+            attempt=1,
+            clarification_round=0,
+            stage_attempt=1,
+        )
+        repository.append_event(
+            query_id,
+            "route.executed",
+            "harness_action",
+            "passed",
+            "route executed",
+            {"route_id": route_id, "final_action": "SQL_REPAIR", "outcome": "applied"},
+            attempt=1,
+            clarification_round=0,
+            stage_attempt=1,
+        )
+        events = repository.list_events(query_id)
+        assert [event.type for event in events] == ["route.decided", "route.executed"]
+        assert [event.output["route_id"] for event in events] == [route_id, route_id]
     finally:
         with repository.engine.begin() as connection:
             connection.execute(
