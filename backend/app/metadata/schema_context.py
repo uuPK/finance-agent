@@ -268,6 +268,29 @@ class SchemaContextProvider:
             )
             in selected_join_pairs
         ]
+        # Guardrail policy uses the complete active physical join catalog, not
+        # the retrieval-limited subset shown to the model.
+        join_relationship_allowlist = [
+            {
+                "left_table": row["left_table"],
+                "left_column": row["left_column"],
+                "right_table": row["right_table"],
+                "right_column": row["right_column"],
+            }
+            for row in join_relationships
+            if row.get("left_schema") == "mart"
+            and row.get("right_schema") == "mart"
+            and row.get("left_column")
+            in {
+                item["column_name"]
+                for item in physical_columns.get(("mart", row["left_table"]), [])
+            }
+            and row.get("right_column")
+            in {
+                item["column_name"]
+                for item in physical_columns.get(("mart", row["right_table"]), [])
+            }
+        ]
         # The retriever ranks against the complete benchmark.  Using the previous
         # fixed first-five rows here silently discarded newly loaded official
         # regression examples before the LLM could see them.
@@ -289,6 +312,7 @@ class SchemaContextProvider:
             "metrics": selected_metrics,
             "business_terms": selected_business_terms,
             "join_relationships": selected_join_relationships,
+            "join_relationship_allowlist": join_relationship_allowlist,
             "question_examples": selected_question_examples,
             "rule_constraints": retrieval.matched_rule_constraints,
             "table_allowlist": sorted(table_allowlist),
@@ -537,6 +561,7 @@ class SchemaContextProvider:
             "metrics": [],
             "business_terms": [],
             "join_relationships": [],
+            "join_relationship_allowlist": [],
             "question_examples": [],
             "table_allowlist": [],
             "sensitive_columns": [],

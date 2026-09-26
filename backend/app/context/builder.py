@@ -70,6 +70,12 @@ def merge_contexts(base: dict[str, Any], addition: dict[str, Any]) -> tuple[dict
         merged[group] = list(existing.values())
     for key in ("table_allowlist", "sensitive_columns"):
         merged[key] = list(dict.fromkeys([*(merged.get(key) or []), *(addition.get(key) or [])]))
+    # Each database load supplies a complete physical JOIN catalog. Replace the
+    # old policy snapshot instead of merging retrieval-limited JOIN evidence.
+    if "join_relationship_allowlist" in addition:
+        merged["join_relationship_allowlist"] = copy.deepcopy(
+            addition["join_relationship_allowlist"]
+        )
     allowed = dict(merged.get("allowed_columns_by_table") or {})
     for table, columns in (addition.get("allowed_columns_by_table") or {}).items():
         allowed[table] = list(dict.fromkeys([*(allowed.get(table) or []), *columns]))

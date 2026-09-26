@@ -37,6 +37,7 @@ class SQLGuardrail:
         max_offset: int = 10_000,
         allowed_schema: str = "mart",
         allowed_functions: set[str] | None = None,
+        approved_join_paths: set[tuple[str, str, str, str]] | None = None,
     ) -> None:
         self.allowed_tables = allowed_tables or set()
         self.allowed_columns_by_table = allowed_columns_by_table or {}
@@ -45,6 +46,7 @@ class SQLGuardrail:
         self.max_limit = max_limit
         self.max_offset = max_offset
         self.allowed_schema = allowed_schema
+        self.approved_join_paths = approved_join_paths
         self.allowed_functions = {
             "abs",
             "and",
@@ -89,6 +91,26 @@ class SQLGuardrail:
             return [item for item in value if isinstance(item, str)]
 
         raw_columns = metadata_context.get("allowed_columns_by_table")
+        raw_join_paths = metadata_context.get("join_relationship_allowlist")
+        approved_join_paths = None
+        if isinstance(raw_join_paths, list):
+            approved_join_paths = {
+                (left_table, left_column, right_table, right_column)
+                for row in raw_join_paths
+                if isinstance(row, dict)
+                for left_table, left_column, right_table, right_column in [
+                    (
+                        row.get("left_table"),
+                        row.get("left_column"),
+                        row.get("right_table"),
+                        row.get("right_column"),
+                    )
+                ]
+                if all(
+                    isinstance(value, str) and value
+                    for value in (left_table, left_column, right_table, right_column)
+                )
+            }
         allowed_columns_by_table = (
             {
                 table_name: set(string_list(columns))
@@ -108,6 +130,7 @@ class SQLGuardrail:
             require_limit=require_limit,
             max_limit=max_limit,
             max_offset=max_offset,
+            approved_join_paths=approved_join_paths,
         )
 
     def validate(self, sql: str) -> list[GuardrailFinding]:
@@ -115,9 +138,7 @@ class SQLGuardrail:
 
         try:
             statements = [
-                statement
-                for statement in sqlglot.parse(sql, read="postgres")
-                if statement
+                statement for statement in sqlglot.parse(sql, read="postgres") if statement
             ]
         except sqlglot.errors.ParseError as exc:
             return [
@@ -157,6 +178,7 @@ class SQLGuardrail:
         findings.extend(self._check_allowed_functions(expression))
         findings.extend(self._check_allowed_columns(expression))
         findings.extend(self._check_sensitive_columns(expression))
+        findings.extend(self._check_join_paths(expression))
 
         if self.require_limit:
             findings.append(self._check_limit(expression))
@@ -252,9 +274,7 @@ class SQLGuardrail:
         findings: list[GuardrailFinding] = []
         cte_names = {cte.alias for cte in expression.find_all(exp.CTE) if cte.alias}
         table_names = {
-            table.name
-            for table in expression.find_all(exp.Table)
-            if table.name not in cte_names
+            table.name for table in expression.find_all(exp.Table) if table.name not in cte_names
         }
         for table_name in sorted(table_names):
             passed = table_name in self.allowed_tables
@@ -448,6 +468,132 @@ class SQLGuardrail:
                 )
             )
         return findings
+
+    def _check_join_paths(self, expression: exp.Expression) -> list[GuardrailFinding]:
+        """Validate direct mart joins against the complete physical relationship catalog."""
+        findings: list[GuardrailFinding] = []
+        for select in expression.find_all(exp.Select):
+            source = select.args.get("from_")
+            base = source.this if isinstance(source, exp.From) else None
+            joined: dict[str, str] = {}
+            if isinstance(base, exp.Table) and base.db == self.allowed_schema:
+                joined[base.alias_or_name] = base.name
+            for join in select.args.get("joins") or []:
+                right = join.this
+                right_table = (
+                    right.name
+                    if isinstance(right, exp.Table) and right.db == self.allowed_schema
+                    else None
+                )
+                right_alias = right.alias_or_name if isinstance(right, exp.Table) else None
+                kind = str(join.args.get("kind") or "").upper()
+                on = join.args.get("on")
+                using = join.args.get("using") or []
+                if (
+                    kind == "CROSS"
+                    or (on is None and not using)
+                    or (on is not None and not any(on.find_all(exp.Column)))
+                ):
+                    findings.append(
+                        GuardrailFinding(
+                            name="cartesian_join",
+                            passed=False,
+                            message="JOIN has no key condition; Cartesian JOIN is blocked.",
+                            severity="error",
+                        )
+                    )
+                elif right_table is None or not joined or self.approved_join_paths is None:
+                    findings.append(
+                        GuardrailFinding(
+                            name="join_path_consistency",
+                            passed=True,
+                            message="Derived or unverified JOIN path needs manual review.",
+                            severity="warning",
+                        )
+                    )
+                elif on is not None and any(isinstance(node, exp.Or) for node in on.walk()):
+                    findings.append(
+                        GuardrailFinding(
+                            name="join_path_consistency",
+                            passed=False,
+                            message="JOIN uses OR; no single approved key path is proved.",
+                            severity="error",
+                        )
+                    )
+                elif self._join_matches_catalog(join, joined, right_alias, right_table):
+                    findings.append(
+                        GuardrailFinding(
+                            name="join_path_consistency",
+                            passed=True,
+                            message=f"JOIN to `{right_table}` uses an approved key path.",
+                        )
+                    )
+                elif right_table in joined.values():
+                    findings.append(
+                        GuardrailFinding(
+                            name="join_path_consistency",
+                            passed=True,
+                            message="Self-JOIN path cannot be proved from physical table aliases.",
+                            severity="warning",
+                        )
+                    )
+                else:
+                    findings.append(
+                        GuardrailFinding(
+                            name="join_path_consistency",
+                            passed=False,
+                            message=f"JOIN to `{right_table}` lacks an approved key path.",
+                            severity="error",
+                        )
+                    )
+                if right_table is not None and right_alias:
+                    joined[right_alias] = right_table
+        return findings
+
+    def _join_matches_catalog(
+        self,
+        join: exp.Join,
+        joined: dict[str, str],
+        right_alias: str | None,
+        right_table: str,
+    ) -> bool:
+        if right_alias is None or self.approved_join_paths is None:
+            return False
+        on = join.args.get("on")
+        if on is not None:
+            for node in on.walk():
+                if not isinstance(node, exp.EQ):
+                    continue
+                left, right = node.left, node.right
+                if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+                    continue
+                for first, second in ((left, right), (right, left)):
+                    old_table = joined.get(first.table)
+                    if old_table is None or second.table != right_alias:
+                        continue
+                    if self._approved_key(old_table, first.name, right_table, second.name):
+                        return True
+        for identifier in join.args.get("using") or []:
+            if not isinstance(identifier, exp.Identifier):
+                continue
+            column = identifier.name
+            if any(
+                self._approved_key(old_table, column, right_table, column)
+                for old_table in joined.values()
+            ):
+                return True
+        return False
+
+    def _approved_key(
+        self, left_table: str, left_column: str, right_table: str, right_column: str
+    ) -> bool:
+        paths = self.approved_join_paths or set()
+        return (left_table, left_column, right_table, right_column) in paths or (
+            right_table,
+            right_column,
+            left_table,
+            left_column,
+        ) in paths
 
     def _check_limit(self, expression: exp.Expression) -> GuardrailFinding:
         limit = expression.args.get("limit")

@@ -8,6 +8,7 @@ export const stageLabels: Record<string, string> = {
   load_schema_context: "加载数据结构",
   generate_sql: "生成 SQL",
   sql_hard_review: "SQL 硬规则检查",
+  sql_explain_review: "可选查询计划检查",
   sql_llm_review: "SQL 语义审核",
   repair_sql: "修复 SQL",
   execute_sql: "执行 SQL",

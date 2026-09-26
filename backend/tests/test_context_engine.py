@@ -56,6 +56,10 @@ def _raw_context() -> dict:
         "join_relationships": [{"id": 1, "left_table": "asset",
                                 "left_column": "customer_id", "right_table": "customer",
                                 "right_column": "id", "description": "按客户键连接"}],
+        "join_relationship_allowlist": [
+            {"left_table": "asset", "left_column": "customer_id",
+             "right_table": "customer", "right_column": "id"}
+        ],
         "question_examples": [{"id": 1, "question": "客户资产示例",
                                "expected_sql": "select 1 " * 500}],
         "rule_constraints": [],
@@ -94,6 +98,7 @@ def test_context_budget_retains_grounding_and_keeps_guardrail_catalog_separate()
     assert {"amount", "customer_id"} <= {row["name"] for row in asset["columns"]}
     assert prompt["metrics"][0]["formula"] == "sum(asset.amount)"
     assert prompt["join_relationships"][0]["left_column"] == "customer_id"
+    assert "join_relationship_allowlist" not in prompt
     assert len(raw["allowed_columns_by_table"]["asset"]) == 62
     context = {**raw, "prompt_context": prompt}
     messages = LLMSQLActor(None)._build_messages("客户总资产", _plan(), context, None, None)
@@ -160,6 +165,18 @@ def test_context_merge_deduplicates_then_evicts_for_targeted_metric() -> None:
     assert bundle.stats()["context_expansion_count"] == 1
     assert bundle.stats()["dedup_count"] >= 1
     assert bundle.token_usage <= 1900
+
+
+def test_context_expansion_replaces_full_join_policy_snapshot() -> None:
+    base = _raw_context()
+    addition = _raw_context()
+    addition["join_relationship_allowlist"] = []
+
+    merged, _ = merge_contexts(base, addition)
+
+    assert merged["join_relationship_allowlist"] == []
+    assert len(merged["join_relationships"]) == 1
+    assert base["join_relationship_allowlist"]
 
 
 def test_provider_expansion_is_callable_and_budgeted(monkeypatch) -> None:

@@ -17,6 +17,7 @@ from app.guardrails.empty_result_diagnostic import EmptyResultDiagnosticValidato
 from app.guardrails.plan_grounding import ground_query_plan
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
 from app.guardrails.sql_guardrail import GuardrailFinding, SQLGuardrail
+from app.guardrails.sql_plan_inspector import SQLPlanInspection, SQLPlanInspector
 from app.llm.protocols import SupportsLLMComplete
 from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.query import (
@@ -112,6 +113,12 @@ class QueryService:
         self.empty_result_validator = EmptyResultDiagnosticValidator(
             engine=getattr(self.sql_executor, "engine", None),
             timeout_seconds=self.settings.empty_result_diagnostic_timeout_seconds,
+        )
+        self.sql_plan_inspector = SQLPlanInspector(
+            engine=getattr(self.sql_executor, "engine", None),
+            timeout_seconds=self.settings.sql_explain_timeout_seconds,
+            max_plan_rows=self.settings.sql_explain_max_plan_rows,
+            max_total_cost=self.settings.sql_explain_max_total_cost,
         )
         self.result_validator = result_validator
         self.audit_logger = audit_logger or QueryAuditLogger()
@@ -1349,6 +1356,26 @@ class QueryService:
             attempt=attempt,
         )
 
+        if hard_review_passed and self.settings.enable_sql_explain_check:
+            await self._emit(
+                "sql_explain_review",
+                "running",
+                "正在只读检查 PostgreSQL 查询计划",
+                attempt=attempt,
+            )
+            try:
+                inspection = self.sql_plan_inspector.inspect(sql_draft.sql)
+            except Exception:
+                inspection = SQLPlanInspection("failed", "inspector_exception")
+            await self._record_trace("sql_plan", inspection.facts())
+            await self._emit(
+                "sql_explain_review",
+                "passed" if inspection.status == "ok" else "skipped",
+                "查询计划检查已结束；估计风险只作提示",
+                inspection.facts(),
+                attempt=attempt,
+            )
+
         critic_result = LLMSQLCriticResult(
             status="failed",
             llm_error="Hard SQL review failed; SQLCritic skipped.",
@@ -1678,6 +1705,10 @@ class QueryService:
             "limit_value": "Use a positive integer literal in LIMIT.",
             "limit_max_rows": "Lower LIMIT to the configured max rows.",
             "sql_parse": "Regenerate syntactically valid PostgreSQL SQL.",
+            "join_path_consistency": (
+                "Use the approved table and column pairs from metadata.join_relationships."
+            ),
+            "cartesian_join": "Replace Cartesian JOIN with an approved metadata key path.",
         }
         return hints.get(error_type, "Regenerate SQL to satisfy hard guardrail checks.")
 

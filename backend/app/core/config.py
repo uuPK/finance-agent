@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     max_retry: int = 2
     sql_timeout_seconds: int = 30
     empty_result_diagnostic_timeout_seconds: int = 3
+    enable_sql_explain_check: bool = False
+    sql_explain_timeout_seconds: int = 3
+    sql_explain_max_plan_rows: int = 1_000_000
+    sql_explain_max_total_cost: int = 1_000_000
     max_result_rows: int = 1000
     result_preview_rows: int = 100
     export_max_rows: int = 100000

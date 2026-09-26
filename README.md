@@ -161,6 +161,10 @@ Phase 5–6 已建立 Trace、HarnessState 与失败域路由：澄清轮次和�
 
 成功但零行的查询保持 `status=completed`，并以独立 `result_status=EMPTY_RESULT` 标识。单表、简单 AND 条件下，系统用一条受 Guardrail 保护的限时只读聚合 SQL 检查各条件及其交集；条件组合没有匹配数据时直接说明，不自动放宽筛选或修复 SQL。复杂查询或探针失败仅报告诊断未确认。详见 [Phase 7 实施与验收边界](docs/phase7-empty-result-diagnosis.md)。
 
+### JOIN 路径与查询计划检查（Phase 8）
+
+SQL Guardrail 现在用 PostgreSQL 中启用且字段仍存在的完整 `metadata.join_relationships` 校验直接物理表 JOIN；检索给模型的有限 JOIN 工作集不充当安全白名单。无键笛卡尔 JOIN 和未登记的直接物理 JOIN 会被拦截；CTE/派生表等无法证明的路径仅作警告，避免误伤原有复杂查询。可在 `.env` 中设 `ENABLE_SQL_EXPLAIN_CHECK=true` 开启限时、只读、无 `ANALYZE` 的 PostgreSQL 计划预检；大扫描、高估计成本等只写入 Trace 并提示，不改变硬校验和 SQL Critic 结论。详见 [Phase 8 实施与验收边界](docs/phase8-sql-guardrail.md)。
+
 ## 本地质量检查与持续集成
 
 ```powershell
