@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     schema_context_budget: int = 10000
     stage_retrieval_budget: int = 2
     global_retrieval_budget: int = 3
+    metadata_refresh_limit: int = 1
+    sql_execution_retry_limit: int = 2
+    sql_execution_backoff_ms: int = 200
     model_name: str = "deepseek-chat"
     max_retry: int = 2
     sql_timeout_seconds: int = 30

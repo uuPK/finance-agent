@@ -3,6 +3,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.query_plan import ClarificationQuestion
+from app.schemas.v2_protocol import MissingContextRequest
 
 ReviewStage = Literal["query_plan_review", "sql_review", "result_review"]
 
@@ -16,6 +17,7 @@ class ReviewDecision(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     repair_hint: str | None = None
     clarification_questions: list[ClarificationQuestion] = Field(default_factory=list)
+    missing_context_request: MissingContextRequest | None = None
     confidence: float = Field(ge=0.0, le=1.0)
 
 

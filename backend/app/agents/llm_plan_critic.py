@@ -110,6 +110,9 @@ class LLMPlanCritic:
             - 如果计划使用了 metadata context 中没有的具体指标、业务词、表或字段，且不是用户原文明确给出的，应判定 fabricated_metadata。
             - 如果命中的 business_terms 标记 clarification_required=true，但计划直接 ready，应判定 guessed_business_definition。
             - 如果元数据召回置信度低，且用户问题依赖模糊业务词，应要求澄清或补充元数据，不要勉强通过。
+            - 只有能明确指出缺失的表、字段、指标、术语、关联或样例时，才使用
+              error_type="missing_context"，并填写 missing_context_request 的 type、concept、
+              reason 和可确定的 from_table/to_table；不要从猜测构造检索请求。
             - 多个明确的日期窗口、多个指标或多个候选事实表本身不是风险：允许计划把各指标
               的时间窗口保留在 metric/filter/assumptions 中，并交由 SQLActor 以分 CTE 预聚合实现。
               不得仅因存在多表、多指标、不同显式时间范围，或 metadata context 未召回所有

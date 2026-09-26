@@ -38,6 +38,22 @@ def test_failure_router_maps_only_explicitly_supported_failure_domains() -> None
         ),
         (
             FailureEvent(stage="execution", error_type="stale_metadata_schema", retryable=True),
+            HarnessAction.METADATA_REFRESH,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="transient_db_error", retryable=True),
+            HarnessAction.RETRY_EXECUTION,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="lock_timeout", retryable=True),
+            HarnessAction.RETRY_EXECUTION,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="query_timeout", retryable=True),
+            HarnessAction.SQL_REPAIR,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="query_cancelled", retryable=True),
             HarnessAction.TERMINATE,
         ),
         (
@@ -127,6 +143,27 @@ def test_sql_executor_extracts_postgres_missing_column_diagnostic() -> None:
     assert SQLExecutor._missing_column(wrapped, "unstructured database error") == "missing_metric"
     assert SQLExecutor()._classify_error("localized database diagnostic", "42703") == (
         "column_not_found"
+    )
+
+
+def test_sql_executor_separates_statement_timeout_cancel_and_connection_faults() -> None:
+    executor = SQLExecutor()
+    assert executor._classify_error("canceling statement due to statement timeout", "57014") == (
+        "query_timeout"
+    )
+    assert executor._classify_error("canceling statement due to user request", "57014") == (
+        "query_cancelled"
+    )
+    assert executor._classify_error("canceling statement due to lock timeout", "55P03") == (
+        "lock_timeout"
+    )
+    assert executor._classify_error("connection failed", "08006") == "transient_db_error"
+    assert executor._classify_error("protocol violation", "08P01") == "sql_execution_error"
+    assert executor._classify_error("connection lost", connection_invalidated=True) == (
+        "transient_db_error"
+    )
+    assert executor._classify_error("connection refused", operational_error=True) == (
+        "transient_db_error"
     )
 
 
@@ -242,3 +279,66 @@ def test_verified_context_refresh_reserves_only_context_budget() -> None:
         "exhausted": True,
         "reserved": True,
     }
+
+
+def test_metadata_refresh_reserves_metadata_and_sql_budgets() -> None:
+    events: list[dict] = []
+
+    async def sink(event: dict) -> None:
+        events.append(event)
+
+    service = QueryService(enable_llm=False, event_sink=sink)
+    service.llm_enabled = True  # Routing policy only; no model call is made.
+    state = HarnessState(
+        uuid4(), 0, max_plan_repairs=1, max_sql_repairs=1, max_metadata_refreshes=1
+    )
+    service.harness_state = state
+    harness = QueryHarness(service, state)
+    failure = FailureEvent(stage="execution", error_type="stale_metadata_schema", retryable=True)
+
+    async def decide_twice() -> tuple:
+        first = await harness.route_failure(
+            failure, source_stage="execute_sql", source_attempt=0, allow_metadata_refresh=True
+        )
+        second = await harness.route_failure(
+            failure, source_stage="execute_sql", source_attempt=0, allow_metadata_refresh=True
+        )
+        return first, second
+
+    first, second = asyncio.run(decide_twice())
+    assert first.final_action == HarnessAction.METADATA_REFRESH
+    assert second.final_action == HarnessAction.TERMINATE
+    assert second.reason_code == "budget_exhausted"
+    assert state.metadata_refreshes_used == 1
+    assert state.sql_repairs_used == 0
+    assert [event["type"] for event in events] == [
+        "route.decided",
+        "route.decided",
+        "budget.exhausted",
+        "route.executed",
+    ]
+
+
+def test_execution_retry_budget_needs_no_model_and_exhausts() -> None:
+    service = QueryService(enable_llm=False)
+    state = HarnessState(uuid4(), 0, max_plan_repairs=0, max_sql_repairs=0, max_execution_retries=1)
+    service.harness_state = state
+    harness = QueryHarness(service, state)
+    failure = FailureEvent(
+        stage="execution", error_type="transient_db_error", retryable=True, sqlstate="08006"
+    )
+
+    async def decide_twice() -> tuple:
+        first = await harness.route_failure(
+            failure, source_stage="execute_sql", source_attempt=0, allow_execution_retry=True
+        )
+        second = await harness.route_failure(
+            failure, source_stage="execute_sql", source_attempt=1, allow_execution_retry=True
+        )
+        return first, second
+
+    first, second = asyncio.run(decide_twice())
+    assert first.final_action == HarnessAction.RETRY_EXECUTION
+    assert second.final_action == HarnessAction.TERMINATE
+    assert second.reason_code == "budget_exhausted"
+    assert state.execution_retries_used == state.total_retries == 1

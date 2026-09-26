@@ -29,9 +29,13 @@ class HarnessState:
     max_plan_repairs: int
     max_sql_repairs: int
     max_context_refreshes: int = 2
+    max_metadata_refreshes: int = 1
+    max_execution_retries: int = 2
     plan_repairs_used: int = 0
     sql_repairs_used: int = 0
     context_refreshes_used: int = 0
+    metadata_refreshes_used: int = 0
+    execution_retries_used: int = 0
     current_stage: str | None = None
     stages: dict[tuple[str, int], StageState] = field(default_factory=dict)
     llm_calls: int = 0
@@ -47,6 +51,8 @@ class HarnessState:
             or self.max_plan_repairs < 0
             or self.max_sql_repairs < 0
             or self.max_context_refreshes < 0
+            or self.max_metadata_refreshes < 0
+            or self.max_execution_retries < 0
         ):
             raise ValueError("Harness coordinates and repair limits must be non-negative")
 
@@ -82,9 +88,27 @@ class HarnessState:
         self.context_refreshes_used += 1
         return self.context_refreshes_used
 
+    def can_refresh_metadata(self) -> bool:
+        return self.metadata_refreshes_used < self.max_metadata_refreshes
+
+    def reserve_metadata_refresh(self) -> int:
+        if not self.can_refresh_metadata():
+            raise RuntimeError("metadata refresh budget exhausted")
+        self.metadata_refreshes_used += 1
+        return self.metadata_refreshes_used
+
+    def can_retry_execution(self) -> bool:
+        return self.execution_retries_used < self.max_execution_retries
+
+    def reserve_execution_retry(self) -> int:
+        if not self.can_retry_execution():
+            raise RuntimeError("execution retry budget exhausted")
+        self.execution_retries_used += 1
+        return self.execution_retries_used
+
     @property
     def total_retries(self) -> int:
-        return self.plan_repairs_used + self.sql_repairs_used
+        return self.plan_repairs_used + self.sql_repairs_used + self.execution_retries_used
 
     def budget_facts(self, domain: RepairDomain) -> dict[str, int | str | bool]:
         return {

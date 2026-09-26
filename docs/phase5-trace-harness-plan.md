@@ -1,6 +1,6 @@
 # Phase 5–6：Trace 与 Harness 联动实施计划
 
-状态：已确认的增补方案；按子步实施、验证、单独推送，下一子步须经用户确认。
+状态：Phase 5 与 Phase 6 已实现；此前按子步验收，本次依用户要求完成 Phase 6 剩余路线与整阶段验收。
 
 ## 为什么先补 Trace 契约
 
@@ -50,7 +50,7 @@ Trace 不能反向决定流程。检索、Context、Plan、SQL、执行、结果
 
 真实链路验收使用 `RUN_TRACE_LIVE_TESTS=1` 运行 `backend/tests/test_trace_live_integration.py`：调用当前配置的真实模型与 Milvus/智谱检索，只在测试进程内存保留响应和事件，不写入运行审计表。普通全量测试默认跳过它，避免意外调用付费 API。
 
-### Phase 5.2：HarnessState 与 QueryService facade（已实现，待用户验收）
+### Phase 5.2：HarnessState 与 QueryService facade（已完成）
 
 引入统一状态和预算，逐阶段搬迁编排；用相同的阶段坐标关联 Trace span 与已有的输入/输出证据引用。迁移期间旧 API、SSE、SQL Guardrail 和规则保护保持工作；不在此子步实现新的失败路由。
 
@@ -62,21 +62,25 @@ Trace 不能反向决定流程。检索、Context、Plan、SQL、执行、结果
 
 将 `FailureEvent → 候选动作 → 预算检查 → 最终动作 → 执行结果` 串为可审计轨迹；按失败域只重做必要阶段，不从头运行。每个失败恰有一个最终路由决定；达到预算上限时终止或澄清。
 
-#### Phase 6.1：保守路由与审计闭环（已实现，待用户验收）
+#### Phase 6.1：保守路由与审计闭环（已完成）
 
 FailureRouter 只按明确的失败域和错误类型提出候选动作；QueryHarness 再检查模型可用性、修复预算和动作是否已实现，决定最终动作。Trace 记录路由 ID、失败阶段/安全化错误类型、来源阶段/span、候选动作、最终动作、裁决原因、预算计数与执行结果。原始 evidence 和 repair_hint 不写入 Trace。
 
-当前可执行的局部动作：Plan 审核失败走 PLAN_REPAIR；SQL 审核失败、结果硬校验失败及明确的 SQL 语法错误走 SQL_REPAIR。未知列、超时和未分类执行错误不自动重试；缺少上下文时虽然会提出 CONTEXT_REFRESH 候选，但由于目前没有安全的刷新动作执行器，最终记为 TERMINATE。所有重试必须先通过各自预算检查。
+首版可执行的局部动作是 Plan/SQL 修复；之后在 6.2–6.3 扩展了有证据的 Context/元数据刷新与执行重试。每次路由仍先记录候选，再由 Harness 检查证据、模型可用性及预算，写入最终动作和执行结局。
 
-#### Phase 6.2：证据化元数据/Context 路由（已实现，待用户验收）
+#### Phase 6.2：证据化元数据/Context 路由（已完成）
 
 SQL 执行器保留 PostgreSQL SQLSTATE 与结构化缺失列诊断。只有当 SQL 解析结果恰为一个 `mart` allowlist 表、SQLDraft 表与之吻合，并由只读 `information_schema.columns` 证明实时数据库确有该列而当前 Context 没有时，才允许申请有预算的 `CONTEXT_REFRESH`。刷新复用 `SchemaContextProvider.expand` 的定向检索与检索预算，不让 Actor 直接访问 Milvus；取回后重审并重跑原 SQL，不额外生成 SQL。多表/歧义、数据库不可读、实时表结构不存在该列，以及刷新后仍缺字段都保守终止或进入既有 SQL 修复分类，并写入路由和执行 Trace。
 
-本子步不新增 `METADATA_REFRESH` 协议动作，也不自动改写数据库元数据目录。数据库与目录真正不一致时以 `metadata_refresh_required` 终止，留待后续由受控管理流程刷新，避免查询时隐式修改元数据。
+当实时数据库已经没有该列、但本次 Context 仍有该列时，走有独立预算的 `METADATA_REFRESH`：从实时物理表结构及现有元数据重新构造**本次运行的内存快照**，确认旧列确已消失后才重新生成、审核 SQL；它不写入或自动修复 PostgreSQL 元数据目录及 Milvus 文档。若刷新无法验证表，或预算不足，直接终止。
 
-#### Phase 6.3：瞬时数据库故障与超时策略（待后续子步）
+Plan/SQL Critic 可输出结构化 `MissingContextRequest`；只有请求明确、数据库 Context 可用且预算允许时，Harness 才调用定向 `expand` 并重审相应阶段。没有具体请求的泛化“缺少元数据”判断不会触发任意检索。Plan 刷新后重新做证据约束；SQL 刷新后重审原 SQL。检索自身预算耗尽也会写入 `budget.exhausted`。
 
-区分可验证的连接瞬时故障与查询复杂度导致的超时，再实现有界次数和退避；没有明确瞬时证据时保持终止。
+#### Phase 6.3：瞬时数据库故障与超时策略（已完成）
+
+SQL 执行器保留 SQLSTATE，仅对明确的连接类、序列化冲突、死锁、资源不足等错误或连接失效，申请有界 `RETRY_EXECUTION`；锁等待超时也可重试。Harness 以封顶指数退避重新执行**同一条已审核 SQL**，不重复调用生成模型，也不跳过原先的 SQL 硬校验。`statement_timeout` 表示该 SQL 超出执行上限，走有预算的 SQL 优化修复；优化仍返回完全相同 SQL 时停止，避免重复超时。普通用户取消（即使同为 SQLSTATE `57014`）、未知执行错误和证据不足的故障均终止。
+
+默认预算：`METADATA_REFRESH_LIMIT=1`、`SQL_EXECUTION_RETRY_LIMIT=2`、`SQL_EXECUTION_BACKOFF_MS=200`；退避单次封顶 2000 ms，SQL 修复仍受既有 `MAX_RETRY` 限制。每次路由及预算决议都保留在 Trace 中；预算耗尽只终止当前请求，不触发无限循环。
 
 ## 验收与后续
 
@@ -85,4 +89,4 @@ SQL 执行器保留 PostgreSQL SQLSTATE 与结构化缺失列诊断。只有当 
 - 旧 API/SSE 读取兼容；Trace 不含 API Key、完整 Prompt、隐藏推理或敏感结果行。
 - Phase 9 基于 Trace 统计成功率、实际模型 token 和成本；Phase 11 才用各阶段 P50/P95 优化性能；Phase 14 再扩展前端 Debug 展示。
 
-每个子步结束跑现有测试与新增回归，单独提交并推送 GitHub，等待用户确认后继续。
+本轮 Phase 6 验收覆盖纯路由、预算、真实 PostgreSQL `statement_timeout`（SQLSTATE `57014`）、真实智谱模型与 Milvus 检索，以及后端全量回归。实时外部链路测试显式启用 `RUN_TRACE_LIVE_TESTS=1`；普通测试不调用付费 API，也不运行 217 条基准问题或保存其结果。后续阶段仍按用户确认推进并及时推送 GitHub。

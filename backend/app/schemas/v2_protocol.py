@@ -9,9 +9,7 @@ EvidenceSourceType = Literal[
     "system_default",
     "llm_inferred",
 ]
-MissingContextType = Literal[
-    "table", "column", "metric", "business_term", "join_path", "example"
-]
+MissingContextType = Literal["table", "column", "metric", "business_term", "join_path", "example"]
 FailureStage = Literal["plan", "sql", "execution", "result", "retrieval"]
 FailurePriority = Literal["high", "medium", "low"]
 
@@ -38,6 +36,8 @@ class FailureEvent(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     repair_hint: str | None = None
     retryable: bool = False
+    sqlstate: str | None = Field(default=None, pattern=r"^[0-9A-Z]{5}$")
+    missing_context_request: MissingContextRequest | None = None
 
 
 class HarnessAction(StrEnum):
@@ -45,6 +45,7 @@ class HarnessAction(StrEnum):
     PLAN_REPAIR = "PLAN_REPAIR"
     SQL_REPAIR = "SQL_REPAIR"
     CONTEXT_REFRESH = "CONTEXT_REFRESH"
+    METADATA_REFRESH = "METADATA_REFRESH"
     RETRY_EXECUTION = "RETRY_EXECUTION"
     CLARIFY = "CLARIFY"
     TERMINATE = "TERMINATE"

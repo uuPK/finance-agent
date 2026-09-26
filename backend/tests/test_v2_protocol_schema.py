@@ -89,9 +89,7 @@ def test_missing_context_request_carries_targeted_retrieval_details() -> None:
     assert request.to_table == "fund_transaction"
     assert request.priority == "high"
     with pytest.raises(ValidationError):
-        MissingContextRequest(
-            type="unsupported", concept="x", reason="reason", priority="urgent"
-        )
+        MissingContextRequest(type="unsupported", concept="x", reason="reason", priority="urgent")
 
 
 def test_failure_event_captures_stage_evidence_and_retryability() -> None:
@@ -119,6 +117,7 @@ def test_harness_action_is_restricted_to_the_v2_action_set() -> None:
         "PLAN_REPAIR",
         "SQL_REPAIR",
         "CONTEXT_REFRESH",
+        "METADATA_REFRESH",
         "RETRY_EXECUTION",
         "CLARIFY",
         "TERMINATE",

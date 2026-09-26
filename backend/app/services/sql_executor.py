@@ -10,11 +10,30 @@ from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import get_settings
 from app.db.session import engine as default_engine
 
 SQLExecutionStatus = Literal["success", "failed", "timeout"]
+_TRANSIENT_SQLSTATES = {
+    "08000",
+    "08001",
+    "08003",
+    "08006",
+    "08007",
+    "40001",
+    "40P01",
+    "53300",
+    "57P01",
+    "57P02",
+    "57P03",
+}
+_CONNECTIVITY_MESSAGES = (
+    "connection refused",
+    "connection reset by peer",
+    "server closed the connection unexpectedly",
+)
 
 
 @dataclass(slots=True)
@@ -83,11 +102,17 @@ class SQLExecutor:
         except Exception as exc:
             error_message = str(exc)
             sqlstate = self._sqlstate(exc)
+            error_type = self._classify_error(
+                error_message,
+                sqlstate,
+                connection_invalidated=bool(getattr(exc, "connection_invalidated", False)),
+                operational_error=isinstance(exc, OperationalError),
+            )
             return SQLExecutionResult(
-                status="timeout" if self._is_timeout(error_message) else "failed",
+                status="timeout" if error_type == "query_timeout" else "failed",
                 sql=sql,
                 elapsed_ms=int((perf_counter() - started_at) * 1000),
-                error_type=self._classify_error(error_message, sqlstate),
+                error_type=error_type,
                 error_message=error_message,
                 sqlstate=sqlstate,
                 missing_column=self._missing_column(exc, error_message),
@@ -109,14 +134,29 @@ class SQLExecutor:
         match = re.search(r'column\s+["\']([^"\']+)["\']\s+does not exist', error_message, re.I)
         return match.group(1).split(".")[-1] if match else None
 
-    def _classify_error(self, error_message: str, sqlstate: str | None = None) -> str:
+    def _classify_error(
+        self,
+        error_message: str,
+        sqlstate: str | None = None,
+        *,
+        connection_invalidated: bool = False,
+        operational_error: bool = False,
+    ) -> str:
         lowered = error_message.lower()
         if sqlstate == "42703":
             return "column_not_found"
         if sqlstate == "42601":
             return "sql_syntax_error"
         if self._is_timeout(error_message):
-            return "timeout"
+            return "query_timeout"
+        if "lock timeout" in lowered and sqlstate in {"55P03", "57014"}:
+            return "lock_timeout"
+        if sqlstate in _TRANSIENT_SQLSTATES or connection_invalidated:
+            return "transient_db_error"
+        if operational_error and any(message in lowered for message in _CONNECTIVITY_MESSAGES):
+            return "transient_db_error"
+        if sqlstate == "57014":
+            return "query_cancelled"
         if "does not exist" in lowered and "column" in lowered:
             return "column_not_found"
         if "does not exist" in lowered and ("relation" in lowered or "table" in lowered):
@@ -129,7 +169,7 @@ class SQLExecutor:
 
     def _is_timeout(self, error_message: str) -> bool:
         lowered = error_message.lower()
-        return "statement timeout" in lowered or "query canceled" in lowered
+        return "statement timeout" in lowered
 
     def _jsonable(self, value: Any) -> Any:
         if isinstance(value, Decimal):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -10,6 +11,7 @@ from sqlglot import exp, parse_one
 
 from app.agents.llm_plan_critic import LLMPlanCriticResult
 from app.agents.llm_query_plan_actor import QueryPlanBuildResult
+from app.guardrails.plan_grounding import ground_query_plan
 from app.guardrails.result_validator import ResultValidationResult
 from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewBundle, ReviewDecision
@@ -57,6 +59,8 @@ class QueryHarness:
         source_attempt: int,
         allow_retry: bool = True,
         allow_context_refresh: bool = False,
+        allow_metadata_refresh: bool = False,
+        allow_execution_retry: bool = False,
     ) -> RouteDecision:
         """Apply model availability and budget after the pure router proposes an action."""
         candidate = self.router.propose(failure)
@@ -84,6 +88,23 @@ class QueryHarness:
                 final = HarnessAction.TERMINATE
                 reason = "context_refresh_evidence_missing"
             elif not self.state.can_refresh_context():
+                final = HarnessAction.TERMINATE
+                reason = "budget_exhausted"
+        elif candidate == HarnessAction.METADATA_REFRESH:
+            if not allow_metadata_refresh:
+                final = HarnessAction.TERMINATE
+                reason = "metadata_refresh_evidence_missing"
+            elif not self.service.llm_enabled:
+                final = HarnessAction.TERMINATE
+                reason = "model_unavailable"
+            elif not self.state.can_refresh_metadata() or not self.state.can_repair("sql"):
+                final = HarnessAction.TERMINATE
+                reason = "budget_exhausted"
+        elif candidate == HarnessAction.RETRY_EXECUTION:
+            if not allow_execution_retry:
+                final = HarnessAction.TERMINATE
+                reason = "execution_retry_evidence_missing"
+            elif not self.state.can_retry_execution():
                 final = HarnessAction.TERMINATE
                 reason = "budget_exhausted"
         elif domain is None:
@@ -133,6 +154,28 @@ class QueryHarness:
                 "exhausted": used >= limit,
                 "reserved": final == candidate,
             }
+        elif candidate == HarnessAction.METADATA_REFRESH and allow_metadata_refresh:
+            budget = {
+                "domain": "metadata",
+                "used": self.state.metadata_refreshes_used + int(final == candidate),
+                "limit": self.state.max_metadata_refreshes,
+                "reserved": final == candidate,
+                "sql_repair_used": self.state.sql_repairs_used + int(final == candidate),
+                "sql_repair_limit": self.state.max_sql_repairs,
+            }
+            budget["exhausted"] = (
+                budget["used"] >= budget["limit"]
+                or budget["sql_repair_used"] >= budget["sql_repair_limit"]
+            )
+        elif candidate == HarnessAction.RETRY_EXECUTION and allow_execution_retry:
+            budget = {
+                "domain": "execution",
+                "used": self.state.execution_retries_used + int(final == candidate),
+                "limit": self.state.max_execution_retries,
+                "exhausted": self.state.execution_retries_used + int(final == candidate)
+                >= self.state.max_execution_retries,
+                "reserved": final == candidate,
+            }
         await self.service._emit(
             "failure_router",
             "passed",
@@ -141,6 +184,7 @@ class QueryHarness:
                 "route_id": str(route.route_id),
                 "failure_stage": failure.stage,
                 "error_type": route.error_type,
+                "sqlstate": failure.sqlstate,
                 "retryable": failure.retryable,
                 "evidence_count": len(failure.evidence),
                 "source_stage": source_stage,
@@ -154,32 +198,29 @@ class QueryHarness:
             attempt=route.route_attempt,
             event_type="route.decided",
         )
-        if reason == "budget_exhausted" and domain is not None:
-            await self.service._emit(
-                f"{domain}_repair_budget",
-                "failed",
-                "修复预算已耗尽",
-                {"route_id": str(route.route_id), **self.state.budget_facts(domain)},
-                event_type="budget.exhausted",
+        if reason == "budget_exhausted":
+            budget_stage = (
+                f"{domain}_repair_budget"
+                if domain is not None
+                else f"{budget['domain']}_budget"
+                if budget is not None
+                else "route_budget"
             )
-        elif reason == "budget_exhausted" and candidate == HarnessAction.CONTEXT_REFRESH:
             await self.service._emit(
-                "context_refresh_budget",
+                budget_stage,
                 "failed",
-                "Context 刷新预算已耗尽",
-                {
-                    "route_id": str(route.route_id),
-                    "domain": "context",
-                    "used": self.state.context_refreshes_used,
-                    "limit": self.state.max_context_refreshes,
-                    "exhausted": True,
-                },
+                "路由动作预算已耗尽",
+                {"route_id": str(route.route_id), **(budget or {})},
                 event_type="budget.exhausted",
             )
         if domain is not None and final == candidate:
             self.state.reserve_repair(domain)
         elif final == HarnessAction.CONTEXT_REFRESH:
             self.state.reserve_context_refresh()
+        elif final == HarnessAction.METADATA_REFRESH:
+            self.state.reserve_metadata_refresh()
+        elif final == HarnessAction.RETRY_EXECUTION:
+            self.state.reserve_execution_retry()
         else:
             await self.record_route_execution(route, "terminated")
         return route
@@ -187,7 +228,7 @@ class QueryHarness:
     async def record_route_execution(self, route: RouteDecision, outcome: str) -> None:
         await self.service._emit(
             "harness_action",
-            "failed" if outcome in {"failed", "not_found"} else "passed",
+            "failed" if outcome in {"failed", "not_found", "cancelled"} else "passed",
             "路由动作已处理",
             {
                 "route_id": str(route.route_id),
@@ -219,11 +260,33 @@ class QueryHarness:
             reason="Live schema contains this column but the current SQL context does not.",
             priority="high",
         )
+        return await self.refresh_requested_context(
+            route,
+            question=question,
+            query_plan=query_plan,
+            current_context=current_context,
+            request=request,
+            expected_column=(table_name, column_name),
+        )
+
+    async def refresh_requested_context(
+        self,
+        route: RouteDecision,
+        *,
+        question: str,
+        query_plan: QueryPlan,
+        current_context: dict[str, object],
+        request: MissingContextRequest,
+        expected_column: tuple[str, str] | None = None,
+    ) -> tuple[dict[str, object], bool]:
+        if current_context.get("source") != "database":
+            await self.record_route_execution(route, "failed")
+            return current_context, False
         await self.service._emit(
             "refresh_context",
             "running",
-            "正在按实时数据库结构刷新 SQL 上下文",
-            {"table": table_name, "column": column_name},
+            "正在定向补充查询上下文",
+            {"request_type": request.type},
             attempt=route.route_attempt,
         )
         refreshed = self.service.schema_context_provider.expand(
@@ -232,17 +295,36 @@ class QueryHarness:
             question=question,
             query_plan=query_plan,
         )
-        columns = refreshed.get("allowed_columns_by_table")
-        table_columns = columns.get(table_name) if isinstance(columns, dict) else None
-        found = isinstance(table_columns, list) and column_name in table_columns
+        if refreshed.get("context_expansion_status") == "budget_exhausted":
+            stats = refreshed.get("context_stats")
+            calls = stats.get("retrieval_calls") if isinstance(stats, dict) else None
+            await self.service._emit(
+                "retrieval_budget",
+                "failed",
+                "定向检索预算已耗尽",
+                {
+                    "route_id": str(route.route_id),
+                    "domain": "retrieval",
+                    "used": calls if isinstance(calls, int) else None,
+                    "limit": self.service.settings.global_retrieval_budget,
+                    "exhausted": True,
+                },
+                event_type="budget.exhausted",
+            )
+        found = refreshed.get("context_expansion_status") == "expanded"
+        if expected_column is not None:
+            table_name, column_name = expected_column
+            columns = refreshed.get("allowed_columns_by_table")
+            table_columns = columns.get(table_name) if isinstance(columns, dict) else None
+            found = found and isinstance(table_columns, list) and column_name in table_columns
         await self.service._record_trace("context_selection", lambda: context_facts(refreshed))
         await self.service._emit(
             "refresh_context",
             "passed" if found else "failed",
-            "已刷新 SQL 上下文" if found else "刷新后仍未找到该数据库字段",
+            "已补充查询上下文" if found else "定向检索未能补充所需上下文",
             {
-                "table": table_name,
-                "column_present": found,
+                "request_type": request.type,
+                "expansion_status": refreshed.get("context_expansion_status"),
                 "context_item_ids": (refreshed.get("context_bundle") or {}).get("item_ids", [])
                 if isinstance(refreshed.get("context_bundle"), dict)
                 else [],
@@ -251,6 +333,73 @@ class QueryHarness:
         )
         await self.record_route_execution(route, "applied" if found else "not_found")
         return refreshed, found
+
+    async def refresh_metadata(
+        self,
+        route: RouteDecision,
+        *,
+        question: str,
+        query_plan: QueryPlan,
+        current_context: dict[str, object],
+        table_name: str,
+        column_name: str,
+    ) -> tuple[dict[str, object], bool]:
+        """Rebuild the working metadata snapshot from live DB; never mutate the catalog."""
+        await self.service._emit(
+            "refresh_metadata",
+            "running",
+            "正在重新读取实时表结构和元数据",
+            {"table": table_name},
+            attempt=route.route_attempt,
+        )
+        refreshed = self.service._load_metadata_context(
+            question, query_plan, previous_context=current_context
+        )
+        allowlist = refreshed.get("table_allowlist")
+        columns = refreshed.get("allowed_columns_by_table")
+        table_columns = columns.get(table_name) if isinstance(columns, dict) else None
+        valid = (
+            refreshed.get("source") == "database"
+            and isinstance(allowlist, list)
+            and table_name in allowlist
+            and isinstance(table_columns, list)
+            and column_name not in table_columns
+        )
+        await self.service._record_trace("context_selection", lambda: context_facts(refreshed))
+        await self.service._emit(
+            "refresh_metadata",
+            "passed" if valid else "failed",
+            "实时元数据快照已更新" if valid else "无法确认更新后的物理表结构",
+            {"table": table_name, "stale_column_removed": valid},
+            attempt=route.route_attempt,
+        )
+        if not valid:
+            await self.record_route_execution(route, "failed")
+        return refreshed, valid
+
+    async def wait_for_execution_retry(self, route: RouteDecision) -> None:
+        base_ms = max(0, self.service.settings.sql_execution_backoff_ms)
+        backoff_ms = min(base_ms * 2 ** (self.state.execution_retries_used - 1), 2000)
+        await self.service._emit(
+            "execution_retry",
+            "running",
+            "等待后重试同一条已审核 SQL",
+            {"backoff_ms": backoff_ms},
+            attempt=route.route_attempt,
+        )
+        try:
+            if backoff_ms:
+                await asyncio.sleep(backoff_ms / 1000)
+        except asyncio.CancelledError:
+            await self.record_route_execution(route, "cancelled")
+            raise
+        await self.service._emit(
+            "execution_retry",
+            "passed",
+            "执行重试等待结束",
+            {"backoff_ms": backoff_ms},
+            attempt=route.route_attempt,
+        )
 
     @staticmethod
     def _first_failed(review_bundle: ReviewBundle) -> ReviewDecision | None:
@@ -271,6 +420,7 @@ class QueryHarness:
             evidence=item.evidence if item else [],
             repair_hint=item.repair_hint if item else None,
             retryable=plan.plan_status != "invalid",
+            missing_context_request=item.missing_context_request if item else None,
         )
 
     def sql_failure(
@@ -289,6 +439,7 @@ class QueryHarness:
                 evidence=item.evidence if item else [],
                 repair_hint=item.repair_hint if item else None,
                 retryable=True,
+                missing_context_request=item.missing_context_request if item else None,
             )
         if execution_result is not None and execution_result.status != "success":
             error_type = safe_error_type(execution_result.error_type, "sql_execution_error")
@@ -300,6 +451,7 @@ class QueryHarness:
                 stage="execution",
                 error_type=error_type,
                 retryable=True,
+                sqlstate=execution_result.sqlstate,
             )
         item = (
             next((check for check in result_validation.checks if not check.passed), None)
@@ -312,6 +464,7 @@ class QueryHarness:
             evidence=item.evidence if item else [],
             repair_hint=item.repair_hint if item else None,
             retryable=True,
+            missing_context_request=item.missing_context_request if item else None,
         )
 
     def _classify_unknown_column(
@@ -413,8 +566,9 @@ class QueryHarness:
                 **service._build_actor_details(build_result, build_results),
             },
         )
+        plan_stage_attempt = build_result.repair_attempt
         review_bundle, hard_review_passed, critic_result = await service._review_query_plan(
-            query_plan, metadata_context, attempt=0, original_question=question
+            query_plan, metadata_context, attempt=plan_stage_attempt, original_question=question
         )
         review_history = [
             service._build_review_details(
@@ -436,9 +590,46 @@ class QueryHarness:
             route = await self.route_failure(
                 failure,
                 source_stage=source_stage,
-                source_attempt=build_result.repair_attempt,
+                source_attempt=plan_stage_attempt,
                 allow_retry=actor_repairable,
+                allow_context_refresh=failure.missing_context_request is not None,
             )
+            if route.final_action == HarnessAction.CONTEXT_REFRESH:
+                request = failure.missing_context_request
+                if request is None:
+                    await self.record_route_execution(route, "failed")
+                    break
+                refreshed, found = await self.refresh_requested_context(
+                    route,
+                    question=question,
+                    query_plan=query_plan,
+                    current_context=metadata_context,
+                    request=request,
+                )
+                if not found:
+                    break
+                metadata_context = refreshed
+                query_plan = ground_query_plan(query_plan, question, metadata_context)
+                build_result.plan = query_plan
+                await service._record_trace(
+                    "plan_evidence", lambda plan=query_plan: plan_facts(plan)
+                )
+                plan_stage_attempt += 1
+                review_bundle, hard_review_passed, critic_result = await service._review_query_plan(
+                    query_plan,
+                    metadata_context,
+                    attempt=plan_stage_attempt,
+                    original_question=question,
+                )
+                review_history.append(
+                    service._build_review_details(
+                        build_result.repair_attempt,
+                        review_bundle,
+                        hard_review_passed,
+                        critic_result,
+                    )
+                )
+                continue
             if route.final_action != HarnessAction.PLAN_REPAIR:
                 break
             repair_feedback = service._failed_review_feedback(review_bundle)
@@ -459,6 +650,7 @@ class QueryHarness:
                 repair_attempt=repair_count,
             )
             build_result = service._apply_rule_plan_safeguards(build_result, deterministic_plan)
+            plan_stage_attempt = max(plan_stage_attempt + 1, repair_count)
             await self.record_route_execution(
                 route, "applied" if build_result.source == "llm" else "failed"
             )
@@ -489,7 +681,7 @@ class QueryHarness:
             review_bundle, hard_review_passed, critic_result = await service._review_query_plan(
                 query_plan,
                 metadata_context,
-                attempt=repair_count,
+                attempt=plan_stage_attempt,
                 original_question=question,
             )
             review_history.append(

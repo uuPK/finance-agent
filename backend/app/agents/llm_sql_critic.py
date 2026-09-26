@@ -135,6 +135,9 @@ _SQL_CRITIC_SYSTEM_PROMPT = dedent(
     3. 表名、字段名、敏感字段和 LIMIT 已由 hard guardrail 基于 schema context 校验；
        你不能覆盖 hard guardrail 的失败结论。
     4. 如果 SQL 与 QueryPlan 无关、遗漏关键条件、粒度错误或返回敏感字段，必须失败。
+    5. 只有能明确指出审核所缺的元数据时，才使用 error_type="missing_context"，
+       并填写 missing_context_request 的 type、concept、reason 与可确定的表名；
+       不得把 SQL 本身的错误伪装成缺少元数据。
 
     必查项：
     - SQL 是否覆盖所有 QueryPlan.metrics。

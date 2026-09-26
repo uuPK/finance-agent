@@ -127,6 +127,8 @@ class QueryService:
             max_plan_repairs=self.max_repair_attempts,
             max_sql_repairs=self.max_repair_attempts,
             max_context_refreshes=max(0, self.settings.stage_retrieval_budget),
+            max_metadata_refreshes=max(0, self.settings.metadata_refresh_limit),
+            max_execution_retries=max(0, self.settings.sql_execution_retry_limit),
         )
         harness = QueryHarness(self, self.harness_state)
         if start_audit:
@@ -673,16 +675,24 @@ class QueryService:
         so only security, unsupported business definitions, omitted user
         conditions, wrong metric/time semantics and grain errors block here.
         """
-        if decision.passed or decision.error_type in {
-            "unsafe_sensitive_output",
-            "guessed_business_definition",
-            "fabricated_metadata",
-            "wrong_grain",
-            "missing_user_condition",
-            "wrong_metric",
-            "wrong_time",
-            "wrong_filter",
-        }:
+        if (
+            decision.passed
+            or decision.error_type
+            in {
+                "unsafe_sensitive_output",
+                "guessed_business_definition",
+                "fabricated_metadata",
+                "wrong_grain",
+                "missing_user_condition",
+                "wrong_metric",
+                "wrong_time",
+                "wrong_filter",
+            }
+            or (
+                decision.error_type in {"missing_context", "missing_metadata_context"}
+                and decision.missing_context_request is not None
+            )
+        ):
             return decision
         return decision.model_copy(
             update={
@@ -834,22 +844,27 @@ class QueryService:
             llm_error="Result review has not run.",
         )
         execution_history: list[dict[str, object]] = []
+        skip_sql_review = False
+        pending_retry_route = None
 
         while True:
-            review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
-                query_plan,
-                build_result.draft,
-                metadata_context,
-                attempt=sql_stage_attempt,
-            )
-            review_history.append(
-                self._build_sql_review_details(
-                    build_result.repair_attempt,
-                    review_bundle,
-                    hard_review_passed,
-                    critic_result,
+            if skip_sql_review:
+                skip_sql_review = False
+            else:
+                review_bundle, hard_review_passed, critic_result = await self._review_sql_draft(
+                    query_plan,
+                    build_result.draft,
+                    metadata_context,
+                    attempt=sql_stage_attempt,
                 )
-            )
+                review_history.append(
+                    self._build_sql_review_details(
+                        build_result.repair_attempt,
+                        review_bundle,
+                        hard_review_passed,
+                        critic_result,
+                    )
+                )
 
             execution_result = None
             result_hard_validation = None
@@ -899,6 +914,12 @@ class QueryService:
                     },
                     attempt=sql_stage_attempt,
                 )
+                if pending_retry_route is not None:
+                    await harness.record_route_execution(
+                        pending_retry_route,
+                        "succeeded" if execution_result.status == "success" else "failed",
+                    )
+                    pending_retry_route = None
                 await self._emit(
                     "result_hard_review",
                     "running",
@@ -1008,31 +1029,63 @@ class QueryService:
             elif failure.stage == "execution":
                 source_stage = "execute_sql"
             else:
-                source_stage = "result_hard_review"
+                source_stage = (
+                    "result_hard_review"
+                    if result_hard_validation is not None
+                    and any(not item.passed for item in result_hard_validation.checks)
+                    else "result_llm_review"
+                )
             route = await harness.route_failure(
                 failure,
                 source_stage=source_stage,
                 source_attempt=sql_stage_attempt,
                 allow_context_refresh=(
+                    failure.missing_context_request is not None
+                    or (
+                        failure.stage == "execution"
+                        and failure.error_type == "missing_metadata_context"
+                    )
+                ),
+                allow_metadata_refresh=(
+                    failure.stage == "execution" and failure.error_type == "stale_metadata_schema"
+                ),
+                allow_execution_retry=(
                     failure.stage == "execution"
-                    and failure.error_type == "missing_metadata_context"
+                    and failure.error_type in {"transient_db_error", "lock_timeout"}
                 ),
             )
+            if route.final_action == HarnessAction.RETRY_EXECUTION:
+                await harness.wait_for_execution_retry(route)
+                pending_retry_route = route
+                sql_stage_attempt += 1
+                skip_sql_review = True
+                continue
             if route.final_action == HarnessAction.CONTEXT_REFRESH:
-                tables = build_result.draft.tables if build_result.draft else []
-                column_name = execution_result.missing_column if execution_result else None
-                if len(tables) != 1 or not column_name or build_result.draft is None:
-                    route_failure_reason = "Context refresh requires one verified table and column."
-                    await harness.record_route_execution(route, "failed")
-                    break
-                refreshed_context, found = await harness.refresh_context(
-                    route,
-                    question=question,
-                    query_plan=query_plan,
-                    current_context=metadata_context,
-                    table_name=tables[0].rsplit(".", 1)[-1],
-                    column_name=column_name,
-                )
+                if failure.missing_context_request is not None:
+                    refreshed_context, found = await harness.refresh_requested_context(
+                        route,
+                        question=question,
+                        query_plan=query_plan,
+                        current_context=metadata_context,
+                        request=failure.missing_context_request,
+                    )
+                else:
+                    tables = build_result.draft.tables if build_result.draft else []
+                    column_name = execution_result.missing_column if execution_result else None
+                    if len(tables) != 1 or not column_name or build_result.draft is None:
+                        route_failure_reason = (
+                            "Context refresh requires one verified table and column."
+                        )
+                        await harness.record_route_execution(route, "failed")
+                        break
+                    refreshed_context, found = await harness.refresh_context(
+                        route,
+                        question=question,
+                        query_plan=query_plan,
+                        current_context=metadata_context,
+                        table_name=tables[0].rsplit(".", 1)[-1],
+                        column_name=column_name,
+                    )
                 if not found:
                     route_failure_reason = (
                         "The live schema contains the column, but bounded metadata retrieval "
@@ -1042,10 +1095,35 @@ class QueryService:
                 metadata_context = refreshed_context
                 sql_stage_attempt += 1
                 continue
-            if route.final_action != HarnessAction.SQL_REPAIR:
+            if route.final_action == HarnessAction.METADATA_REFRESH:
+                tables = build_result.draft.tables if build_result.draft else []
+                column_name = execution_result.missing_column if execution_result else None
+                if len(tables) != 1 or not column_name:
+                    route_failure_reason = (
+                        "Metadata refresh requires one verified table and column."
+                    )
+                    await harness.record_route_execution(route, "failed")
+                    break
+                refreshed_context, found = await harness.refresh_metadata(
+                    route,
+                    question=question,
+                    query_plan=query_plan,
+                    current_context=metadata_context,
+                    table_name=tables[0].rsplit(".", 1)[-1],
+                    column_name=column_name,
+                )
+                if not found:
+                    route_failure_reason = "Live metadata refresh could not verify the table."
+                    break
+                metadata_context = refreshed_context
+                harness.state.reserve_repair("sql")
+            elif route.final_action != HarnessAction.SQL_REPAIR:
                 break
 
             repair_feedback = self._failed_sql_attempt_feedback(review_bundle, result_validation)
+            execution_feedback = self._execution_repair_feedback(failure.error_type)
+            if execution_feedback is not None:
+                repair_feedback.append(execution_feedback)
             previous_sql = build_result.draft.sql
             repair_count = harness.state.sql_repairs_used
             await self._emit(
@@ -1065,12 +1143,22 @@ class QueryService:
             )
             build_results.append(build_result)
             sql_stage_attempt = max(sql_stage_attempt + 1, build_result.repair_attempt)
+            unchanged_timeout_sql = (
+                failure.error_type == "query_timeout"
+                and build_result.draft is not None
+                and build_result.draft.sql.strip() == previous_sql.strip()
+            )
             await harness.record_route_execution(
-                route, "applied" if build_result.draft is not None else "failed"
+                route,
+                "applied"
+                if build_result.draft is not None and not unchanged_timeout_sql
+                else "failed",
             )
             await self._emit(
                 "repair_sql",
-                "passed" if build_result.draft is not None else "failed",
+                "passed"
+                if build_result.draft is not None and not unchanged_timeout_sql
+                else "failed",
                 f"第 {repair_count} 次 SQL 修复已完成",
                 {
                     "sql": build_result.draft.sql if build_result.draft else None,
@@ -1080,6 +1168,10 @@ class QueryService:
                 },
                 attempt=repair_count,
             )
+
+            if unchanged_timeout_sql:
+                route_failure_reason = "SQL optimization returned the same timed-out query."
+                break
 
             if build_result.draft is None:
                 await harness.route_sql_generation_failure("repair_sql", repair_count)
@@ -1419,6 +1511,36 @@ class QueryService:
         self, result_validation: ResultValidationResult
     ) -> list[ReviewDecision]:
         return [check for check in result_validation.checks if not check.passed]
+
+    @staticmethod
+    def _execution_repair_feedback(error_type: str) -> ReviewDecision | None:
+        hints = {
+            "query_timeout": (
+                "The approved query exceeded PostgreSQL statement_timeout.",
+                "Simplify the SQL while preserving the approved QueryPlan, filters, grain, "
+                "and result limit. Avoid unnecessary joins and repeated scans.",
+            ),
+            "unknown_column_in_sql": (
+                "The SQL references a column absent from the live table and Context.",
+                "Use only physical columns in the current metadata Context.",
+            ),
+            "stale_metadata_schema": (
+                "The previous Context contained a column absent from the live table.",
+                "Regenerate SQL against the refreshed physical schema without that column.",
+            ),
+        }
+        detail = hints.get(error_type)
+        if detail is None:
+            return None
+        return ReviewDecision(
+            passed=False,
+            score=0,
+            stage="sql_review",
+            error_type=error_type,
+            reason=detail[0],
+            repair_hint=detail[1],
+            confidence=1.0,
+        )
 
     def _sql_loop_failure_reason(
         self,

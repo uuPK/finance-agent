@@ -45,8 +45,8 @@ class SchemaContextProvider:
     ) -> dict[str, Any]:
         """Run one type-specific lookup and replace the budgeted working set.
 
-        This is a callable Context Engine operation for the future Harness.  It
-        does not let an actor call Milvus directly or bypass retrieval budgets.
+        Harness calls this Context Engine operation after a verified missing-
+        context route; actors cannot call Milvus or bypass retrieval budgets.
         """
         if current.get("source") != "database":
             return {**current, "context_expansion_status": "unavailable"}

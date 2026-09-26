@@ -63,8 +63,14 @@ class FailureRouter:
         if failure.stage == "execution":
             if failure.error_type in {"sql_syntax_error", "unknown_column_in_sql"}:
                 return HarnessAction.SQL_REPAIR
+            if failure.error_type == "query_timeout":
+                return HarnessAction.SQL_REPAIR
             if failure.error_type == "missing_metadata_context":
                 return HarnessAction.CONTEXT_REFRESH
+            if failure.error_type == "stale_metadata_schema":
+                return HarnessAction.METADATA_REFRESH
+            if failure.error_type in {"transient_db_error", "lock_timeout"}:
+                return HarnessAction.RETRY_EXECUTION
             # Unknown columns need live-schema/context provenance. A timeout is not
             # proof of a transient failure; neither should be blindly retried.
             return HarnessAction.TERMINATE

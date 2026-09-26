@@ -147,7 +147,7 @@ uv sync --extra dev --frozen
 
 `SchemaContextProvider` 保留完整的数据库元数据和 SQL Guardrail 白名单，但给模型的 `prompt_context` 是独立的工作集。它按指标定义、必需字段、JOIN、业务术语等优先级选择内容，先压缩非关键描述，再淘汰低优先级项；必需证据装不下时失败关闭，不悄悄删掉。`SCHEMA_CONTEXT_BUDGET` 默认 10000，是模型无关的 JSON token **估算值**，不是模型 API 返回的精确 token 用量。`context_stats` 记录预算、已用估算 token、条目数、去重、压缩、淘汰与检索次数。
 
-`SchemaContextProvider.expand(current, MissingContextRequest, question=..., query_plan=...)` 提供按类型定向补充接口：Hybrid 模式在 Milvus 内仅召回请求的文档类型，Legacy 模式使用同类 PostgreSQL 元数据兜底；补充结果重新合并、去重和预算裁剪。`STAGE_RETRIEVAL_BUDGET` 与 `GLOBAL_RETRIEVAL_BUDGET` 限制额外调用。当前阶段**尚未**让 Actor 自动发起扩展或让 Harness 路由失败；那属于后续 Harness 阶段，现有 API/SSE 行为保持兼容。
+`SchemaContextProvider.expand(current, MissingContextRequest, question=..., query_plan=...)` 提供按类型定向补充接口：Hybrid 模式在 Milvus 内仅召回请求的文档类型，Legacy 模式使用同类 PostgreSQL 元数据兜底；补充结果重新合并、去重和预算裁剪。`STAGE_RETRIEVAL_BUDGET` 与 `GLOBAL_RETRIEVAL_BUDGET` 限制额外调用。Phase 6 的 Harness 已能根据 Plan/SQL Critic 的结构化缺口请求定向调用该接口；无具体缺口或预算耗尽时不会盲目刷新。
 
 ### QueryPlan 证据约束与澄清（Phase 4）
 
@@ -155,7 +155,7 @@ Plan Actor 提议业务解释后，服务端重新核对原始用户问题与召
 
 例如治理“高净值”术语时，可在 `metadata.business_terms.default_plan_fragment` 填入 `{"metric_code":"total_asset","operator":">=","value":1000000}` 并设置 `clarification_required=false`；对应 `metric_code` 必须存在于已召回的指标元数据。仅写“高净值”文字说明却没有可执行门槛时，系统会请求澄清，不猜测 100 万。此阶段未改 SQL Guardrail、API/SSE 协议或 Harness 路由。
 
-Phase 5–6 将先定义运行 Trace，再让 Harness 消费同一套状态、预算与事件契约；澄清轮次和阶段修复尝试会分开记录。详见 [Trace 与 Harness 联动实施计划](docs/phase5-trace-harness-plan.md)。
+Phase 5–6 已建立 Trace、HarnessState 与失败域路由：澄清轮次和阶段修复尝试分开记录；实时结构与 Context 不一致时可在内存中有界刷新，连接/锁等瞬时故障有界退避重试，SQL 执行超时走优化修复，无法验证的故障保守终止。详细路由、预算与验收边界见 [Trace 与 Harness 联动实施计划](docs/phase5-trace-harness-plan.md)。
 
 ## 本地质量检查与持续集成
 
