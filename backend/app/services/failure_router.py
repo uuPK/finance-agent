@@ -19,6 +19,21 @@ def safe_error_type(value: str | None, default: str) -> str:
     return default
 
 
+def classify_unknown_column(
+    *, live_schema_has_column: bool | None, context_has_column: bool
+) -> str:
+    """Classify an unknown column only from a read-only live-schema comparison."""
+    if live_schema_has_column is None:
+        return "column_not_found"
+    if live_schema_has_column and not context_has_column:
+        return "missing_metadata_context"
+    if not live_schema_has_column and context_has_column:
+        return "stale_metadata_schema"
+    if not live_schema_has_column:
+        return "unknown_column_in_sql"
+    return "column_not_found"
+
+
 @dataclass(frozen=True, slots=True)
 class RouteDecision:
     route_id: UUID
@@ -46,8 +61,10 @@ class FailureRouter:
         if failure.stage == "sql":
             return HarnessAction.SQL_REPAIR
         if failure.stage == "execution":
-            if failure.error_type == "sql_syntax_error":
+            if failure.error_type in {"sql_syntax_error", "unknown_column_in_sql"}:
                 return HarnessAction.SQL_REPAIR
+            if failure.error_type == "missing_metadata_context":
+                return HarnessAction.CONTEXT_REFRESH
             # Unknown columns need live-schema/context provenance. A timeout is not
             # proof of a transient failure; neither should be blindly retried.
             return HarnessAction.TERMINATE

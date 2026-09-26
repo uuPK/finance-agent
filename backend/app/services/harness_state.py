@@ -28,8 +28,10 @@ class HarnessState:
     clarification_round: int
     max_plan_repairs: int
     max_sql_repairs: int
+    max_context_refreshes: int = 2
     plan_repairs_used: int = 0
     sql_repairs_used: int = 0
+    context_refreshes_used: int = 0
     current_stage: str | None = None
     stages: dict[tuple[str, int], StageState] = field(default_factory=dict)
     llm_calls: int = 0
@@ -40,7 +42,12 @@ class HarnessState:
     route_count: int = 0
 
     def __post_init__(self) -> None:
-        if self.clarification_round < 0 or self.max_plan_repairs < 0 or self.max_sql_repairs < 0:
+        if (
+            self.clarification_round < 0
+            or self.max_plan_repairs < 0
+            or self.max_sql_repairs < 0
+            or self.max_context_refreshes < 0
+        ):
             raise ValueError("Harness coordinates and repair limits must be non-negative")
 
     def repair_used(self, domain: RepairDomain) -> int:
@@ -65,6 +72,15 @@ class HarnessState:
     def next_route_attempt(self) -> int:
         self.route_count += 1
         return self.route_count
+
+    def can_refresh_context(self) -> bool:
+        return self.context_refreshes_used < self.max_context_refreshes
+
+    def reserve_context_refresh(self) -> int:
+        if not self.can_refresh_context():
+            raise RuntimeError("context refresh budget exhausted")
+        self.context_refreshes_used += 1
+        return self.context_refreshes_used
 
     @property
     def total_retries(self) -> int:

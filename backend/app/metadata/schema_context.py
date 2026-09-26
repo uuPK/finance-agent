@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sqlalchemy import text
@@ -52,9 +53,8 @@ class SchemaContextProvider:
         old_stats = current.get("context_stats") or {}
         used = int(old_stats.get("context_expansion_count", 0))
         calls = int(old_stats.get("retrieval_calls", 1))
-        if (
-            used >= max(self.settings.stage_retrieval_budget, 0)
-            or calls >= max(self.settings.global_retrieval_budget, 0)
+        if used >= max(self.settings.stage_retrieval_budget, 0) or calls >= max(
+            self.settings.global_retrieval_budget, 0
         ):
             return {**current, "context_expansion_status": "budget_exhausted"}
         try:
@@ -103,6 +103,31 @@ class SchemaContextProvider:
             }
             result["context_expansion_status"] = f"failed:{type(exc).__name__}"
             return result
+
+    def physical_column_exists(self, table_name: str, column_name: str) -> bool | None:
+        """Check one allowlisted mart column; None means the schema could not be read."""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+            return None
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", column_name):
+            return None
+        try:
+            with self.engine.connect() as connection:
+                value = connection.execute(
+                    text(
+                        """
+                        select 1
+                        from information_schema.columns
+                        where table_schema = 'mart'
+                          and table_name = :table_name
+                          and column_name = :column_name
+                        limit 1
+                        """
+                    ),
+                    {"table_name": table_name, "column_name": column_name},
+                ).first()
+            return value is not None
+        except Exception:
+            return None
 
     def _targeted_retrieval(
         self, connection: Connection, request: MissingContextRequest

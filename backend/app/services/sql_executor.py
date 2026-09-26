@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -27,6 +28,8 @@ class SQLExecutionResult:
     elapsed_ms: int = 0
     error_type: str | None = None
     error_message: str | None = None
+    sqlstate: str | None = None
+    missing_column: str | None = None
 
 
 class SQLExecutor:
@@ -65,8 +68,7 @@ class SQLExecutor:
             truncated = len(fetched_rows) > self.max_result_rows
             visible_rows = fetched_rows[: self.max_result_rows]
             rows = [
-                {key: self._jsonable(value) for key, value in row.items()}
-                for row in visible_rows
+                {key: self._jsonable(value) for key, value in row.items()} for row in visible_rows
             ]
             columns = list(rows[0].keys()) if rows else result_columns
             return SQLExecutionResult(
@@ -80,16 +82,39 @@ class SQLExecutor:
             )
         except Exception as exc:
             error_message = str(exc)
+            sqlstate = self._sqlstate(exc)
             return SQLExecutionResult(
                 status="timeout" if self._is_timeout(error_message) else "failed",
                 sql=sql,
                 elapsed_ms=int((perf_counter() - started_at) * 1000),
-                error_type=self._classify_error(error_message),
+                error_type=self._classify_error(error_message, sqlstate),
                 error_message=error_message,
+                sqlstate=sqlstate,
+                missing_column=self._missing_column(exc, error_message),
             )
 
-    def _classify_error(self, error_message: str) -> str:
+    @staticmethod
+    def _sqlstate(exc: Exception) -> str | None:
+        original = getattr(exc, "orig", exc)
+        value = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9A-Z]{5}", value) else None
+
+    @staticmethod
+    def _missing_column(exc: Exception, error_message: str) -> str | None:
+        original = getattr(exc, "orig", exc)
+        diagnostic = getattr(original, "diag", None)
+        value = getattr(diagnostic, "column_name", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip().split(".")[-1].strip('"')
+        match = re.search(r'column\s+["\']([^"\']+)["\']\s+does not exist', error_message, re.I)
+        return match.group(1).split(".")[-1] if match else None
+
+    def _classify_error(self, error_message: str, sqlstate: str | None = None) -> str:
         lowered = error_message.lower()
+        if sqlstate == "42703":
+            return "column_not_found"
+        if sqlstate == "42601":
+            return "sql_syntax_error"
         if self._is_timeout(error_message):
             return "timeout"
         if "does not exist" in lowered and "column" in lowered:

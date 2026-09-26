@@ -126,6 +126,7 @@ class QueryService:
             clarification_round=self.event_attempt,
             max_plan_repairs=self.max_repair_attempts,
             max_sql_repairs=self.max_repair_attempts,
+            max_context_refreshes=max(0, self.settings.stage_retrieval_budget),
         )
         harness = QueryHarness(self, self.harness_state)
         if start_audit:
@@ -819,6 +820,8 @@ class QueryService:
             )
 
         repair_count = harness.state.sql_repairs_used
+        sql_stage_attempt = build_result.repair_attempt
+        route_failure_reason: str | None = None
         review_bundle = ReviewBundle()
         hard_review_passed = False
         critic_result = LLMSQLCriticResult(status="failed")
@@ -837,7 +840,7 @@ class QueryService:
                 query_plan,
                 build_result.draft,
                 metadata_context,
-                attempt=build_result.repair_attempt,
+                attempt=sql_stage_attempt,
             )
             review_history.append(
                 self._build_sql_review_details(
@@ -861,12 +864,12 @@ class QueryService:
                     "running",
                     "正在只读事务中执行已审核的 SQL",
                     {"sql": build_result.draft.sql},
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 execution_result = self.sql_executor.execute(build_result.draft.sql)
                 execution_id = self.audit_logger.log_sql_execution(
                     query_id=query_id,
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                     result=execution_result,
                 )
                 await self._record_trace(
@@ -894,13 +897,13 @@ class QueryService:
                         "error_message": execution_result.error_message,
                         "result_preview": execution_result.rows[: self.result_preview_rows],
                     },
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 await self._emit(
                     "result_hard_review",
                     "running",
                     "正在检查查询结果硬规则",
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 result_hard_validation = self._validate_execution_result(
                     query_plan=query_plan,
@@ -926,7 +929,7 @@ class QueryService:
                         "error_type": result_hard_validation.error_type,
                         "repair_hint": result_hard_validation.repair_hint,
                     },
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 await self._emit(
                     "result_llm_review",
@@ -934,7 +937,7 @@ class QueryService:
                     "正在核对查询结果与用户问题是否一致"
                     if result_hard_validation.passed
                     else "结果硬规则未通过，语义审核已跳过",
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 result_validation, result_critic_result = await self._review_result(
                     question=question,
@@ -965,7 +968,7 @@ class QueryService:
                     result_critic_status,
                     "查询结果语义审核已完成",
                     self._result_critic_log_payload(result_critic_result),
-                    attempt=build_result.repair_attempt,
+                    attempt=sql_stage_attempt,
                 )
                 self.audit_logger.log_result_validation(
                     query_id=query_id,
@@ -989,7 +992,13 @@ class QueryService:
             if passed:
                 break
 
-            failure = harness.sql_failure(review_bundle, result_validation, execution_result)
+            failure = harness.sql_failure(
+                review_bundle,
+                result_validation,
+                execution_result,
+                build_result.draft,
+                metadata_context,
+            )
             if failure.stage == "sql":
                 source_stage = (
                     "sql_hard_review"
@@ -1003,8 +1012,36 @@ class QueryService:
             route = await harness.route_failure(
                 failure,
                 source_stage=source_stage,
-                source_attempt=build_result.repair_attempt,
+                source_attempt=sql_stage_attempt,
+                allow_context_refresh=(
+                    failure.stage == "execution"
+                    and failure.error_type == "missing_metadata_context"
+                ),
             )
+            if route.final_action == HarnessAction.CONTEXT_REFRESH:
+                tables = build_result.draft.tables if build_result.draft else []
+                column_name = execution_result.missing_column if execution_result else None
+                if len(tables) != 1 or not column_name or build_result.draft is None:
+                    route_failure_reason = "Context refresh requires one verified table and column."
+                    await harness.record_route_execution(route, "failed")
+                    break
+                refreshed_context, found = await harness.refresh_context(
+                    route,
+                    question=question,
+                    query_plan=query_plan,
+                    current_context=metadata_context,
+                    table_name=tables[0].rsplit(".", 1)[-1],
+                    column_name=column_name,
+                )
+                if not found:
+                    route_failure_reason = (
+                        "The live schema contains the column, but bounded metadata retrieval "
+                        "could not add it to SQL context."
+                    )
+                    break
+                metadata_context = refreshed_context
+                sql_stage_attempt += 1
+                continue
             if route.final_action != HarnessAction.SQL_REPAIR:
                 break
 
@@ -1027,6 +1064,7 @@ class QueryService:
                 repair_attempt=repair_count,
             )
             build_results.append(build_result)
+            sql_stage_attempt = max(sql_stage_attempt + 1, build_result.repair_attempt)
             await harness.record_route_execution(
                 route, "applied" if build_result.draft is not None else "failed"
             )
@@ -1068,6 +1106,8 @@ class QueryService:
         failure_reason = self._sql_loop_failure_reason(
             review_bundle, execution_result, result_validation
         )
+        if route_failure_reason:
+            failure_reason = route_failure_reason
 
         return SQLLoopResult(
             sql=sql,

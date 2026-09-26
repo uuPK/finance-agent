@@ -68,9 +68,11 @@ FailureRouter 只按明确的失败域和错误类型提出候选动作；QueryH
 
 当前可执行的局部动作：Plan 审核失败走 PLAN_REPAIR；SQL 审核失败、结果硬校验失败及明确的 SQL 语法错误走 SQL_REPAIR。未知列、超时和未分类执行错误不自动重试；缺少上下文时虽然会提出 CONTEXT_REFRESH 候选，但由于目前没有安全的刷新动作执行器，最终记为 TERMINATE。所有重试必须先通过各自预算检查。
 
-#### Phase 6.2：证据化元数据/Context 路由（待后续子步）
+#### Phase 6.2：证据化元数据/Context 路由（已实现，待用户验收）
 
-增加可核对的 Live DB Schema 与 Context 对照，再决定 CONTEXT_REFRESH、元数据刷新或 SQL_REPAIR；不从错误消息猜字段来源。需要先明确 `METADATA_REFRESH` 的协议动作和受控执行器。
+SQL 执行器保留 PostgreSQL SQLSTATE 与结构化缺失列诊断。只有当 SQL 解析结果恰为一个 `mart` allowlist 表、SQLDraft 表与之吻合，并由只读 `information_schema.columns` 证明实时数据库确有该列而当前 Context 没有时，才允许申请有预算的 `CONTEXT_REFRESH`。刷新复用 `SchemaContextProvider.expand` 的定向检索与检索预算，不让 Actor 直接访问 Milvus；取回后重审并重跑原 SQL，不额外生成 SQL。多表/歧义、数据库不可读、实时表结构不存在该列，以及刷新后仍缺字段都保守终止或进入既有 SQL 修复分类，并写入路由和执行 Trace。
+
+本子步不新增 `METADATA_REFRESH` 协议动作，也不自动改写数据库元数据目录。数据库与目录真正不一致时以 `metadata_refresh_required` 终止，留待后续由受控管理流程刷新，避免查询时隐式修改元数据。
 
 #### Phase 6.3：瞬时数据库故障与超时策略（待后续子步）
 

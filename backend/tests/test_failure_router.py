@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from uuid import uuid4
 
+from app.schemas.sql import SQLDraft
 from app.schemas.v2_protocol import FailureEvent, HarnessAction
-from app.services.failure_router import FailureRouter
+from app.services.failure_router import FailureRouter, classify_unknown_column
 from app.services.harness_state import HarnessState
 from app.services.query_harness import QueryHarness
 from app.services.query_service import QueryService
+from app.services.sql_executor import SQLExecutionResult, SQLExecutor
 
 
 def test_failure_router_maps_only_explicitly_supported_failure_domains() -> None:
@@ -24,6 +27,18 @@ def test_failure_router_maps_only_explicitly_supported_failure_domains() -> None
         (
             FailureEvent(stage="execution", error_type="sql_syntax_error", retryable=True),
             HarnessAction.SQL_REPAIR,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="unknown_column_in_sql", retryable=True),
+            HarnessAction.SQL_REPAIR,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="missing_metadata_context", retryable=True),
+            HarnessAction.CONTEXT_REFRESH,
+        ),
+        (
+            FailureEvent(stage="execution", error_type="stale_metadata_schema", retryable=True),
+            HarnessAction.TERMINATE,
         ),
         (
             FailureEvent(stage="execution", error_type="column_not_found", retryable=True),
@@ -45,6 +60,74 @@ def test_failure_router_maps_only_explicitly_supported_failure_domains() -> None
 
     for failure, expected in cases:
         assert router.propose(failure) == expected
+
+
+def test_unknown_column_classification_requires_live_and_context_evidence() -> None:
+    assert classify_unknown_column(live_schema_has_column=True, context_has_column=False) == (
+        "missing_metadata_context"
+    )
+    assert classify_unknown_column(live_schema_has_column=False, context_has_column=True) == (
+        "stale_metadata_schema"
+    )
+    assert classify_unknown_column(live_schema_has_column=False, context_has_column=False) == (
+        "unknown_column_in_sql"
+    )
+    assert classify_unknown_column(live_schema_has_column=None, context_has_column=False) == (
+        "column_not_found"
+    )
+
+
+def test_unknown_column_refresh_requires_one_allowlisted_live_table() -> None:
+    service = QueryService(enable_llm=False)
+    service.schema_context_provider.physical_column_exists = lambda table, column: True
+    harness = QueryHarness(
+        service,
+        HarnessState(uuid4(), 0, max_plan_repairs=1, max_sql_repairs=1),
+    )
+    execution = SQLExecutionResult(
+        status="failed",
+        sql="select missing_metric from mart.sales",
+        error_type="column_not_found",
+        missing_column="missing_metric",
+    )
+    context = {"table_allowlist": ["sales"], "allowed_columns_by_table": {"sales": ["id"]}}
+
+    classified = harness._classify_unknown_column(
+        execution,
+        SQLDraft(sql=execution.sql, tables=["mart.sales"]),
+        context,
+    )
+    ambiguous = harness._classify_unknown_column(
+        execution,
+        SQLDraft(
+            sql="select missing_metric from mart.sales join mart.customers on true",
+            tables=["mart.sales", "mart.customers"],
+        ),
+        context,
+    )
+    unqualified = harness._classify_unknown_column(
+        execution,
+        SQLDraft(sql="select missing_metric from sales", tables=["sales"]),
+        context,
+    )
+
+    assert classified == "missing_metadata_context"
+    assert ambiguous == "column_not_found"
+    assert unqualified == "column_not_found"
+
+
+def test_sql_executor_extracts_postgres_missing_column_diagnostic() -> None:
+    original = SimpleNamespace(
+        sqlstate="42703",
+        diag=SimpleNamespace(column_name="missing_metric"),
+    )
+    wrapped = SimpleNamespace(orig=original)
+
+    assert SQLExecutor._sqlstate(wrapped) == "42703"
+    assert SQLExecutor._missing_column(wrapped, "unstructured database error") == "missing_metric"
+    assert SQLExecutor()._classify_error("localized database diagnostic", "42703") == (
+        "column_not_found"
+    )
 
 
 def test_harness_records_final_route_and_exhausted_budget_without_failure_text() -> None:
@@ -99,7 +182,7 @@ def test_harness_records_final_route_and_exhausted_budget_without_failure_text()
     assert "private repair hint" not in str(events)
 
 
-def test_unimplemented_context_refresh_is_audited_then_terminated() -> None:
+def test_unverified_context_refresh_is_audited_then_terminated() -> None:
     events: list[dict] = []
 
     async def sink(event: dict) -> None:
@@ -120,8 +203,42 @@ def test_unimplemented_context_refresh_is_audited_then_terminated() -> None:
 
     assert decision.candidate_action == HarnessAction.CONTEXT_REFRESH
     assert decision.final_action == HarnessAction.TERMINATE
-    assert decision.reason_code == "action_not_implemented"
+    assert decision.reason_code == "context_refresh_evidence_missing"
     assert state.sql_repairs_used == 0
     assert [event["type"] for event in events] == ["route.decided", "route.executed"]
     assert events[0]["output"]["candidate_action"] == "CONTEXT_REFRESH"
     assert events[0]["output"]["final_action"] == "TERMINATE"
+
+
+def test_verified_context_refresh_reserves_only_context_budget() -> None:
+    events: list[dict] = []
+
+    async def sink(event: dict) -> None:
+        events.append(event)
+
+    service = QueryService(enable_llm=False, event_sink=sink)
+    state = HarnessState(uuid4(), 0, max_plan_repairs=1, max_sql_repairs=1, max_context_refreshes=1)
+    service.harness_state = state
+    harness = QueryHarness(service, state)
+    failure = FailureEvent(stage="execution", error_type="missing_metadata_context", retryable=True)
+
+    decision = asyncio.run(
+        harness.route_failure(
+            failure,
+            source_stage="execute_sql",
+            source_attempt=0,
+            allow_context_refresh=True,
+        )
+    )
+
+    assert decision.final_action == HarnessAction.CONTEXT_REFRESH
+    assert state.context_refreshes_used == 1
+    assert state.sql_repairs_used == 0
+    assert [event["type"] for event in events] == ["route.decided"]
+    assert events[0]["output"]["budget"] == {
+        "domain": "context",
+        "used": 1,
+        "limit": 1,
+        "exhausted": True,
+        "reserved": True,
+    }
