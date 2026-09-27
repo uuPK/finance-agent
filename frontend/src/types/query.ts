@@ -333,10 +333,12 @@ export interface EvaluationResultSummary {
   review_priority?: string;
   review_status: string;
   risk_reasons: string[];
+  metrics?: Record<string, Record<string, number | string | null>>;
 }
 
 export interface EvaluationRunDetail extends EvaluationRunSummary {
   results: EvaluationResultSummary[];
+  metrics_summary?: Record<string, Record<string, number | null>>;
 }
 
 export interface EvaluationDashboard {

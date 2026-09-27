@@ -59,6 +59,8 @@ class EmptyResultDiagnosis(BaseModel):
 
 class QueryResponse(BaseModel):
     _evaluation_execution_artifact: EvaluationExecutionArtifact | None = PrivateAttr(default=None)
+    _evaluation_retrieval: dict[str, Any] | None = PrivateAttr(default=None)
+    _evaluation_runtime: dict[str, Any] | None = PrivateAttr(default=None)
 
     query_id: UUID = Field(default_factory=uuid4)
     status: Literal["planned", "completed", "failed", "needs_clarification"] = "planned"

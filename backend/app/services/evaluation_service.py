@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.db.session import engine as default_engine
+from app.evaluation.phase9_metrics import score_case_metrics, summarize_case_metrics
 from app.guardrails.sql_guardrail import SQLGuardrail
 from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.evaluation import (
@@ -213,13 +214,13 @@ class EvaluationRepository:
                     insert into evaluation.eval_results
                         (eval_run_id, case_id, query_id, passed, executable, result_correct,
                          plan_score, sql_score, result_score, elapsed_ms, failure_type, failure_reason,
-                         generated_sql, generated_query_plan, generated_response, auto_decision,
+                         generated_sql, generated_query_plan, generated_response, metrics, auto_decision,
                          review_priority, review_status, risk_reasons, critic_confidence)
                     values
                         (:eval_run_id, :case_id, :query_id, :passed, :executable, :result_correct,
                          :plan_score, :sql_score, :result_score, :elapsed_ms, :failure_type,
                          :failure_reason, :generated_sql, cast(:generated_query_plan as jsonb),
-                         cast(:generated_response as jsonb), :auto_decision, :review_priority,
+                         cast(:generated_response as jsonb), cast(:metrics as jsonb), :auto_decision, :review_priority,
                          :review_status, cast(:risk_reasons as jsonb), :critic_confidence)
                     on conflict (eval_run_id, case_id) do update set
                         query_id = excluded.query_id, passed = excluded.passed,
@@ -230,6 +231,7 @@ class EvaluationRepository:
                         generated_sql = excluded.generated_sql,
                         generated_query_plan = excluded.generated_query_plan,
                         generated_response = excluded.generated_response,
+                        metrics = excluded.metrics,
                         auto_decision = excluded.auto_decision,
                         review_priority = excluded.review_priority,
                         review_status = excluded.review_status,
@@ -247,6 +249,7 @@ class EvaluationRepository:
                     "generated_response": json.dumps(
                         result["generated_response"], ensure_ascii=False
                     ),
+                    "metrics": json.dumps(result.get("metrics", {}), ensure_ascii=False),
                     "risk_reasons": json.dumps(result["risk_reasons"], ensure_ascii=False),
                 },
             )
@@ -308,6 +311,9 @@ class EvaluationRepository:
         return EvaluationRunDetail(
             **self._run_summary_payload(run),
             results=[self._result_summary(row) for row in results],
+            metrics_summary=summarize_case_metrics(
+                [dict(row.get("metrics") or {}) for row in results]
+            ),
         )
 
     def list_runs(self, limit: int = 20) -> list[EvaluationRunSummary]:
@@ -1042,6 +1048,7 @@ class EvaluationRepository:
             review_priority=row["review_priority"],
             review_status=row["review_status"],
             risk_reasons=list(row["risk_reasons"] or []),
+            metrics=dict(row.get("metrics") or {}),
         )
 
     @staticmethod
@@ -1091,9 +1098,42 @@ class EvaluationManager:
             for case in cases:
                 response: QueryResponse | None = None
                 error: Exception | None = None
+                events: list[dict[str, Any]] = []
+                service: QueryService | None = None
+                prior_sink: Any = None
                 started_at = perf_counter()
                 try:
-                    response = await self.service_factory().run(
+                    service = self.service_factory()
+                    prior_sink = getattr(service, "event_sink", None)
+
+                    async def collect(
+                        event: dict[str, Any],
+                        *,
+                        captured_events: list[dict[str, Any]] = events,
+                        sink: Any = prior_sink,
+                    ) -> None:
+                        captured_events.append({
+                            "type": event.get("type"),
+                            "stage": event.get("stage"),
+                            "status": event.get("status"),
+                            "duration_ms": event.get("duration_ms"),
+                            "output": (
+                                {key: (event.get("output") or {}).get(key) for key in (
+                                    "prompt_tokens", "completion_tokens", "total_tokens"
+                                )}
+                                if event.get("type") == "trace.llm_call"
+                                else {"context_tokens_estimated": (event.get("output") or {}).get("context_tokens_estimated")}
+                                if event.get("type") == "trace.context_selection"
+                                else {"expansion_status": (event.get("output") or {}).get("expansion_status")}
+                                if event.get("stage") == "refresh_context"
+                                else {}
+                            ),
+                        })
+                        if sink is not None:
+                            await sink(event)
+
+                    service.event_sink = collect
+                    response = await service.run(
                         QueryRequest(
                             question=case["question"], user_id="evaluation", include_debug=True
                         ),
@@ -1101,8 +1141,11 @@ class EvaluationManager:
                     )
                 except Exception as exc:  # The failure becomes an auditable evaluation result.
                     error = exc
+                finally:
+                    if service is not None:
+                        service.event_sink = prior_sink
                 elapsed_ms = int((perf_counter() - started_at) * 1000)
-                result = self._score(case, response, error, elapsed_ms)
+                result = self._score(case, response, error, elapsed_ms, events=events)
                 await asyncio.to_thread(self.repository.save_result, eval_run_id, case, result)
         except Exception:
             status = "failed"
@@ -1115,8 +1158,12 @@ class EvaluationManager:
         response: QueryResponse | None,
         error: Exception | None,
         elapsed_ms: int,
+        *,
+        events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if response is None:
+            metrics = score_case_metrics(case, None, events=events, elapsed_ms=elapsed_ms,
+                                         result_correct=False)
             return {
                 "query_id": None,
                 "passed": False,
@@ -1136,6 +1183,7 @@ class EvaluationManager:
                 "review_status": "pending",
                 "risk_reasons": ["runtime_error"],
                 "critic_confidence": None,
+                "metrics": metrics,
             }
         generated_plan = response.query_plan.model_dump(mode="json") if response.query_plan else {}
         expected_status = case["expected_status"]
@@ -1156,6 +1204,14 @@ class EvaluationManager:
                     execution_artifact.rows, expected_result.get("rows", []), generated_plan
                 )
             )
+        )
+        metrics = score_case_metrics(
+            case, response,
+            retrieval=response._evaluation_retrieval,
+            runtime=response._evaluation_runtime,
+            events=events,
+            elapsed_ms=elapsed_ms,
+            result_correct=bool(result_correct),
         )
         plan_score = self._plan_score(
             case["expected_query_plan"] or {}, generated_plan, status_match
@@ -1206,6 +1262,7 @@ class EvaluationManager:
             "review_status": "pending" if needs_review else "not_required",
             "risk_reasons": risk_reasons,
             "critic_confidence": confidence,
+            "metrics": metrics,
         }
 
     @staticmethod
@@ -1220,6 +1277,11 @@ class EvaluationManager:
             fields += 1
             expected_value = expected[key]
             if key == "metrics":
+                if isinstance(expected_value, list):
+                    expected_value = [
+                        item.get("metric_code") if isinstance(item, dict) else item
+                        for item in expected_value
+                    ]
                 actual_value = [item.get("metric_code") for item in actual.get("metrics", [])]
             elif key == "filters":
                 actual_value = [
@@ -1237,7 +1299,9 @@ class EvaluationManager:
                 actual_value = actual.get(key)
             if _canonical(expected_value) == _canonical(actual_value) or (
                 isinstance(expected_value, list)
-                and set(expected_value).issubset(set(actual_value or []))
+                and {_canonical(item) for item in expected_value}.issubset(
+                    {_canonical(item) for item in (actual_value or [])}
+                )
             ):
                 matched += 1
         return round((matched / fields) * 100, 2) if fields else 100.0

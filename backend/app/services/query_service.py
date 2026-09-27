@@ -309,6 +309,48 @@ class QueryService:
                 row_count=execution_result.row_count,
                 truncated=execution_result.truncated,
             )
+        if include_evaluation_artifact:
+            final_context = (
+                sql_loop_result.metadata_context if sql_loop_result else metadata_context
+            )
+            retrieval = final_context.get("retrieval")
+            retrieval = retrieval if isinstance(retrieval, dict) else {}
+            response._evaluation_retrieval = {
+                "strategy": retrieval.get("strategy"),
+                "configured_k": self.settings.final_top_k
+                if self.settings.retriever_mode == "hybrid"
+                else None,
+                "candidate_count": len(retrieval.get("evidence") or []),
+                "table_names": retrieval.get("table_names") or [],
+                "metric_codes": retrieval.get("metric_codes") or [],
+                "matched_columns": [
+                    {"table_name": row.get("table_name"), "column_name": row.get("column_name")}
+                    for row in retrieval.get("matched_columns") or []
+                    if isinstance(row, dict)
+                ],
+                "matched_join_relationships": [
+                    {
+                        key: row.get(key)
+                        for key in ("left_table", "left_column", "right_table", "right_column")
+                    }
+                    for row in retrieval.get("matched_join_relationships") or []
+                    if isinstance(row, dict)
+                ],
+            }
+            state = self.harness_state
+            response._evaluation_runtime = {
+                key: getattr(state, key, None) if state else None
+                for key in (
+                    "plan_repairs_used",
+                    "sql_repairs_used",
+                    "context_refreshes_used",
+                    "execution_retries_used",
+                    "llm_calls",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "context_tokens_estimated",
+                )
+            }
         failed_check = next((check for check in all_checks if not check.passed), None)
         self.audit_logger.finish_query_run(
             query_id=query_id,

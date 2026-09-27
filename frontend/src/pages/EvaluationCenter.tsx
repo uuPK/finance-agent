@@ -41,6 +41,21 @@ const metricCards = [
   { key: "result_accuracy" as const, label: "结果准确率", icon: Gauge }
 ];
 
+const phase9Metrics = [
+  { group: "retrieval", key: "table_recall_at_k", label: "表召回", percent: true },
+  { group: "retrieval", key: "column_recall_at_k", label: "字段召回", percent: true },
+  { group: "retrieval", key: "metric_recall_at_k", label: "指标召回", percent: true },
+  { group: "retrieval", key: "join_path_recall_at_k", label: "JOIN 路径召回", percent: true },
+  { group: "plan", key: "semantic_accuracy", label: "计划语义", percent: true },
+  { group: "plan", key: "filter_coverage", label: "条件覆盖", percent: true },
+  { group: "runtime", key: "plan_repair_success", label: "计划修复成功", percent: true },
+  { group: "runtime", key: "sql_repair_success", label: "SQL 修复成功", percent: true },
+  { group: "cost", key: "llm_calls", label: "平均模型调用", percent: false },
+  { group: "cost", key: "p50_latency_ms", label: "P50 耗时", percent: false },
+  { group: "cost", key: "p95_latency_ms", label: "P95 耗时", percent: false },
+  { group: "critic", key: "token_overhead", label: "Critic token 开销", percent: false }
+] as const;
+
 const priorityClass: Record<string, string> = {
   blocking: "bg-rose-100 text-rose-700",
   high: "bg-amber-100 text-amber-800",
@@ -372,6 +387,21 @@ export function EvaluationCenter() {
             return <div key={metric.key} className="border-b border-r border-line p-4"><Icon className="h-5 w-5 text-slate-500" /><div className="mt-4 text-2xl font-semibold text-ink">{formatPercent(dashboard?.[metric.key])}</div><div className="mt-1 text-sm text-muted">{metric.label}</div></div>;
           })}
         </section>
+
+        {selectedRun && selectedRun.results.some((result) => result.metrics && Object.keys(result.metrics).length > 0) && (
+          <section className="mt-5 border border-line bg-white p-4">
+            <h2 className="text-sm font-semibold text-ink">Phase 9 分层评测</h2>
+            <p className="mt-1 text-xs text-muted">仅统计有标准标注或 Trace 证据的案例；— 表示暂无可计算样本，不等于 0%。召回是最终元数据候选集口径。</p>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {phase9Metrics.map((metric) => {
+                const value = selectedRun.metrics_summary?.[metric.group]?.[metric.key];
+                const count = selectedRun.metrics_summary?.[`${metric.group}_samples`]?.[metric.key] ?? 0;
+                return <div key={`${metric.group}.${metric.key}`} className="border border-line p-3"><p className="text-xs text-muted">{metric.label}</p><p className="mt-1 text-lg font-semibold text-ink">{typeof value === "number" ? metric.percent ? `${(value * 100).toFixed(1)}%` : metric.key.includes("latency") ? formatDuration(value) : value.toFixed(1) : "—"}</p><p className="mt-1 text-xs text-muted">有效样本 {count}</p></div>;
+              })}
+            </div>
+            <p className="mt-3 text-xs text-muted">Critic 误放行／误拦截需要草稿级人工真值；目前保留未标注，不用最终结果倒推。</p>
+          </section>
+        )}
 
         <section className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="border border-line bg-white">

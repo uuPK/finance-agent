@@ -165,6 +165,10 @@ Phase 5–6 已建立 Trace、HarnessState 与失败域路由：澄清轮次和�
 
 SQL Guardrail 现在用 PostgreSQL 中启用且字段仍存在的完整 `metadata.join_relationships` 校验直接物理表 JOIN；检索给模型的有限 JOIN 工作集不充当安全白名单。无键笛卡尔 JOIN 和未登记的直接物理 JOIN 会被拦截；CTE/派生表等无法证明的路径仅作警告，避免误伤原有复杂查询。可在 `.env` 中设 `ENABLE_SQL_EXPLAIN_CHECK=true` 开启限时、只读、无 `ANALYZE` 的 PostgreSQL 计划预检；大扫描、高估计成本等只写入 Trace 并提示，不改变硬校验和 SQL Critic 结论。详见 [Phase 8 实施与验收边界](docs/phase8-sql-guardrail.md)。
 
+### 分层评测指标（Phase 9）
+
+评测中心按案例和批次展示检索召回、QueryPlan 覆盖、Harness 修复、模型调用/token、延迟与 Critic 开销；缺少标准标签或可靠 Trace 时显示不可用，不用 0 冒充。原有完整执行结果评分保持不变。现有数据库需先执行 [012 增量迁移](backend/db/migrations/012_evaluation_metrics.sql)。指标口径与尚需人工标注的 Critic 误判项见 [Phase 9 说明](docs/phase9-evaluation.md)。
+
 ## 本地质量检查与持续集成
 
 ```powershell

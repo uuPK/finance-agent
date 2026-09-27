@@ -85,10 +85,12 @@ class EvaluationResultSummary(BaseModel):
     review_priority: str | None = None
     review_status: str
     risk_reasons: list[str] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluationRunDetail(EvaluationRunSummary):
     results: list[EvaluationResultSummary] = Field(default_factory=list)
+    metrics_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReviewBatchCreate(BaseModel):

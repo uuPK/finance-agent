@@ -418,6 +418,7 @@ create table if not exists evaluation.eval_results (
     generated_sql text,
     generated_query_plan jsonb not null default '{}'::jsonb,
     generated_response jsonb not null default '{}'::jsonb,
+    metrics jsonb not null default '{}'::jsonb,
     auto_decision varchar(32) not null default 'pending',
     review_priority varchar(16),
     review_status varchar(32) not null default 'not_required',
