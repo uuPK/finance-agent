@@ -378,61 +378,26 @@ class QueryService:
     def _apply_rule_plan_safeguards(
         build_result: QueryPlanBuildResult,
         deterministic_plan: QueryPlan,
+        metadata_context: dict[str, object] | None = None,
     ) -> QueryPlanBuildResult:
-        """Apply deterministic protections for unambiguous metrics and result grain."""
+        """Apply generic structural protections using active, retrieved metadata."""
         llm_plan = build_result.plan
-        question = llm_plan.question or deterministic_plan.question
-        # These phrases have verified official-dataset definitions.  The
-        # deterministic plan is intentionally used as the source of truth here:
-        # it preserves every explicit condition, whereas an LLM plan may be
-        # superficially valid but silently drop one of several linked filters.
-        official_semantic_terms = (
-            "日均资产",
-            "盈亏",
-            "盈利",
-            "钻石卡",
-            "比亚迪",
-            "科创板",
-            "分公司各营业部",
-            "不同客户年龄段资产分布",
-            "普通账户总资产",
-            "信用账户净资产",
-            "交易费用",
-            "现金资产",
-            "平均年龄",
-            "成交数量",
-            "现金净流入",
-            "现金流入",
-            "转账金额",
-            "划拨金额",
-            "一级营业部",
-            "一级产品分类",
-            "二级产品分类",
-            "产品大类",
-            "同时发生过买入和卖出",
-            "双向交易",
-            "不同产品",
+        catalog_codes = (
+            {
+                row.get("metric_code")
+                for row in metadata_context.get("metrics", [])
+                if isinstance(row, dict)
+            }
+            if metadata_context is not None else None
         )
-        if (
-            deterministic_plan.plan_status == "ready"
-            and deterministic_plan.metrics
-            and any(term in question for term in official_semantic_terms)
-        ):
-            return QueryPlanBuildResult(
-                plan=deterministic_plan,
-                source="rule_fallback",
-                repair_attempt=build_result.repair_attempt,
-                llm_error=(
-                    "Deterministic official-semantic plan preserved the verified "
-                    "conditions and grain."
-                ),
-                llm_model=build_result.llm_model,
-                llm_provider=build_result.llm_provider,
-            )
+        verified_metrics = [
+            metric for metric in deterministic_plan.metrics
+            if catalog_codes is None or metric.metric_code in catalog_codes
+        ]
         if (
             llm_plan.plan_status == "needs_clarification"
             and deterministic_plan.plan_status == "ready"
-            and deterministic_plan.metrics
+            and verified_metrics
         ):
             return QueryPlanBuildResult(
                 plan=deterministic_plan,
@@ -445,7 +410,7 @@ class QueryService:
         if (
             llm_plan.plan_status == "ready"
             and deterministic_plan.plan_status == "ready"
-            and deterministic_plan.metrics
+            and verified_metrics
             and any(item.requires_clarification for item in llm_plan.filters)
         ):
             return QueryPlanBuildResult(
@@ -472,8 +437,8 @@ class QueryService:
                     or not set(deterministic_plan.grain.keys).issubset(set(llm_plan.grain.keys))
                 )
             )
-            required_output_metrics = QueryService._required_output_metrics(
-                question, deterministic_plan
+            required_output_metrics = QueryService._output_metrics_from_metadata(
+                deterministic_plan, metadata_context
             )
             llm_metric_codes = {
                 metric.metric_code for metric in llm_plan.metrics if metric.metric_code
@@ -557,10 +522,10 @@ class QueryService:
         ):
             safe_plan = deterministic_plan
             reason = "Deterministic clarification policy replaced an incomplete ready QueryPlan."
-        elif deterministic_plan.metrics:
+        elif verified_metrics:
             safe_plan = llm_plan.model_copy(
                 update={
-                    "metrics": deterministic_plan.metrics,
+                    "metrics": verified_metrics,
                     "filters": llm_plan.filters or deterministic_plan.filters,
                     "time_range": llm_plan.time_range or deterministic_plan.time_range,
                     "data_requirements": deterministic_plan.data_requirements,
@@ -579,37 +544,26 @@ class QueryService:
         )
 
     @staticmethod
-    def _required_output_metrics(question: str, plan: QueryPlan) -> list[QueryMetric]:
-        """Keep explicitly requested result metrics; leave threshold-only metrics as filters."""
-        metric_cues = {
-            "customer_count": ("数量", "人数", "多少", "总数", "几个", "几位", "客户数"),
-            "total_asset": ("总资产", "资产合计"),
-            "average_total_asset": ("平均总资产", "平均资产"),
-            "average_customer_age": ("平均年龄",),
-            "normal_total_asset": ("普通账户总资产", "普通资产"),
-            "credit_total_asset": ("信用账户净资产", "信用资产"),
-            "holding_market_value": ("持仓市值", "持仓金额", "市值合计"),
-            "holding_quantity": ("持有份额", "持仓份额"),
-            "trade_amount": ("交易金额", "成交金额", "交易额"),
-            "trade_fee": ("交易费用", "手续费"),
-            "trade_quantity": ("成交数量", "交易数量", "成交份额"),
-            "net_cash_flow": ("净资金流入", "净流入金额"),
-            "net_cash_inflow": ("现金净流入", "现金净流"),
-            "cash_in_amount": ("现金流入",),
-            "transfer_amount": ("转账金额",),
-            "assignment_amount": ("划拨金额",),
-        }
+    def _output_metrics_from_metadata(
+        plan: QueryPlan, metadata_context: dict[str, object] | None
+    ) -> list[QueryMetric]:
+        """Infer displayed metrics from plan output and catalog, never a Python phrase map."""
         filter_metric_codes = {
             item.metric_code for item in plan.filters if item.metric_code is not None
         }
-        required: list[QueryMetric] = []
-        for metric in plan.metrics:
-            code = metric.metric_code
-            if not code or code in filter_metric_codes:
-                continue
-            if any(cue in question for cue in metric_cues.get(code, ())):
-                required.append(metric)
-        return required
+        output_columns = set(plan.output.columns)
+        catalog_codes = {
+            row.get("metric_code")
+            for row in (metadata_context or {}).get("metrics", [])
+            if isinstance(row, dict)
+        } if metadata_context is not None else None
+        return [
+            metric for metric in plan.metrics
+            if metric.metric_code
+            and metric.metric_code not in filter_metric_codes
+            and (metric.alias or metric.name) in output_columns
+            and (catalog_codes is None or metric.metric_code in catalog_codes)
+        ]
 
     @staticmethod
     def _merge_plan_metrics(

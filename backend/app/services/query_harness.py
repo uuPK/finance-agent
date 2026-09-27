@@ -564,7 +564,9 @@ class QueryHarness:
             metadata_context=metadata_context,
         )
         deterministic_plan = service.rule_based_actor.build(question)
-        build_result = service._apply_rule_plan_safeguards(build_result, deterministic_plan)
+        build_result = service._apply_rule_plan_safeguards(
+            build_result, deterministic_plan, metadata_context
+        )
         query_plan = build_result.plan
         build_results = [build_result]
         metadata_context = service._load_metadata_context(
@@ -668,7 +670,9 @@ class QueryHarness:
                 metadata_context=metadata_context,
                 repair_attempt=repair_count,
             )
-            build_result = service._apply_rule_plan_safeguards(build_result, deterministic_plan)
+            build_result = service._apply_rule_plan_safeguards(
+                build_result, deterministic_plan, metadata_context
+            )
             plan_stage_attempt = max(plan_stage_attempt + 1, repair_count)
             await self.record_route_execution(
                 route, "applied" if build_result.source == "llm" else "failed"

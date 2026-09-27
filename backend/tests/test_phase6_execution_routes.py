@@ -346,7 +346,7 @@ def test_plan_missing_context_refreshes_then_rechecks_without_rebuilding_plan() 
     )
     service._load_metadata_context = lambda *args, **kwargs: initial
     service._ground_plan_with_context = lambda question, plan, context: (plan, context)
-    service._apply_rule_plan_safeguards = lambda result, deterministic: result
+    service._apply_rule_plan_safeguards = lambda result, deterministic, context: result
     plan = QueryPlan(plan_status="ready", intent="metadata_question")
     actor_attempts: list[int] = []
 
