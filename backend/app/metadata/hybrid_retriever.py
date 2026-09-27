@@ -10,7 +10,7 @@ from sqlalchemy.engine import Connection
 
 from app.core.config import Settings
 from app.metadata.documents import MetadataDocument, load_metadata_documents
-from app.metadata.fusion import RetrievalEvidence, reciprocal_rank_fusion
+from app.metadata.fusion import RetrievalEvidence, rank_candidates
 from app.metadata.metadata_filter import candidate_filter
 from app.metadata.milvus_store import MilvusMetadataStore
 from app.metadata.query_analysis import analyze_query
@@ -65,7 +65,9 @@ class HybridMetadataRetriever:
                 close()
 
     def retrieve(
-        self, question: str, query_plan: QueryPlan | None = None,
+        self,
+        question: str,
+        query_plan: QueryPlan | None = None,
         target_request: MissingContextRequest | None = None,
     ) -> MetadataRetrievalResult:
         if not question.strip():
@@ -76,31 +78,55 @@ class HybridMetadataRetriever:
         by_id = {doc.doc_id: doc for doc in documents}
         analysis = analyze_query(question)
         target_type = (
-            "join" if target_request and target_request.type == "join_path"
-            else target_request.type if target_request else None
+            "join"
+            if target_request and target_request.type == "join_path"
+            else target_request.type
+            if target_request
+            else None
         )
-        expression = (
-            f'doc_type == "{target_type}"' if target_type else candidate_filter(analysis)
+        expression = f'doc_type == "{target_type}"' if target_type else candidate_filter(analysis)
+        index_sync = (
+            self.store.verify_synced(documents)
+            if self.settings.ablation_strict_retrieval
+            else self.store.sync(documents)
         )
-        index_sync = self.store.sync(documents)
         lexical_query = " ".join((analysis.rewritten_query, *analysis.keywords))[:4096]
+        fusion_mode = self.settings.retrieval_fusion_mode
+        if fusion_mode not in {"bm25", "dense", "round_robin", "rrf"}:
+            raise ValueError(f"Unsupported metadata fusion mode: {fusion_mode}")
         if target_request:
-            bm25_ids = self.store.search_bm25(
-                lexical_query, self.settings.retrieval_bm25_top_k, expression, False
+            bm25_ids = (
+                self.store.search_bm25(
+                    lexical_query, self.settings.retrieval_bm25_top_k, expression, False
+                )
+                if fusion_mode != "dense"
+                else []
             )
-            dense_ids = self.store.search_dense(
-                analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression, False
+            dense_ids = (
+                self.store.search_dense(
+                    analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression, False
+                )
+                if fusion_mode != "bm25"
+                else []
             )
         else:
-            bm25_ids = self.store.search_bm25(
-                lexical_query, self.settings.retrieval_bm25_top_k, expression
+            bm25_ids = (
+                self.store.search_bm25(
+                    lexical_query, self.settings.retrieval_bm25_top_k, expression
+                )
+                if fusion_mode != "dense"
+                else []
             )
-            dense_ids = self.store.search_dense(
-                analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression
+            dense_ids = (
+                self.store.search_dense(
+                    analysis.rewritten_query, self.settings.retrieval_dense_top_k, expression
+                )
+                if fusion_mode != "bm25"
+                else []
             )
         ranked = [
             item
-            for item in reciprocal_rank_fusion(bm25_ids, dense_ids)
+            for item in rank_candidates(bm25_ids, dense_ids, fusion_mode)
             if item.doc_id in by_id
             and (not target_request or self._target_matches(by_id[item.doc_id], target_request))
         ]
@@ -142,6 +168,8 @@ class HybridMetadataRetriever:
                     rescored.append(item)
                 candidates = rescored
             except Exception as exc:
+                if self.settings.ablation_strict_retrieval:
+                    raise
                 # Preserve availability while making degraded ranking observable.
                 rerank_error = f"{type(exc).__name__}: {exc}"
         type_caps = {
@@ -169,10 +197,14 @@ class HybridMetadataRetriever:
                 for name, rank in (("bm25", item.bm25_rank), ("dense", item.dense_rank))
                 if rank is not None
             )
-            item.selected_reason = (
-                f"{channels} -> RRF -> rerank"
-                if item.reranker_score is not None
-                else f"{channels} -> RRF"
+            method = {
+                "rrf": "RRF",
+                "round_robin": "round_robin",
+                "bm25": "direct",
+                "dense": "direct",
+            }[fusion_mode]
+            item.selected_reason = f"{channels} -> {method}" + (
+                " -> rerank" if item.reranker_score is not None else ""
             )
         return self._materialize(
             documents,
@@ -283,6 +315,15 @@ class HybridMetadataRetriever:
         for doc_id in ordered_ids:
             doc = by_id[doc_id]
             matched[doc.doc_type].append(doc.metadata)
+        strategy = (
+            "milvus_bm25_dense_rrf_rerank"
+            if self.settings.retrieval_fusion_mode == "rrf"
+            and self.settings.enable_reranker
+            and not rerank_error
+            else "milvus_bm25_dense_rrf"
+            if self.settings.retrieval_fusion_mode == "rrf"
+            else f"milvus_{self.settings.retrieval_fusion_mode}"
+        )
         return MetadataRetrievalResult(
             keywords=list(analysis["keywords"]),
             table_names=list(dict.fromkeys(row["table_name"] for row in matched["table"])),
@@ -296,11 +337,7 @@ class HybridMetadataRetriever:
             matched_question_examples=matched["example"][:3],
             matched_rule_constraints=matched["rule"],
             confidence=0.8 if any(item.bm25_rank and item.dense_rank for item in selected) else 0.5,
-            strategy=(
-                "milvus_bm25_dense_rrf_rerank"
-                if self.settings.enable_reranker and not rerank_error
-                else "milvus_bm25_dense_rrf"
-            ),
+            strategy=strategy,
             evidence=[evidence[doc_id].to_dict() for doc_id in ordered_ids],
             query_analysis=analysis,
             metadata_filter=expression,

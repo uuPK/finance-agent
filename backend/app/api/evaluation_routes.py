@@ -31,19 +31,29 @@ async def get_dashboard() -> EvaluationDashboard:
 
 @router.post("/runs", response_model=EvaluationRunCreated, status_code=status.HTTP_202_ACCEPTED)
 async def create_evaluation_run(payload: EvaluationRunCreate) -> EvaluationRunCreated:
-    eval_run_id = await get_evaluation_manager().start_run(
-        payload.run_name,
-        payload.difficulty,
-        payload.case_source,
-        payload.limit,
-        payload.evaluation_mode,
-    )
+    try:
+        eval_run_id = await get_evaluation_manager().start_run(
+            payload.run_name,
+            payload.difficulty,
+            payload.case_source,
+            payload.limit,
+            payload.evaluation_mode,
+            payload.ablation_variant,
+            payload.comparison_group,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return EvaluationRunCreated(eval_run_id=eval_run_id, status="running")
 
 
 @router.get("/runs", response_model=list[EvaluationRunSummary])
 async def list_evaluation_runs(limit: int = Query(20, ge=1, le=100)) -> list[EvaluationRunSummary]:
     return await asyncio.to_thread(get_evaluation_manager().repository.list_runs, limit)
+
+
+@router.get("/comparisons/{group}", response_model=list[EvaluationRunDetail])
+async def get_comparison(group: str) -> list[EvaluationRunDetail]:
+    return await asyncio.to_thread(get_evaluation_manager().repository.comparison, group)
 
 
 @router.get("/runs/{eval_run_id}", response_model=EvaluationRunDetail)

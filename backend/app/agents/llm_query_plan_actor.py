@@ -12,7 +12,7 @@ from app.llm.schemas import LLMMessage
 from app.schemas.query_plan import QueryDimension, QueryGrain, QueryPlan
 from app.schemas.review import ReviewDecision
 
-ActorSource = Literal["llm", "rule_fallback"]
+ActorSource = Literal["llm", "rule_fallback", "ablation_direct"]
 
 
 @dataclass(slots=True)

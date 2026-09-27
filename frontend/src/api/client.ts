@@ -219,12 +219,18 @@ export async function getEvaluationRun(runId: string): Promise<EvaluationRunDeta
   return parseResponse(await fetch(`/api/evaluation/runs/${runId}`));
 }
 
+export async function getEvaluationComparison(group: string): Promise<EvaluationRunDetail[]> {
+  return parseResponse(await fetch(`/api/evaluation/comparisons/${encodeURIComponent(group)}`));
+}
+
 export async function createEvaluationRun(payload: {
   run_name: string;
   difficulty?: string;
   case_source?: "official" | "official_derived" | "official_extension" | "official_challenge" | "official_challenge_v2" | "official_challenge_v3" | "official_challenge_v4" | "official_challenge_v5";
   limit: number;
   evaluation_mode: "smoke" | "full";
+  ablation_variant?: string;
+  comparison_group?: string;
 }): Promise<{ eval_run_id: string; status: string }> {
   return parseResponse(
     await fetch("/api/evaluation/runs", {

@@ -16,8 +16,17 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.core.config import get_settings
 from app.db.session import engine as default_engine
+from app.evaluation.ablation import (
+    AblationProfile,
+    comparison_manifest,
+    database_fingerprint,
+    get_profile,
+    validate_ablation_environment,
+)
 from app.evaluation.phase9_metrics import score_case_metrics, summarize_case_metrics
+from app.evaluation.slices import summarize_slices
 from app.guardrails.sql_guardrail import SQLGuardrail
 from app.metadata.schema_context import SchemaContextProvider
 from app.schemas.evaluation import (
@@ -149,7 +158,15 @@ class EvaluationRepository:
         self.metadata_catalog = MetadataCatalogService(self.engine)
         self.schema_context_provider = SchemaContextProvider(self.engine)
 
-    def create_run(self, run_name: str, mode: str, case_source: str | None = None) -> UUID:
+    def create_run(
+        self,
+        run_name: str,
+        mode: str,
+        case_source: str | None = None,
+        ablation_variant: str | None = None,
+        comparison_group: str | None = None,
+        manifest: dict[str, Any] | None = None,
+    ) -> UUID:
         dataset_version = {
             "official_extension": "official-v1-extension",
             "official_challenge": "official-v1-challenge",
@@ -161,19 +178,66 @@ class EvaluationRepository:
             "official_challenge_v7": "official-v1-challenge-v7",
         }.get(case_source, "official-v1")
         with self.engine.begin() as connection:
+            if comparison_group is not None:
+                connection.execute(
+                    text("select pg_advisory_xact_lock(hashtext(:comparison_group))"),
+                    {"comparison_group": comparison_group},
+                )
+                existing = (
+                    connection.execute(
+                        text("""
+                    select ablation_variant, comparison_manifest
+                    from evaluation.eval_runs where comparison_group = :comparison_group
+                    for update
+                """),
+                        {"comparison_group": comparison_group},
+                    )
+                    .mappings()
+                    .all()
+                )
+                if any(row["comparison_manifest"] != manifest for row in existing):
+                    raise ValueError(
+                        "Comparison group has a different model, prompt, cases, "
+                        "retry budget or database snapshot."
+                    )
+                if any(row["ablation_variant"] == ablation_variant for row in existing):
+                    raise ValueError(
+                        "This ablation variant already exists in the comparison group."
+                    )
             return connection.execute(
                 text(
                     """
                     insert into evaluation.eval_runs
                         (run_name, model_name, status, dataset_version, metadata_version, prompt_version,
-                         evaluation_mode)
-                    values (:run_name, 'deepseek-chat', 'running', :dataset_version, 'official-metadata-v1',
-                            'official-query-pipeline-v1', :mode)
+                         evaluation_mode, ablation_variant, comparison_group, comparison_manifest)
+                    values (:run_name, :model_name, 'running', :dataset_version, 'official-metadata-v1',
+                            'official-query-pipeline-v1', :mode, :ablation_variant,
+                            :comparison_group, cast(:manifest as jsonb))
                     returning eval_run_id
                     """
                 ),
-                {"run_name": run_name, "mode": mode, "dataset_version": dataset_version},
+                {
+                    "run_name": run_name,
+                    "mode": mode,
+                    "dataset_version": dataset_version,
+                    "model_name": get_settings().llm_model,
+                    "ablation_variant": ablation_variant,
+                    "comparison_group": comparison_group,
+                    "manifest": json.dumps(manifest) if manifest is not None else None,
+                },
             ).scalar_one()
+
+    def invalidate_comparison(self, eval_run_id: UUID, reason: str) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("""
+                update evaluation.eval_runs
+                set comparison_manifest = jsonb_set(
+                    comparison_manifest, '{invalid_reason}', to_jsonb(cast(:reason as text))
+                ) where eval_run_id = :eval_run_id
+            """),
+                {"eval_run_id": str(eval_run_id), "reason": reason},
+            )
 
     def load_cases(
         self, difficulty: str | None, case_source: str | None, limit: int
@@ -192,7 +256,7 @@ class EvaluationRepository:
                     text(
                         f"""
                     select case_id, case_code, question, difficulty, expected_query_plan, expected_sql,
-                           expected_result, expected_status, scoring_config, tags
+                           expected_result, expected_status, scoring_config, tags, source_type
                     from evaluation.eval_cases
                     {where}
                     order by case_code
@@ -296,7 +360,8 @@ class EvaluationRepository:
                 connection.execute(
                     text(
                         """
-                    select er.*, ec.case_code, ec.question, ec.difficulty, ec.expected_status
+                    select er.*, ec.case_code, ec.question, ec.difficulty, ec.expected_status,
+                           ec.expected_sql, ec.expected_query_plan, ec.tags, ec.source_type
                     from evaluation.eval_results er
                     join evaluation.eval_cases ec on ec.case_id = er.case_id
                     where er.eval_run_id = :eval_run_id
@@ -314,7 +379,26 @@ class EvaluationRepository:
             metrics_summary=summarize_case_metrics(
                 [dict(row.get("metrics") or {}) for row in results]
             ),
+            comparison_manifest=dict(run["comparison_manifest"])
+            if run.get("comparison_manifest")
+            else None,
+            slice_summary=summarize_slices([dict(row) for row in results]),
         )
+
+    def comparison(self, group: str) -> list[EvaluationRunDetail]:
+        with self.engine.connect() as connection:
+            run_ids = (
+                connection.execute(
+                    text("""
+                select eval_run_id from evaluation.eval_runs
+                where comparison_group = :group order by started_at
+            """),
+                    {"group": group},
+                )
+                .scalars()
+                .all()
+            )
+        return [detail for run_id in run_ids if (detail := self.get_run(run_id)) is not None]
 
     def list_runs(self, limit: int = 20) -> list[EvaluationRunSummary]:
         with self.engine.connect() as connection:
@@ -1022,6 +1106,8 @@ class EvaluationRepository:
             if row["average_elapsed_ms"]
             else None,
             "dataset_version": row.get("dataset_version"),
+            "ablation_variant": row.get("ablation_variant"),
+            "comparison_group": row.get("comparison_group"),
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
         }
@@ -1082,17 +1168,41 @@ class EvaluationManager:
         case_source: str | None,
         limit: int,
         mode: str,
+        ablation_variant: str | None = None,
+        comparison_group: str | None = None,
     ) -> UUID:
+        cases = await asyncio.to_thread(self.repository.load_cases, difficulty, case_source, limit)
+        profile = get_profile(ablation_variant) if ablation_variant else None
+        manifest = None
+        if profile is not None:
+            if not comparison_group:
+                raise ValueError("Comparison group is required for ablation runs.")
+            if not cases:
+                raise ValueError("No active cases match the ablation selection.")
+            await asyncio.to_thread(
+                validate_ablation_environment, self.repository.engine, get_settings(), profile
+            )
+            snapshot = await asyncio.to_thread(database_fingerprint, self.repository.engine)
+            manifest = comparison_manifest(get_settings(), cases, snapshot, 2)
         eval_run_id = await asyncio.to_thread(
-            self.repository.create_run, run_name, mode, case_source
+            self.repository.create_run,
+            run_name,
+            mode,
+            case_source,
+            ablation_variant,
+            comparison_group,
+            manifest,
         )
-        cases = await asyncio.to_thread(
-            self.repository.load_cases, difficulty, case_source, limit
-        )
-        self._start_task(self._execute(eval_run_id, cases))
+        self._start_task(self._execute(eval_run_id, cases, profile, manifest))
         return eval_run_id
 
-    async def _execute(self, eval_run_id: UUID, cases: list[dict[str, Any]]) -> None:
+    async def _execute(
+        self,
+        eval_run_id: UUID,
+        cases: list[dict[str, Any]],
+        profile: AblationProfile | None = None,
+        manifest: dict[str, Any] | None = None,
+    ) -> None:
         status = "completed"
         try:
             for case in cases:
@@ -1103,7 +1213,13 @@ class EvaluationManager:
                 prior_sink: Any = None
                 started_at = perf_counter()
                 try:
-                    service = self.service_factory()
+                    service = (
+                        QueryService(
+                            settings=profile.settings(get_settings()), ablation_profile=profile
+                        )
+                        if profile
+                        else self.service_factory()
+                    )
                     prior_sink = getattr(service, "event_sink", None)
 
                     async def collect(
@@ -1112,23 +1228,38 @@ class EvaluationManager:
                         captured_events: list[dict[str, Any]] = events,
                         sink: Any = prior_sink,
                     ) -> None:
-                        captured_events.append({
-                            "type": event.get("type"),
-                            "stage": event.get("stage"),
-                            "status": event.get("status"),
-                            "duration_ms": event.get("duration_ms"),
-                            "output": (
-                                {key: (event.get("output") or {}).get(key) for key in (
-                                    "prompt_tokens", "completion_tokens", "total_tokens"
-                                )}
-                                if event.get("type") == "trace.llm_call"
-                                else {"context_tokens_estimated": (event.get("output") or {}).get("context_tokens_estimated")}
-                                if event.get("type") == "trace.context_selection"
-                                else {"expansion_status": (event.get("output") or {}).get("expansion_status")}
-                                if event.get("stage") == "refresh_context"
-                                else {}
-                            ),
-                        })
+                        captured_events.append(
+                            {
+                                "type": event.get("type"),
+                                "stage": event.get("stage"),
+                                "status": event.get("status"),
+                                "duration_ms": event.get("duration_ms"),
+                                "output": (
+                                    {
+                                        key: (event.get("output") or {}).get(key)
+                                        for key in (
+                                            "prompt_tokens",
+                                            "completion_tokens",
+                                            "total_tokens",
+                                        )
+                                    }
+                                    if event.get("type") == "trace.llm_call"
+                                    else {
+                                        "context_tokens_estimated": (event.get("output") or {}).get(
+                                            "context_tokens_estimated"
+                                        )
+                                    }
+                                    if event.get("type") == "trace.context_selection"
+                                    else {
+                                        "expansion_status": (event.get("output") or {}).get(
+                                            "expansion_status"
+                                        )
+                                    }
+                                    if event.get("stage") == "refresh_context"
+                                    else {}
+                                ),
+                            }
+                        )
                         if sink is not None:
                             await sink(event)
 
@@ -1147,6 +1278,15 @@ class EvaluationManager:
                 elapsed_ms = int((perf_counter() - started_at) * 1000)
                 result = self._score(case, response, error, elapsed_ms, events=events)
                 await asyncio.to_thread(self.repository.save_result, eval_run_id, case, result)
+            if manifest is not None:
+                end_snapshot = await asyncio.to_thread(database_fingerprint, self.repository.engine)
+                if end_snapshot != manifest["database_sha256"]:
+                    status = "failed"
+                    await asyncio.to_thread(
+                        self.repository.invalidate_comparison,
+                        eval_run_id,
+                        "Database contents changed during the run.",
+                    )
         except Exception:
             status = "failed"
         finally:
@@ -1162,8 +1302,9 @@ class EvaluationManager:
         events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if response is None:
-            metrics = score_case_metrics(case, None, events=events, elapsed_ms=elapsed_ms,
-                                         result_correct=False)
+            metrics = score_case_metrics(
+                case, None, events=events, elapsed_ms=elapsed_ms, result_correct=False
+            )
             return {
                 "query_id": None,
                 "passed": False,
@@ -1206,7 +1347,8 @@ class EvaluationManager:
             )
         )
         metrics = score_case_metrics(
-            case, response,
+            case,
+            response,
             retrieval=response._evaluation_retrieval,
             runtime=response._evaluation_runtime,
             events=events,

@@ -9,7 +9,7 @@ import pytest
 
 from app.core.config import Settings
 from app.metadata.documents import MetadataDocument
-from app.metadata.fusion import reciprocal_rank_fusion
+from app.metadata.fusion import rank_candidates, reciprocal_rank_fusion
 from app.metadata.hybrid_retriever import HybridMetadataRetriever
 from app.metadata.metadata_filter import candidate_filter
 from app.metadata.milvus_store import MilvusMetadataStore
@@ -34,6 +34,51 @@ def test_query_analysis_filter_and_rrf() -> None:
     fused = reciprocal_rank_fusion(["a", "b"], ["b", "c"])
     assert [item.doc_id for item in fused] == ["b", "a", "c"]
     assert fused[0].bm25_rank == 2 and fused[0].dense_rank == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("bm25", ["a", "b"]),
+        ("dense", ["b", "c"]),
+        ("round_robin", ["a", "b", "c"]),
+        ("rrf", ["b", "a", "c"]),
+    ],
+)
+def test_ablation_fusion_modes_are_distinct(mode: str, expected: list[str]) -> None:
+    ranked = rank_candidates(["a", "b"], ["b", "c"], mode)
+    assert [item.doc_id for item in ranked] == expected
+    if mode == "rrf":
+        assert ranked[0].rrf_score > 0
+    else:
+        assert all(item.rrf_score == 0 for item in ranked)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_calls"),
+    [("bm25", ["bm25"]), ("dense", ["dense"]),
+     ("round_robin", ["bm25", "dense"]), ("rrf", ["bm25", "dense"])],
+)
+def test_ablation_retrieval_only_calls_enabled_channels(
+    monkeypatch, mode: str, expected_calls: list[str]
+) -> None:
+    docs = [_doc("table:mart.asset", "table", "资产", {"table_name": "asset"})]
+    monkeypatch.setattr("app.metadata.hybrid_retriever.load_metadata_documents", lambda _: docs)
+    calls: list[str] = []
+
+    def search(channel: str) -> list[str]:
+        calls.append(channel)
+        return ["table:mart.asset"]
+
+    store = SimpleNamespace(
+        sync=lambda _: {"total": 1, "upserted": 0, "deleted": 0},
+        search_bm25=lambda *_: search("bm25"),
+        search_dense=lambda *_: search("dense"),
+    )
+    settings = Settings(_env_file=None, enable_reranker=False, retrieval_fusion_mode=mode)
+    result = HybridMetadataRetriever(Mock(), settings, store=store).retrieve("资产")
+    assert calls == expected_calls
+    assert result.table_names == ["asset"]
 
 
 def test_zhipu_official_embedding_and_rerank_contract() -> None:

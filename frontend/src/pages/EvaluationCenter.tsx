@@ -17,6 +17,7 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   createEvaluationRun,
   createReviewBatch,
+  getEvaluationComparison,
   getEvaluationDashboard,
   getEvaluationRun,
   importReviewDecisions,
@@ -55,6 +56,24 @@ const phase9Metrics = [
   { group: "cost", key: "p95_latency_ms", label: "P95 耗时", percent: false },
   { group: "critic", key: "token_overhead", label: "Critic token 开销", percent: false }
 ] as const;
+
+const ablationVariants = [
+  ["full", "Full"], ["no_query_plan", "No QueryPlan"],
+  ["no_critic", "No Critic"], ["bm25_only", "BM25 only"],
+  ["dense_only", "Dense only"], ["bm25_dense", "BM25 + Dense（交错）"],
+  ["bm25_dense_rrf", "BM25 + Dense + RRF"],
+  ["full_cross_encoder", "Full Retrieval + CrossEncoder"],
+  ["legacy_retrieval", "Legacy Retrieval"],
+  ["hybrid_retrieval", "Hybrid Retrieval"],
+  ["critic_always", "Always-on Critic"],
+  ["critic_conditional", "Conditional Critic"]
+] as const;
+
+const sliceLabels: Record<string, string> = {
+  single_table: "单表", aggregation: "聚合", multi_table_join: "多表 JOIN",
+  multi_time_window: "多时间窗", business_terminology: "业务术语",
+  ambiguous: "歧义", challenge: "挑战题"
+};
 
 const priorityClass: Record<string, string> = {
   blocking: "bg-rose-100 text-rose-700",
@@ -137,6 +156,9 @@ export function EvaluationCenter() {
   const [selectedItem, setSelectedItem] = useState<ReviewItemDetail | null>(null);
   const [difficulty, setDifficulty] = useState("");
   const [caseSource, setCaseSource] = useState("");
+  const [ablationVariant, setAblationVariant] = useState("");
+  const [comparisonGroup, setComparisonGroup] = useState("");
+  const [comparisonRuns, setComparisonRuns] = useState<EvaluationRunDetail[]>([]);
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState("");
   const [reviewerId, setReviewerId] = useState("reviewer-01");
@@ -154,6 +176,9 @@ export function EvaluationCenter() {
   const loadRun = useCallback(async (runId: string) => {
     const detail = await getEvaluationRun(runId);
     setSelectedRun(detail);
+    setComparisonRuns(detail.comparison_group
+      ? await getEvaluationComparison(detail.comparison_group)
+      : []);
   }, []);
 
   const loadOverview = useCallback(async () => {
@@ -246,7 +271,7 @@ export function EvaluationCenter() {
     setMessage("");
     try {
       const created = await createEvaluationRun({
-        run_name: `workbench-${new Date().toISOString().slice(0, 19)}`,
+        run_name: `${ablationVariant || "workbench"}-${new Date().toISOString().slice(0, 19)}`,
         difficulty: difficulty || undefined,
         case_source: caseSource === "extension"
           ? "official_extension"
@@ -264,7 +289,9 @@ export function EvaluationCenter() {
         // A full run must cover every active baseline case. The API cap leaves
         // room for the 217-case baseline to grow without silently truncating it.
         limit: caseSource ? 30 : difficulty ? 20 : 500,
-        evaluation_mode: caseSource || !difficulty ? "full" : "smoke"
+        evaluation_mode: caseSource || !difficulty ? "full" : "smoke",
+        ablation_variant: ablationVariant || undefined,
+        comparison_group: ablationVariant ? comparisonGroup.trim() || undefined : undefined
       });
       await loadRun(created.eval_run_id);
       await loadOverview();
@@ -368,18 +395,34 @@ export function EvaluationCenter() {
             <p className="mt-1 text-sm text-muted">基准案例、自动评分与人工裁定运行在同一条可审计链路中。</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <select value={ablationVariant} onChange={(event) => setAblationVariant(event.target.value)} className="h-9 border border-line bg-white px-3 text-sm text-ink" aria-label="消融变体">
+              <option value="">常规评测</option>
+              {ablationVariants.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+            </select>
+            {ablationVariant && <input value={comparisonGroup} onChange={(event) => setComparisonGroup(event.target.value)} placeholder="对照组名称（各变体填相同）" aria-label="对照组名称" className="h-9 w-56 border border-line bg-white px-3 text-sm text-ink" />}
             <select value={caseSource} onChange={(event) => { setCaseSource(event.target.value); if (event.target.value) setDifficulty(""); }} className="h-9 border border-line bg-white px-3 text-sm text-ink">
               <option value="">全部评测集（257题）</option><option value="extension">扩展集（30题）</option><option value="challenge-v1">第一轮独立挑战集（30题）</option><option value="challenge-v2">第二轮独立挑战集（30题）</option><option value="challenge-v3">第三轮独立挑战集（30题）</option><option value="challenge-v4">第四轮独立挑战集（30题）</option><option value="challenge-v5">第五轮独立挑战集（40题）</option>
             </select>
             <select value={difficulty} onChange={(event) => { setDifficulty(event.target.value); if (event.target.value) setCaseSource(""); }} disabled={Boolean(caseSource)} className="h-9 border border-line bg-white px-3 text-sm text-ink disabled:bg-slate-50">
               <option value="">完整评测集</option><option value="simple">简单案例冒烟</option><option value="medium">中等案例冒烟</option><option value="complex">复杂案例冒烟</option>
             </select>
-            <button type="button" onClick={() => void startEvaluation()} disabled={hasRunningRun} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><Play className="h-4 w-4" />{hasRunningRun ? "评测运行中" : "运行评测"}</button>
+            <button type="button" onClick={() => void startEvaluation()} disabled={hasRunningRun || Boolean(ablationVariant && !comparisonGroup.trim())} className="inline-flex h-9 items-center gap-2 bg-slate-900 px-3 text-sm font-medium text-white disabled:opacity-50"><Play className="h-4 w-4" />{hasRunningRun ? "评测运行中" : "运行评测"}</button>
             <button type="button" onClick={() => void buildReviewBatch()} disabled={!selectedRun || selectedRun.status !== "completed"} className="inline-flex h-9 items-center gap-2 border border-line bg-white px-3 text-sm font-medium text-ink disabled:opacity-50"><ClipboardCheck className="h-4 w-4" />为本次生成复核批次</button>
           </div>
         </header>
 
         {message && <p className="mt-4 border-l-2 border-teal-600 bg-teal-50 px-3 py-2 text-sm text-teal-900">{message}</p>}
+
+        {selectedRun?.comparison_group && (
+          <section className="mt-5 border border-line bg-white p-4">
+            <h2 className="text-sm font-semibold text-ink">Phase 10 消融对照 · {selectedRun.comparison_group}</h2>
+            <p className="mt-1 text-xs text-muted">仅比较同一指纹的模型、提示词代码、题集与数据库。失败批次不能用于结论；不自动运行其他变体。</p>
+            <div className="mt-3 overflow-x-auto"><table className="w-full min-w-[600px] text-left text-sm"><thead><tr className="border-b border-line text-xs text-muted"><th className="py-2">变体</th><th>状态</th><th>准确率</th><th>平均 LLM 调用</th><th>P95 耗时</th></tr></thead><tbody>{comparisonRuns.map((run) => <tr key={run.eval_run_id} className="border-b border-line"><td className="py-2">{run.ablation_variant}</td><td>{run.status}</td><td>{run.status === "completed" && run.total_cases ? `${(run.passed_cases / run.total_cases * 100).toFixed(1)}%` : "—"}</td><td>{run.metrics_summary?.cost?.llm_calls ?? "—"}</td><td>{typeof run.metrics_summary?.cost?.p95_latency_ms === "number" ? formatDuration(run.metrics_summary.cost.p95_latency_ms) : "—"}</td></tr>)}</tbody></table></div>
+            <div className="mt-4 overflow-x-auto"><table className="w-full min-w-[900px] text-left text-xs"><thead><tr className="border-b border-line text-muted"><th className="py-2">变体 / 题型</th>{Object.entries(sliceLabels).map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{comparisonRuns.map((run) => <tr key={run.eval_run_id} className="border-b border-line"><td className="py-2 font-medium">{run.ablation_variant}</td>{Object.keys(sliceLabels).map((name) => { const slice = run.slice_summary?.[name]; return <td key={name}>{run.status === "completed" && slice?.accuracy != null ? `${(slice.accuracy * 100).toFixed(1)}% (${slice.cases})` : "—"}</td>; })}</tr>)}</tbody></table></div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-3 lg:grid-cols-7">{Object.entries(selectedRun.slice_summary ?? {}).map(([name, slice]) => <div key={name} className="border border-line p-2 text-xs"><div className="text-muted">{sliceLabels[name] ?? name}</div><div className="mt-1 font-semibold text-ink">{selectedRun.status === "completed" && slice.accuracy !== null ? `${(slice.accuracy * 100).toFixed(1)}%` : "—"}</div><div className="text-muted">{slice.passed}/{slice.cases} 题</div></div>)}</div>
+            <p className="mt-3 text-xs text-muted">多时间窗按标准计划、业务术语按案例标签识别；无标注显示 0 题，不推断归类。指纹：{String(selectedRun.comparison_manifest?.database_sha256 ?? "—").slice(0, 12)}…</p>
+          </section>
+        )}
 
         <section className="mt-5 grid border-l border-t border-line bg-white sm:grid-cols-2 lg:grid-cols-4">
           {metricCards.map((metric) => {

@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from app.evaluation.ablation import PROFILES
 from app.schemas.metadata import MetadataChangeInput
 
 Difficulty = Literal["simple", "medium", "complex"]
@@ -32,6 +33,16 @@ class EvaluationRunCreate(BaseModel):
     case_source: EvaluationCaseSource | None = None
     limit: int = Field(default=20, ge=1, le=500)
     evaluation_mode: Literal["smoke", "full"] = "full"
+    ablation_variant: str | None = None
+    comparison_group: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_ablation(self) -> EvaluationRunCreate:
+        if self.ablation_variant is not None and self.ablation_variant not in PROFILES:
+            raise ValueError("Unknown ablation variant.")
+        if bool(self.ablation_variant) != bool(self.comparison_group):
+            raise ValueError("Ablation variant and comparison group must be supplied together.")
+        return self
 
 
 class EvaluationRunCreated(BaseModel):
@@ -48,6 +59,8 @@ class EvaluationRunSummary(BaseModel):
     review_queued_cases: int = 0
     average_elapsed_ms: float | None = None
     dataset_version: str | None = None
+    ablation_variant: str | None = None
+    comparison_group: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
 
@@ -91,6 +104,8 @@ class EvaluationResultSummary(BaseModel):
 class EvaluationRunDetail(EvaluationRunSummary):
     results: list[EvaluationResultSummary] = Field(default_factory=list)
     metrics_summary: dict[str, Any] = Field(default_factory=dict)
+    comparison_manifest: dict[str, Any] | None = None
+    slice_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReviewBatchCreate(BaseModel):

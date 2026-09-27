@@ -40,6 +40,7 @@ class LLMResultCritic:
         hard_checks: list[ReviewDecision],
         metadata_context: dict[str, Any],
         preview_rows: int,
+        direct_question: bool = False,
     ) -> LLMResultCriticResult:
         if self.llm_service is None:
             return LLMResultCriticResult(
@@ -57,6 +58,7 @@ class LLMResultCritic:
                     hard_checks=hard_checks,
                     metadata_context=metadata_context,
                     preview_rows=preview_rows,
+                    direct_question=direct_question,
                 ),
                 temperature=0.0,
                 max_tokens=1800,
@@ -88,13 +90,17 @@ class LLMResultCritic:
         hard_checks: list[ReviewDecision],
         metadata_context: dict[str, Any],
         preview_rows: int,
+        direct_question: bool = False,
     ) -> list[LLMMessage]:
         review_schema = json.dumps(ReviewDecision.model_json_schema(), ensure_ascii=False)
-        query_plan_json = json.dumps(
-            query_plan.model_dump(mode="json", exclude_none=True),
-            ensure_ascii=False,
-            indent=2,
-        )
+        plan_section = ""
+        if not direct_question:
+            query_plan_json = json.dumps(
+                query_plan.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                indent=2,
+            )
+            plan_section = f"Approved QueryPlan：\n{query_plan_json}"
         sql_draft_json = json.dumps(
             sql_draft.model_dump(mode="json", exclude_none=True),
             ensure_ascii=False,
@@ -128,8 +134,7 @@ class LLMResultCritic:
             用户问题：
             {question}
 
-            Approved QueryPlan：
-            {query_plan_json}
+            {plan_section}
 
             Executed SQLDraft：
             {sql_draft_json}
@@ -155,7 +160,15 @@ class LLMResultCritic:
         ).strip()
 
         return [
-            LLMMessage(role="system", content=_RESULT_CRITIC_SYSTEM_PROMPT),
+            LLMMessage(
+                role="system",
+                content=(
+                    "Review whether the executed SQL result answers the original question. "
+                    "There is no QueryPlan in this ablation arm. Hard checks are vetoes. "
+                    "Output one ReviewDecision JSON object with stage result_review."
+                    if direct_question else _RESULT_CRITIC_SYSTEM_PROMPT
+                ),
+            ),
             LLMMessage(role="user", content=user_prompt),
         ]
 

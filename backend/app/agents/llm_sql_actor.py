@@ -41,7 +41,12 @@ class LLMSQLActor:
         previous_sql: str | None = None,
         critic_feedback: list[ReviewDecision] | None = None,
         repair_attempt: int = 0,
+        direct_question: bool = False,
     ) -> SQLBuildResult:
+        if direct_question:
+            return await self._build_direct(
+                question, metadata_context or {}, previous_sql, critic_feedback, repair_attempt
+            )
         semantic_draft = self._semantic_reference_draft(question, query_plan)
         if semantic_draft is not None:
             return SQLBuildResult(
@@ -97,6 +102,59 @@ class LLMSQLActor:
                 source="failed",
                 repair_attempt=repair_attempt,
                 llm_error=f"{type(exc).__name__}: {exc}",
+            )
+
+    async def _build_direct(
+        self,
+        question: str,
+        metadata_context: dict[str, Any],
+        previous_sql: str | None,
+        critic_feedback: list[ReviewDecision] | None,
+        repair_attempt: int,
+    ) -> SQLBuildResult:
+        """Evaluation-only question-to-SQL arm; never sees a QueryPlan or reference draft."""
+        if self.llm_service is None:
+            return SQLBuildResult(None, "failed", repair_attempt, "LLM service is required.")
+        feedback = [item.model_dump(mode="json") for item in critic_feedback or []]
+        prompt = json.dumps(
+            {
+                "question": question,
+                "metadata_context": for_prompt(metadata_context),
+                "previous_sql": previous_sql,
+                "review_feedback": feedback,
+                "output_schema": SQLDraft.model_json_schema(),
+            },
+            ensure_ascii=False,
+        )
+        try:
+            response = await self.llm_service.complete(
+                messages=[
+                    LLMMessage(
+                        role="system",
+                        content=(
+                            "Generate one PostgreSQL SELECT as SQLDraft JSON directly from the user "
+                            "question and provided metadata. Use only real mart tables and columns. "
+                            "Never select sensitive columns. Include a LIMIT of at most 1000. "
+                            "Do not invent definitions or join paths; output only JSON."
+                        ),
+                    ),
+                    LLMMessage(role="user", content=prompt),
+                ],
+                temperature=0.0,
+                max_tokens=2600,
+                response_format={"type": "json_object"},
+            )
+            return SQLBuildResult(
+                SQLDraft.model_validate(extract_json_object(response.content)),
+                "llm",
+                repair_attempt,
+                llm_raw_response=response.content,
+                llm_model=response.model,
+                llm_provider=response.provider,
+            )
+        except Exception as exc:
+            return SQLBuildResult(
+                None, "failed", repair_attempt, llm_error=f"{type(exc).__name__}: {exc}"
             )
 
     @staticmethod
@@ -300,19 +358,28 @@ class LLMSQLActor:
                 dialect="postgres",
                 tables=["ads_cust_info_d"],
                 columns=["average_customer_age"],
-                assumptions=["Average age is calculated over the current official customer snapshot."],
+                assumptions=[
+                    "Average age is calculated over the current official customer snapshot."
+                ],
                 confidence=0.98,
             )
         dimension = dimensions[0]
         if dimension in {"up_org_name", "org_name"}:
             select = f"b.{dimension}"
             from_clause = (
-                "FROM mart.ads_cust_info_d c\n"
-                "JOIN mart.dim_branch b ON b.org_id = c.org_id"
+                "FROM mart.ads_cust_info_d c\nJOIN mart.dim_branch b ON b.org_id = c.org_id"
             )
             age_column = "c.cust_age"
             tables = ["ads_cust_info_d", "dim_branch"]
-        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+        elif dimension in {
+            "cust_status",
+            "cust_type",
+            "cust_lvl_cd",
+            "gender_cd",
+            "edu_cd",
+            "prov_name",
+            "city_name",
+        }:
             select = dimension
             from_clause = "FROM mart.ads_cust_info_d"
             age_column = "cust_age"
@@ -338,7 +405,9 @@ class LLMSQLActor:
 
     @staticmethod
     def _cash_asset_draft(query_plan: QueryPlan, snapshot_date: str | None) -> SQLDraft | None:
-        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {"cash_asset"}:
+        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {
+            "cash_asset"
+        }:
             return None
         dimensions = LLMSQLActor._group_dimensions(query_plan)
         if len(dimensions) > 1:
@@ -357,7 +426,9 @@ class LLMSQLActor:
                 dialect="postgres",
                 tables=["dws_cust_aset_d"],
                 columns=["cash_asset"],
-                assumptions=["Cash asset uses the official normal-balance plus foreign-currency-balance formula."],
+                assumptions=[
+                    "Cash asset uses the official normal-balance plus foreign-currency-balance formula."
+                ],
                 confidence=0.98,
             )
         dimension = dimensions[0]
@@ -368,7 +439,15 @@ class LLMSQLActor:
                 "JOIN mart.dim_branch b ON b.org_id = c.org_id"
             )
             tables = ["dws_cust_aset_d", "ads_cust_info_d", "dim_branch"]
-        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+        elif dimension in {
+            "cust_status",
+            "cust_type",
+            "cust_lvl_cd",
+            "gender_cd",
+            "edu_cd",
+            "prov_name",
+            "city_name",
+        }:
             select = f"c.{dimension}"
             joins = "JOIN mart.ads_cust_info_d c ON c.pty_id = a.pty_id"
             tables = ["dws_cust_aset_d", "ads_cust_info_d"]
@@ -416,12 +495,22 @@ class LLMSQLActor:
                     LIMIT {limit}
                     """
                 ).strip(),
-                dialect="postgres", tables=["dwd_cust_tran_d"], columns=["average_trade_amount"],
-                assumptions=["Average trade amount is calculated from each transacting customer's period total."], confidence=0.98,
+                dialect="postgres",
+                tables=["dwd_cust_tran_d"],
+                columns=["average_trade_amount"],
+                assumptions=[
+                    "Average trade amount is calculated from each transacting customer's period total."
+                ],
+                confidence=0.98,
             )
         if metric_codes == {"trade_fee"} and dimensions == ["ccy"]:
             return LLMSQLActor._simple_trade_group_draft(
-                "ccy", "SUM(COALESCE(buy_fare, 0) + COALESCE(sell_fare, 0))", "trade_fee", start, end, limit
+                "ccy",
+                "SUM(COALESCE(buy_fare, 0) + COALESCE(sell_fare, 0))",
+                "trade_fee",
+                start,
+                end,
+                limit,
             )
         if metric_codes == {"buy_amount"} and dimensions == ["up_org_name"]:
             return SQLDraft(
@@ -436,10 +525,14 @@ class LLMSQLActor:
                     ORDER BY buy_amount DESC NULLS LAST, b.up_org_name
                     LIMIT {limit}
                     """
-                ).strip(), dialect="postgres",
+                ).strip(),
+                dialect="postgres",
                 tables=["dwd_cust_tran_d", "ads_cust_info_d", "dim_branch"],
                 columns=["up_org_name", "buy_amount"],
-                assumptions=["Buy amount uses buy_amt only and is grouped by the requested organization level."], confidence=0.98,
+                assumptions=[
+                    "Buy amount uses buy_amt only and is grouped by the requested organization level."
+                ],
+                confidence=0.98,
             )
         return None
 
@@ -457,22 +550,35 @@ class LLMSQLActor:
                 ORDER BY {alias} DESC NULLS LAST, {dimension}
                 LIMIT {limit}
                 """
-            ).strip(), dialect="postgres", tables=["dwd_cust_tran_d"], columns=[dimension, alias],
-            assumptions=["Trade metric is aggregated only after the requested period filter."], confidence=0.98,
+            ).strip(),
+            dialect="postgres",
+            tables=["dwd_cust_tran_d"],
+            columns=[dimension, alias],
+            assumptions=["Trade metric is aggregated only after the requested period filter."],
+            confidence=0.98,
         )
 
     @staticmethod
-    def _holding_quantity_draft(query_plan: QueryPlan, snapshot_date: str | None) -> SQLDraft | None:
-        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {"holding_quantity"}:
+    def _holding_quantity_draft(
+        query_plan: QueryPlan, snapshot_date: str | None
+    ) -> SQLDraft | None:
+        if not snapshot_date or {metric.metric_code for metric in query_plan.metrics} != {
+            "holding_quantity"
+        }:
             return None
         if LLMSQLActor._group_dimensions(query_plan):
             return None
         return SQLDraft(
-            sql=("SELECT SUM(COALESCE(hold_cnt, 0)) AS holding_quantity\n"
-                 "FROM mart.dwd_cust_hold_d\n"
-                 f"WHERE data_dt = '{snapshot_date}'\nLIMIT {query_plan.output.limit}"),
-            dialect="postgres", tables=["dwd_cust_hold_d"], columns=["holding_quantity"],
-            assumptions=["Holding quantity is the sum of hold_cnt at the requested snapshot."], confidence=0.98,
+            sql=(
+                "SELECT SUM(COALESCE(hold_cnt, 0)) AS holding_quantity\n"
+                "FROM mart.dwd_cust_hold_d\n"
+                f"WHERE data_dt = '{snapshot_date}'\nLIMIT {query_plan.output.limit}"
+            ),
+            dialect="postgres",
+            tables=["dwd_cust_hold_d"],
+            columns=["holding_quantity"],
+            assumptions=["Holding quantity is the sum of hold_cnt at the requested snapshot."],
+            confidence=0.98,
         )
 
     @staticmethod
@@ -480,7 +586,11 @@ class LLMSQLActor:
         query_plan: QueryPlan, start: str | None, end: str | None
     ) -> SQLDraft | None:
         """Count customers after a supported cumulative metric threshold."""
-        if not start or not end or "customer_count" not in {metric.metric_code for metric in query_plan.metrics}:
+        if (
+            not start
+            or not end
+            or "customer_count" not in {metric.metric_code for metric in query_plan.metrics}
+        ):
             return None
         threshold = next(
             (
@@ -531,7 +641,9 @@ class LLMSQLActor:
             dialect="postgres",
             tables=[table.rsplit(".", maxsplit=1)[-1]],
             columns=["customer_count"],
-            assumptions=["The cumulative metric threshold is evaluated per customer before counting."],
+            assumptions=[
+                "The cumulative metric threshold is evaluated per customer before counting."
+            ],
             confidence=0.98,
         )
 
@@ -572,7 +684,9 @@ class LLMSQLActor:
         )
 
     @staticmethod
-    def _finance_group_draft(query_plan: QueryPlan, start: str | None, end: str | None) -> SQLDraft | None:
+    def _finance_group_draft(
+        query_plan: QueryPlan, start: str | None, end: str | None
+    ) -> SQLDraft | None:
         if not start or not end:
             return None
         metric_codes = {metric.metric_code for metric in query_plan.metrics}
@@ -613,7 +727,15 @@ class LLMSQLActor:
                 "JOIN mart.dim_branch b ON b.org_id = c.org_id"
             )
             tables = ["dws_cust_fin_d", "ads_cust_info_d", "dim_branch"]
-        elif dimension in {"cust_status", "cust_type", "cust_lvl_cd", "gender_cd", "edu_cd", "prov_name", "city_name"}:
+        elif dimension in {
+            "cust_status",
+            "cust_type",
+            "cust_lvl_cd",
+            "gender_cd",
+            "edu_cd",
+            "prov_name",
+            "city_name",
+        }:
             select = f"c.{dimension}"
             joins = "JOIN mart.ads_cust_info_d c ON c.pty_id = f.pty_id"
             tables = ["dws_cust_fin_d", "ads_cust_info_d"]
@@ -647,8 +769,14 @@ class LLMSQLActor:
         )
 
     @staticmethod
-    def _trade_product_draft(query_plan: QueryPlan, start: str | None, end: str | None) -> SQLDraft | None:
-        if not start or not end or {metric.metric_code for metric in query_plan.metrics} != {"trade_amount"}:
+    def _trade_product_draft(
+        query_plan: QueryPlan, start: str | None, end: str | None
+    ) -> SQLDraft | None:
+        if (
+            not start
+            or not end
+            or {metric.metric_code for metric in query_plan.metrics} != {"trade_amount"}
+        ):
             return None
         dimensions = LLMSQLActor._group_dimensions(query_plan)
         if len(dimensions) != 1 or dimensions[0] not in {"up_prdt_type_name", "prdt_type_name"}:
@@ -666,9 +794,7 @@ class LLMSQLActor:
         filter_sql = ""
         if product_filter is not None:
             escaped_value = product_filter.value.normalized.replace("'", "''")
-            filter_sql = (
-                f"\n  AND p.{product_filter.field_code} = '{escaped_value}'"
-            )
+            filter_sql = f"\n  AND p.{product_filter.field_code} = '{escaped_value}'"
         dimension = dimensions[0]
         return SQLDraft(
             sql=dedent(
@@ -686,7 +812,9 @@ class LLMSQLActor:
             dialect="postgres",
             tables=["dwd_cust_tran_d", "dim_product"],
             columns=[dimension, "trade_amount"],
-            assumptions=["Product filters constrain the fact rows without becoming additional grouping keys."],
+            assumptions=[
+                "Product filters constrain the fact rows without becoming additional grouping keys."
+            ],
             confidence=0.98,
         )
 
@@ -718,7 +846,9 @@ class LLMSQLActor:
             dialect="postgres",
             tables=["ads_cust_info_d", "dim_branch"],
             columns=[dimension, "customer_count"],
-            assumptions=["Customer counts are grouped by the requested organization hierarchy only."],
+            assumptions=[
+                "Customer counts are grouped by the requested organization hierarchy only."
+            ],
             confidence=0.98,
         )
 
@@ -774,7 +904,9 @@ class LLMSQLActor:
             dialect="postgres",
             tables=["dws_cust_aset_d", "ads_cust_info_d"],
             columns=[dimension, "total_asset"],
-            assumptions=["A code grouping returns the requested code without an unsolicited dictionary label."],
+            assumptions=[
+                "A code grouping returns the requested code without an unsolicited dictionary label."
+            ],
             confidence=0.98,
         )
 
@@ -782,9 +914,9 @@ class LLMSQLActor:
     def _is_bidirectional_trade_question(question: str) -> bool:
         has_buy = "买入" in question
         has_sell = "卖出" in question
-        return (has_buy and has_sell and any(token in question for token in ("同时", "均", "都"))) or (
-            "双向交易" in question or "买卖双向" in question
-        )
+        return (
+            has_buy and has_sell and any(token in question for token in ("同时", "均", "都"))
+        ) or ("双向交易" in question or "买卖双向" in question)
 
     @staticmethod
     def _is_multi_product_holding_question(question: str) -> bool:
@@ -853,7 +985,9 @@ class LLMSQLActor:
             if item.role == "group_by" and item.dimension_code
         ]
         allowed_dimensions = {"cust_status", "cust_type", "gender_cd", "edu_cd", "cust_lvl_cd"}
-        if not grouped_dimensions or any(code not in allowed_dimensions for code in grouped_dimensions):
+        if not grouped_dimensions or any(
+            code not in allowed_dimensions for code in grouped_dimensions
+        ):
             return None
 
         threshold = asset_filter.value.normalized

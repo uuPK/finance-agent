@@ -19,9 +19,15 @@ from app.schemas.v2_protocol import MissingContextRequest
 class SchemaContextProvider:
     """Build a compact SQL generation context from PostgreSQL and metadata tables."""
 
-    def __init__(self, engine: Engine | None = None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine | None = None,
+        settings: Settings | None = None,
+        strict_retrieval: bool = False,
+    ) -> None:
         self.engine = engine or default_engine
         self.settings = settings or get_settings()
+        self.strict_retrieval = strict_retrieval
 
     def load(
         self, query_plan: QueryPlan | None = None, question: str | None = None
@@ -30,6 +36,8 @@ class SchemaContextProvider:
             with self.engine.connect() as connection:
                 return self._load_from_database(connection, query_plan, question)
         except Exception as exc:
+            if self.strict_retrieval:
+                raise
             return self._empty_context(
                 source="unavailable",
                 error=f"{type(exc).__name__}: {exc}",
@@ -140,6 +148,8 @@ class SchemaContextProvider:
                 finally:
                     retriever.close()
             except Exception:
+                if self.strict_retrieval:
+                    raise
                 if connection.in_transaction():
                     connection.rollback()
         return legacy_targeted_retrieval(connection, request)
@@ -169,6 +179,8 @@ class SchemaContextProvider:
                 finally:
                     hybrid.close()
             except Exception as exc:
+                if self.strict_retrieval:
+                    raise
                 if connection.in_transaction():
                     connection.rollback()
                 retrieval = MetadataRetriever(connection).retrieve(

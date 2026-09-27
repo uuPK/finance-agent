@@ -537,6 +537,25 @@ class QueryHarness:
             "已完成元数据检索",
             service._metadata_context_summary(metadata_context),
         )
+        if service.ablation_profile and service.ablation_profile.plan_mode == "direct":
+            # A transport-only object keeps the existing result/audit API stable. It is
+            # neither generated nor given to SQLActor/SQLCritic in this arm.
+            query_plan = QueryPlan(plan_status="ready", question=question)
+            build_result = QueryPlanBuildResult(query_plan, "ablation_direct")
+            await service._emit(
+                "build_query_plan", "skipped", "消融实验：直接从问题生成 SQL，不构造语义计划"
+            )
+            await service._emit("query_plan_llm_review", "skipped", "消融实验：无 QueryPlan 可审核")
+            return PlanPhaseResult(
+                query_plan,
+                metadata_context,
+                build_result,
+                [build_result],
+                ReviewBundle(),
+                True,
+                LLMPlanCriticResult(status="skipped", llm_error="No QueryPlan ablation."),
+                [],
+            )
         await service._emit("build_query_plan", "running", "正在生成结构化查询计划")
         build_result = await service.query_plan_actor.build(
             question,

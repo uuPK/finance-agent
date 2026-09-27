@@ -10,7 +10,7 @@ from app.schemas.query_plan import QueryPlan
 from app.schemas.review import ReviewDecision
 from app.schemas.sql import SQLDraft
 
-SQLCriticStatus = Literal["reviewed", "failed"]
+SQLCriticStatus = Literal["reviewed", "failed", "skipped"]
 
 
 @dataclass(slots=True)
@@ -34,6 +34,7 @@ class LLMSQLCritic:
         query_plan: QueryPlan,
         sql_draft: SQLDraft,
         hard_checks: list[ReviewDecision],
+        direct_question: str | None = None,
     ) -> LLMSQLCriticResult:
         if self.llm_service is None:
             return LLMSQLCriticResult(
@@ -43,11 +44,16 @@ class LLMSQLCritic:
 
         try:
             response = await self.llm_service.complete(
-                messages=self._build_messages(query_plan, sql_draft, hard_checks),
+                messages=(
+                    self._build_direct_messages(direct_question, sql_draft, hard_checks)
+                    if direct_question is not None
+                    else self._build_messages(query_plan, sql_draft, hard_checks)
+                ),
                 temperature=0.0,
                 max_tokens=1800,
                 response_format={"type": "json_object"},
             )
+
             data = extract_json_object(response.content)
             decision = ReviewDecision.model_validate(data)
             if decision.stage != "sql_review":
@@ -64,6 +70,29 @@ class LLMSQLCritic:
                 status="failed",
                 llm_error=f"{type(exc).__name__}: {exc}",
             )
+
+    @staticmethod
+    def _build_direct_messages(
+        question: str, sql_draft: SQLDraft, hard_checks: list[ReviewDecision]
+    ) -> list[LLMMessage]:
+        payload = {
+            "question": question,
+            "sql_draft": sql_draft.model_dump(mode="json"),
+            "hard_checks": [check.model_dump(mode="json") for check in hard_checks],
+            "output_schema": ReviewDecision.model_json_schema(),
+        }
+        return [
+            LLMMessage(
+                role="system",
+                content=(
+                    "Review whether the SQL faithfully answers the original user question. "
+                    "Do not assume a QueryPlan exists. Hard guardrail failures are vetoes. "
+                    "Check metrics, filters, time, grain and output. Return one ReviewDecision "
+                    "JSON object with stage sql_review; do not rewrite SQL."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
+        ]
 
     def _build_messages(
         self,

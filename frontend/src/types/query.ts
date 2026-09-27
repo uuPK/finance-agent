@@ -309,6 +309,8 @@ export interface EvaluationRunSummary {
   review_queued_cases: number;
   average_elapsed_ms?: number;
   dataset_version?: string;
+  ablation_variant?: string | null;
+  comparison_group?: string | null;
   started_at: string;
   finished_at?: string;
 }
@@ -339,6 +341,8 @@ export interface EvaluationResultSummary {
 export interface EvaluationRunDetail extends EvaluationRunSummary {
   results: EvaluationResultSummary[];
   metrics_summary?: Record<string, Record<string, number | null>>;
+  comparison_manifest?: Record<string, unknown> | null;
+  slice_summary?: Record<string, { cases: number; passed: number; accuracy: number | null }>;
 }
 
 export interface EvaluationDashboard {

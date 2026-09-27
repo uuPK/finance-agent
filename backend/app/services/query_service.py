@@ -12,7 +12,8 @@ from app.agents.llm_sql_actor import LLMSQLActor, SQLBuildResult
 from app.agents.llm_sql_critic import LLMSQLCritic, LLMSQLCriticResult
 from app.agents.plan_reviewer import QueryPlanHardValidator
 from app.agents.query_plan_actor import RuleBasedQueryPlanActor
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+from app.evaluation.ablation import AblationProfile
 from app.guardrails.empty_result_diagnostic import EmptyResultDiagnosticValidator
 from app.guardrails.plan_grounding import ground_query_plan
 from app.guardrails.result_validator import ResultHardValidator, ResultValidationResult
@@ -75,8 +76,11 @@ class QueryService:
         result_preview_rows: int | None = None,
         event_sink: EventSink | None = None,
         event_attempt: int = 0,
+        settings: Settings | None = None,
+        ablation_profile: AblationProfile | None = None,
     ) -> None:
-        self.settings = get_settings()
+        self.settings = settings or get_settings()
+        self.ablation_profile = ablation_profile
         self.event_sink = event_sink
         # event_attempt is the legacy constructor name for the clarification round.
         self.event_attempt = max(0, event_attempt)
@@ -108,7 +112,10 @@ class QueryService:
         self.sql_critic = LLMSQLCritic(llm_service=resolved_llm_service)
         self.result_critic = LLMResultCritic(llm_service=resolved_llm_service)
         self.answer_actor = AnswerActor()
-        self.schema_context_provider = schema_context_provider or SchemaContextProvider()
+        self.schema_context_provider = schema_context_provider or SchemaContextProvider(
+            settings=self.settings,
+            strict_retrieval=ablation_profile is not None,
+        )
         self.sql_executor = sql_executor or SQLExecutor()
         self.empty_result_validator = EmptyResultDiagnosticValidator(
             engine=getattr(self.sql_executor, "engine", None),
@@ -271,14 +278,17 @@ class QueryService:
                 ),
                 AgentStep(
                     name="build_query_plan",
-                    status="passed",
-                    summary="Built QueryPlan with LLM actor or deterministic fallback.",
+                    status="skipped" if build_result.source == "ablation_direct" else "passed",
+                    summary=("No QueryPlan ablation: compatibility envelope only."
+                             if build_result.source == "ablation_direct"
+                             else "Built QueryPlan with LLM actor or deterministic fallback."),
                     details=self._build_actor_details(build_result, build_results),
                 ),
                 self._build_repair_step(repair_count, build_results, review_passed),
                 AgentStep(
                     name="query_plan_hard_review",
-                    status="passed" if hard_review_passed else "failed",
+                    status=("skipped" if build_result.source == "ablation_direct"
+                            else "passed" if hard_review_passed else "failed"),
                     summary="Ran deterministic QueryPlan hard checks.",
                     details={
                         "checks": [check.model_dump() for check in review_bundle.hard_checks],
@@ -671,14 +681,18 @@ class QueryService:
 
         critic_result = LLMPlanCriticResult(
             status="skipped",
-            llm_error="Hard review failed; semantic critic skipped.",
+            llm_error=(
+                "PlanCritic disabled by ablation profile."
+                if hard_review_passed and not self._should_call_critic(query_plan)
+                else "Hard review failed; semantic critic skipped."
+            ),
         )
         if query_plan.plan_status == "invalid":
             critic_result = LLMPlanCriticResult(
                 status="skipped",
                 llm_error="Plan status is invalid; semantic critic skipped.",
             )
-        elif hard_review_passed:
+        elif hard_review_passed and self._should_call_critic(query_plan):
             await self._emit(
                 "query_plan_llm_review",
                 "running",
@@ -852,6 +866,8 @@ class QueryService:
             question=question,
             query_plan=query_plan,
             metadata_context=metadata_context,
+            **({"direct_question": True}
+               if self.ablation_profile and self.ablation_profile.plan_mode == "direct" else {}),
         )
         build_results = [build_result]
         await self._emit(
@@ -927,6 +943,9 @@ class QueryService:
                     build_result.draft,
                     metadata_context,
                     attempt=sql_stage_attempt,
+                    **({"original_question": question}
+                       if self.ablation_profile and self.ablation_profile.plan_mode == "direct"
+                       else {}),
                 )
                 review_history.append(
                     self._build_sql_review_details(
@@ -1246,6 +1265,9 @@ class QueryService:
                 previous_sql=previous_sql,
                 critic_feedback=repair_feedback,
                 repair_attempt=repair_count,
+                **({"direct_question": True}
+                   if self.ablation_profile and self.ablation_profile.plan_mode == "direct"
+                   else {}),
             )
             build_results.append(build_result)
             sql_stage_attempt = max(sql_stage_attempt + 1, build_result.repair_attempt)
@@ -1373,6 +1395,7 @@ class QueryService:
         sql_draft: SQLDraft,
         metadata_context: dict[str, object],
         attempt: int = 0,
+        original_question: str | None = None,
     ) -> tuple[ReviewBundle, bool, LLMSQLCriticResult]:
         await self._emit(
             "sql_hard_review",
@@ -1419,10 +1442,13 @@ class QueryService:
             )
 
         critic_result = LLMSQLCriticResult(
-            status="failed",
-            llm_error="Hard SQL review failed; SQLCritic skipped.",
+            status="skipped",
+            llm_error=(
+                "SQLCritic disabled by ablation profile."
+                if hard_review_passed else "Hard SQL review failed; SQLCritic skipped."
+            ),
         )
-        if hard_review_passed:
+        if hard_review_passed and self._should_call_critic(query_plan):
             await self._emit(
                 "sql_llm_review",
                 "running",
@@ -1433,6 +1459,11 @@ class QueryService:
                 query_plan=query_plan,
                 sql_draft=sql_draft,
                 hard_checks=hard_checks,
+                direct_question=(
+                    original_question
+                    if self.ablation_profile and self.ablation_profile.plan_mode == "direct"
+                    else None
+                ),
             )
             if critic_result.decision is not None:
                 decision = self._enforce_sql_critic_confidence(critic_result.decision)
@@ -1444,7 +1475,7 @@ class QueryService:
             "passed"
             if critic_result.decision is not None and critic_result.decision.passed
             else "skipped"
-            if not hard_review_passed
+            if critic_result.status == "skipped" or not hard_review_passed
             else "failed"
         )
         if critic_result.decision is not None:
@@ -1495,9 +1526,13 @@ class QueryService:
     ) -> tuple[ResultValidationResult, LLMResultCriticResult]:
         critic_result = LLMResultCriticResult(
             status="skipped",
-            llm_error="Result hard validation failed; ResultCritic skipped.",
+            llm_error=(
+                "ResultCritic disabled by ablation profile."
+                if hard_validation.passed and not self._should_call_critic(query_plan)
+                else "Result hard validation failed; ResultCritic skipped."
+            ),
         )
-        if hard_validation.passed:
+        if hard_validation.passed and self._should_call_critic(query_plan):
             critic_result = await self.result_critic.review(
                 question=question,
                 query_plan=query_plan,
@@ -1506,12 +1541,29 @@ class QueryService:
                 hard_checks=hard_validation.checks,
                 metadata_context=metadata_context,
                 preview_rows=self.result_preview_rows,
+                **({"direct_question": True}
+                   if self.ablation_profile and self.ablation_profile.plan_mode == "direct"
+                   else {}),
             )
             return (
                 self._merge_result_critic_decision(hard_validation, critic_result),
                 critic_result,
             )
         return hard_validation, critic_result
+
+    def _should_call_critic(self, query_plan: QueryPlan) -> bool:
+        mode = self.ablation_profile.critic_mode if self.ablation_profile else "always"
+        if mode == "none":
+            return False
+        if mode == "always":
+            return True
+        # Fixed, deterministic risk rule for the experimental conditional arm.
+        return bool(
+            query_plan.confidence < 0.85
+            or len(query_plan.data_requirements.candidate_tables) > 1
+            or query_plan.clarifications
+            or query_plan.plan_status != "ready"
+        )
 
     def _merge_result_critic_decision(
         self,
@@ -1903,8 +1955,9 @@ class QueryService:
         if result.decision is None:
             return AgentStep(
                 name="sql_llm_review",
-                status="failed",
-                summary="SQL semantic critic did not approve the SQL.",
+                status="skipped" if result.status == "skipped" else "failed",
+                summary=("SQL semantic critic was skipped." if result.status == "skipped"
+                         else "SQL semantic critic did not approve the SQL."),
                 details={
                     "status": result.status,
                     "llm_error": result.llm_error,

@@ -169,6 +169,10 @@ SQL Guardrail 现在用 PostgreSQL 中启用且字段仍存在的完整 `metadat
 
 评测中心按案例和批次展示检索召回、QueryPlan 覆盖、Harness 修复、模型调用/token、延迟与 Critic 开销；缺少标准标签或可靠 Trace 时显示不可用，不用 0 冒充。原有完整执行结果评分保持不变。现有数据库需先执行 [012 增量迁移](backend/db/migrations/012_evaluation_metrics.sql)。指标口径与尚需人工标注的 Critic 误判项见 [Phase 9 说明](docs/phase9-evaluation.md)。
 
+### 消融实验（Phase 10）
+
+评测中心可选 Full、No QueryPlan、No Critic、Milvus BM25/Dense/RRF/CrossEncoder、Legacy/Hybrid 以及 Always-on/Conditional Critic 对照臂；同组按模型、提示词代码、题集、数据库内容与预算指纹校验，详情见 [Phase 10 说明](docs/phase10-ablation.md)。现有库先执行 [013 增量迁移](backend/db/migrations/013_ablation_runs.sql)。运行会调用真实模型并保存评测批次，本次改造没有自动启动任何基准运行。
+
 ## 本地质量检查与持续集成
 
 ```powershell

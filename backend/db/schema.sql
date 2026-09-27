@@ -393,6 +393,12 @@ create table if not exists evaluation.eval_runs (
     metadata_version varchar(64),
     prompt_version varchar(64),
     evaluation_mode varchar(32) not null default 'full',
+    ablation_variant varchar(64),
+    comparison_group varchar(128),
+    comparison_manifest jsonb,
+    ablation_variant varchar(64),
+    comparison_group varchar(128),
+    comparison_manifest jsonb,
     review_queued_cases integer not null default 0,
     started_at timestamptz not null default now(),
     finished_at timestamptz

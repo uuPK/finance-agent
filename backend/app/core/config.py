@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     zhipu_embedding_dimensions: int = 1024
     zhipu_rerank_model: str = "rerank"
     retriever_mode: str = "legacy"
+    retrieval_fusion_mode: str = "rrf"
+    ablation_strict_retrieval: bool = False
     milvus_uri: str = "http://localhost:19530"
     milvus_collection: str = "finance_metadata_hybrid_v1"
     enable_reranker: bool = True

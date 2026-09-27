@@ -125,6 +125,25 @@ class MilvusMetadataStore:
             )
         return {"total": len(documents), "upserted": len(changed), "deleted": len(stale)}
 
+    def verify_synced(self, documents: list[MetadataDocument]) -> dict[str, int]:
+        """Read-only corpus check for comparable ablation runs."""
+        if not self.client.has_collection(self.collection):
+            raise RuntimeError("Milvus collection is missing; sync metadata before ablation.")
+        self.client.load_collection(self.collection)
+        rows = self.client.query(
+            collection_name=self.collection, filter="",
+            output_fields=["doc_id", "content_hash"], limit=16384,
+        )
+        if len(rows) >= 16384:
+            raise RuntimeError("Milvus corpus exceeds verification limit.")
+        actual = {str(row["doc_id"]): str(row["content_hash"]) for row in rows}
+        expected = {
+            doc.doc_id: doc.content_hash(self.embedding_model) for doc in documents
+        }
+        if actual != expected or len(expected) != len(documents):
+            raise RuntimeError("Milvus metadata differs from PostgreSQL; sync before ablation.")
+        return {"total": len(documents), "upserted": 0, "deleted": 0}
+
     def _search(
         self,
         data: list[str] | list[list[float]],
