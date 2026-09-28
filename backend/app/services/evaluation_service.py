@@ -1020,7 +1020,7 @@ class EvaluationRepository:
 
     def _review_sql_guardrail(self) -> SQLGuardrail | None:
         """Only promote review SQL when the live physical schema can constrain it."""
-        metadata_context = self.schema_context_provider.load()
+        metadata_context = self.schema_context_provider.load_review_sql_policy()
         if (
             metadata_context.get("source") != "database"
             or not metadata_context.get("table_allowlist")

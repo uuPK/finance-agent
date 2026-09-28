@@ -46,6 +46,63 @@ class SchemaContextProvider:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    def load_review_sql_policy(self) -> dict[str, Any]:
+        """Load the full live mart policy for reviewed SQL, without retrieval budgets.
+
+        Unlike the model's question-specific context, this policy must cover all
+        physical business tables while failing closed if security metadata is
+        unavailable.
+        """
+        with self.engine.connect() as connection:
+            tables = self._load_physical_tables(connection)
+            columns = self._load_physical_columns(connection)
+            sensitive_rows = connection.execute(text("""
+                select table_name, column_name
+                from metadata.column_metadata
+                where schema_name = 'mart' and is_active = true and is_sensitive = true
+            """)).mappings().all()
+            joins = connection.execute(text("""
+                select left_schema, left_table, left_column,
+                       right_schema, right_table, right_column
+                from metadata.join_relationships
+                where is_active = true
+            """)).mappings().all()
+
+        allowed_columns = {
+            row["table_name"]: {
+                column["column_name"]
+                for column in columns.get(("mart", row["table_name"]), [])
+            }
+            for row in tables
+        }
+        if not allowed_columns or any(not names for names in allowed_columns.values()):
+            raise ValueError("Live mart table/column policy is unavailable.")
+        return {
+            "source": "database",
+            "table_allowlist": sorted(allowed_columns),
+            "allowed_columns_by_table": {
+                table: sorted(names) for table, names in allowed_columns.items()
+            },
+            "sensitive_columns": sorted({
+                row["column_name"] for row in sensitive_rows
+                if row["table_name"] in allowed_columns
+                and row["column_name"] in allowed_columns[row["table_name"]]
+            }),
+            "join_relationship_allowlist": [
+                {
+                    "left_table": row["left_table"],
+                    "left_column": row["left_column"],
+                    "right_table": row["right_table"],
+                    "right_column": row["right_column"],
+                }
+                for row in joins
+                if row["left_schema"] == "mart"
+                and row["right_schema"] == "mart"
+                and row["left_column"] in allowed_columns.get(row["left_table"], set())
+                and row["right_column"] in allowed_columns.get(row["right_table"], set())
+            ],
+        }
+
     def expand(
         self,
         current: dict[str, Any],

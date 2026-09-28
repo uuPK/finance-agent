@@ -6,6 +6,8 @@ Phase 11 按要求跳过；本阶段不修改前端，也不自动运行或保�
 
 `POST /api/evaluation/review-imports` 仍保留审核决定和 review 状态，但不再直接写 active metadata 或 `evaluation.eval_cases`。合法的 `metadata_changes`、经 SQL Guardrail 检查的修正样例，以及标准答案修正会成为 `metadata.metadata_candidates` 中的独立候选。返回的 `metadata_changes_applied` 恒为 0，新增 `metadata_candidates_created` 表示候选数。修正 SQL 必须同时附有审核者提供的 QueryPlan 与 `corrected_result.rows`；信息不完整时拒绝该条导入，避免自动执行未确认 SQL 后污染标准答案。
 
+审核 SQL 的安全白名单直接读取完整的实时 `mart` 物理表/字段、active 敏感字段和有效 JOIN 目录，不受单个问题的检索 TopK 或提示词预算裁剪；安全元数据读取失败时拒绝审核，不执行 SQL。`needs_clarification` 审核若未提供新的 `corrected_result`，候选沿用现有案例的结果标准，不把它清空；晋级前 active 标准答案不变。
+
 每条候选带 `metadata_version`、来源 `review_item_id` / 可用时的 `source_query_id`、`reviewer_id`、`created_at`、`supersedes`。同一审核项的同一实体不允许重复候选。生产元数据读取仍只看 active 表，不看 candidate 表。
 
 ## 状态与 API

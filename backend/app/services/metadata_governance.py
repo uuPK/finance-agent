@@ -61,12 +61,17 @@ class MetadataGovernanceService:
         elif item.get("case_id") is not None and decision.verdict == "needs_clarification":
             if not decision.corrected_query_plan:
                 raise ValueError("Clarification correction requires a reviewed QueryPlan.")
+            previous_result = connection.execute(text("""
+                select expected_result from evaluation.eval_cases where case_id = :case_id
+            """), {"case_id": str(item["case_id"])}).scalar_one_or_none()
+            if previous_result is None:
+                raise ValueError("The reviewed evaluation case no longer exists.")
             override = {
                 "case_id": str(item["case_id"]),
                 "expected_status": "needs_clarification",
                 "expected_query_plan": decision.corrected_query_plan,
                 "expected_sql": None,
-                "expected_result": decision.corrected_result,
+                "expected_result": decision.corrected_result or previous_result,
             }
 
         candidates: list[tuple[str, str, str, dict[str, Any]]] = []
@@ -114,9 +119,7 @@ class MetadataGovernanceService:
         return len(candidates)
 
     def _validate_reference_sql(self, sql: str) -> None:
-        context = SchemaContextProvider(self.engine).load()
-        if context.get("source") != "database":
-            raise ValueError("Cannot validate corrected SQL without live schema metadata.")
+        context = SchemaContextProvider(self.engine).load_review_sql_policy()
         guardrail = SQLGuardrail.from_metadata_context(context, require_limit=False)
         failures = [item for item in guardrail.validate(sql) if not item.passed]
         if failures:

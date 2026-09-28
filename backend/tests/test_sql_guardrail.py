@@ -1,3 +1,4 @@
+import json
 import os
 from uuid import uuid4
 
@@ -204,6 +205,9 @@ class _SchemaContext:
     def load(self) -> dict[str, object]:
         return self.context
 
+    def load_review_sql_policy(self) -> dict[str, object]:
+        return self.context
+
 
 def test_review_promotion_requires_live_physical_metadata() -> None:
     repository = EvaluationRepository()
@@ -239,7 +243,7 @@ class _RecordingConnection:
         self.calls.append((str(statement), params))
         from types import SimpleNamespace
 
-        return SimpleNamespace(scalar_one_or_none=lambda: None)
+        return SimpleNamespace(scalar_one_or_none=lambda: {"rows": [{"old": True}]})
 
 
 def test_clarification_review_stages_without_touching_active_gold() -> None:
@@ -266,3 +270,6 @@ def test_clarification_review_stages_without_touching_active_gold() -> None:
 
     assert any("insert into metadata.metadata_candidates" in sql for sql, _ in connection.calls)
     assert all("update evaluation.eval_cases" not in sql for sql, _ in connection.calls)
+    payloads = [params["payload"] for sql, params in connection.calls
+                if "insert into metadata.metadata_candidates" in sql]
+    assert json.loads(payloads[0])["expected_result"] == {"rows": [{"old": True}]}
