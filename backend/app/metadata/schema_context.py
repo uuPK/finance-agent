@@ -10,6 +10,7 @@ from app.context.builder import ContextBuilder, merge_contexts
 from app.context.targeted import legacy_targeted_retrieval
 from app.core.config import Settings, get_settings
 from app.db.session import engine as default_engine
+from app.metadata.candidate_overlay import overlay_rows
 from app.metadata.hybrid_retriever import HybridMetadataRetriever
 from app.metadata.retriever import MetadataRetrievalResult, MetadataRetriever
 from app.schemas.query_plan import QueryPlan
@@ -24,10 +25,12 @@ class SchemaContextProvider:
         engine: Engine | None = None,
         settings: Settings | None = None,
         strict_retrieval: bool = False,
+        candidate: dict[str, Any] | None = None,
     ) -> None:
         self.engine = engine or default_engine
         self.settings = settings or get_settings()
         self.strict_retrieval = strict_retrieval
+        self.candidate = candidate
 
     def load(
         self, query_plan: QueryPlan | None = None, question: str | None = None
@@ -142,7 +145,9 @@ class SchemaContextProvider:
     ) -> MetadataRetrievalResult:
         if self.settings.retriever_mode == "hybrid":
             try:
-                retriever = HybridMetadataRetriever(connection, self.settings)
+                retriever = HybridMetadataRetriever(
+                    connection, self.settings, candidate=self.candidate
+                )
                 try:
                     return retriever.retrieve_targeted(request)
                 finally:
@@ -168,12 +173,21 @@ class SchemaContextProvider:
         metrics = self._load_metrics(connection)
         business_terms = self._load_business_terms(connection)
         join_relationships = self._load_join_relationships(connection)
+        overlaid = overlay_rows(
+            {"metric": metrics, "business_term": business_terms, "join": join_relationships},
+            self.candidate,
+        )
+        metrics = overlaid["metric"]
+        business_terms = overlaid["business_term"]
+        join_relationships = overlaid["join"]
         reference_date = self._load_reference_date(connection)
         if retrieval_override is not None:
             retrieval = retrieval_override
         elif self.settings.retriever_mode == "hybrid" and question:
             try:
-                hybrid = HybridMetadataRetriever(connection, self.settings)
+                hybrid = HybridMetadataRetriever(
+                    connection, self.settings, candidate=self.candidate
+                )
                 try:
                     retrieval = hybrid.retrieve(question=question, query_plan=query_plan)
                 finally:

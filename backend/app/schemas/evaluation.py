@@ -151,6 +151,19 @@ class ReviewImportResult(BaseModel):
     accepted: int
     rejected: list[str] = Field(default_factory=list)
     metadata_changes_applied: int = 0
+    metadata_candidates_created: int = 0
+
+
+class MetadataCandidateApproval(BaseModel):
+    approved_by: str = Field(min_length=1, max_length=128)
+
+
+class MetadataCandidateRejection(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class MetadataCandidateRegression(BaseModel):
+    baseline_eval_run_id: UUID
 
 
 class ReviewItemDetail(BaseModel):

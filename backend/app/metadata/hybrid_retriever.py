@@ -32,9 +32,11 @@ class HybridMetadataRetriever:
         settings: Settings,
         store: MilvusMetadataStore | None = None,
         reranker: RerankerProtocol | None = None,
+        candidate: dict[str, Any] | None = None,
     ) -> None:
         self.connection = connection
         self.settings = settings
+        self.candidate = candidate
         if store is None or (settings.enable_reranker and reranker is None):
             zhipu = ZhipuRetrievalClient(
                 api_key=settings.zhipu_retrieval_api_key or settings.zhipu_api_key,
@@ -72,7 +74,11 @@ class HybridMetadataRetriever:
     ) -> MetadataRetrievalResult:
         if not question.strip():
             raise ValueError("Hybrid retrieval requires a non-empty question")
-        documents = load_metadata_documents(self.connection)
+        documents = (
+            load_metadata_documents(self.connection, self.candidate)
+            if self.candidate is not None
+            else load_metadata_documents(self.connection)
+        )
         if not documents:
             raise RuntimeError("No active metadata documents exist in PostgreSQL")
         by_id = {doc.doc_id: doc for doc in documents}
@@ -168,7 +174,7 @@ class HybridMetadataRetriever:
                     rescored.append(item)
                 candidates = rescored
             except Exception as exc:
-                if self.settings.ablation_strict_retrieval:
+                if self.settings.ablation_strict_retrieval or self.candidate is not None:
                     raise
                 # Preserve availability while making degraded ranking observable.
                 rerank_error = f"{type(exc).__name__}: {exc}"

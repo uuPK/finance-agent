@@ -10,6 +10,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
+from app.metadata.candidate_overlay import overlay_rows
+
 
 @dataclass(frozen=True, slots=True)
 class MetadataDocument:
@@ -88,11 +90,14 @@ def _list(value: Any) -> list[str]:
     return [str(item) for item in value if isinstance(item, (str, int))]
 
 
-def load_metadata_documents(connection: Connection) -> list[MetadataDocument]:
+def load_metadata_documents(
+    connection: Connection, candidate: dict[str, Any] | None = None
+) -> list[MetadataDocument]:
     rows = {
         kind: [dict(row) for row in connection.execute(text(sql)).mappings()]
         for kind, sql in _QUERIES.items()
     }
+    overlay_rows(rows, candidate)
     table_domains = {row["table_name"]: row["domain"] for row in rows["table"]}
     documents: list[MetadataDocument] = []
     for row in rows["table"]:

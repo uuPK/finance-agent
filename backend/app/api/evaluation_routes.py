@@ -13,6 +13,9 @@ from app.schemas.evaluation import (
     EvaluationRunCreated,
     EvaluationRunDetail,
     EvaluationRunSummary,
+    MetadataCandidateApproval,
+    MetadataCandidateRegression,
+    MetadataCandidateRejection,
     ReviewBatchCreate,
     ReviewBatchSummary,
     ReviewImportRequest,
@@ -20,6 +23,7 @@ from app.schemas.evaluation import (
     ReviewItemDetail,
 )
 from app.services.evaluation_service import get_evaluation_manager
+from app.services.metadata_governance import MetadataGovernanceService
 
 router = APIRouter(prefix="/evaluation", tags=["evaluation"])
 
@@ -113,3 +117,67 @@ async def export_review_batch(
 @router.post("/review-imports", response_model=ReviewImportResult)
 async def import_review_decisions(payload: ReviewImportRequest) -> ReviewImportResult:
     return await asyncio.to_thread(get_evaluation_manager().repository.import_decisions, payload.decisions)
+
+
+@router.get("/metadata-candidates")
+async def list_metadata_candidates(candidate_status: str | None = None) -> list[dict]:
+    return await asyncio.to_thread(
+        MetadataGovernanceService().list_candidates, candidate_status
+    )
+
+
+@router.get("/metadata-candidates/{candidate_id}")
+async def get_metadata_candidate(candidate_id: UUID) -> dict:
+    candidate = await asyncio.to_thread(MetadataGovernanceService().get_candidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Metadata candidate not found.")
+    return candidate
+
+
+async def _candidate_action(action: str, candidate_id: UUID, *args: object) -> dict:
+    try:
+        method = getattr(MetadataGovernanceService(), action)
+        return await asyncio.to_thread(method, candidate_id, *args)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/metadata-candidates/{candidate_id}/approve")
+async def approve_metadata_candidate(
+    candidate_id: UUID, payload: MetadataCandidateApproval
+) -> dict:
+    return await _candidate_action("approve", candidate_id, payload.approved_by)
+
+
+@router.post("/metadata-candidates/{candidate_id}/reject")
+async def reject_metadata_candidate(
+    candidate_id: UUID, payload: MetadataCandidateRejection
+) -> dict:
+    return await _candidate_action("reject", candidate_id, payload.reason)
+
+
+@router.post("/metadata-candidates/{candidate_id}/regression", status_code=202)
+async def start_metadata_candidate_regression(
+    candidate_id: UUID, payload: MetadataCandidateRegression
+) -> EvaluationRunCreated:
+    try:
+        run_id = await get_evaluation_manager().start_candidate_regression(
+            candidate_id, payload.baseline_eval_run_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return EvaluationRunCreated(eval_run_id=run_id, status="running")
+
+
+@router.post("/metadata-candidates/{candidate_id}/promote")
+async def promote_metadata_candidate(candidate_id: UUID) -> dict:
+    return await _candidate_action("promote", candidate_id)
+
+
+@router.post("/metadata-candidates/{candidate_id}/rollback")
+async def rollback_metadata_candidate(candidate_id: UUID) -> dict:
+    return await _candidate_action("rollback", candidate_id)

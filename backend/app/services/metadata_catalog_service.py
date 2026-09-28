@@ -236,33 +236,110 @@ class MetadataCatalogService:
     def deactivate_rule(self, rule_code: str) -> None:
         self._deactivate("rule_constraints", "rule_code", rule_code)
 
-    def apply_review_changes(
-        self, connection: Any, changes: list[MetadataChangeInput]
-    ) -> int:
-        """Persist reviewer-selected semantic metadata using the review transaction."""
-        for change in changes:
-            if change.kind == "metric":
-                payload = MetadataMetricInput.model_validate(change.payload)
-                self._write_metric(connection, payload, create=change.action == "create")
-            elif change.kind == "term":
-                payload = MetadataBusinessTermInput.model_validate(change.payload)
-                self._write_term(connection, payload, create=change.action == "create")
-            elif change.kind == "join":
-                payload = MetadataJoinInput.model_validate(change.payload)
-                join_id = change.payload.get("id") if change.action == "update" else None
-                if not isinstance(join_id, int):
-                    raise ValueError("Updating a join requires its numeric id.")
-                self._write_join(connection, payload, join_id=join_id)
-            elif change.kind == "example":
-                payload = MetadataQuestionExampleInput.model_validate(change.payload)
-                example_id = change.payload.get("id") if change.action == "update" else None
-                if change.action == "update" and not isinstance(example_id, int):
-                    raise ValueError("Updating an example requires its numeric id.")
-                self._write_example(connection, payload, example_id=example_id)
-            else:
-                payload = MetadataRuleConstraintInput.model_validate(change.payload)
-                self._write_rule(connection, payload, create=change.action == "create")
-        return len(changes)
+    _CANDIDATE_TABLES = {
+        "metric": ("metric_metadata", "metric_code"),
+        "term": ("business_terms", "term"),
+        "join": ("join_relationships", "id"),
+        "example": ("question_examples", "id"),
+        "rule": ("rule_constraints", "rule_code"),
+    }
+
+    @staticmethod
+    def candidate_key(change: MetadataChangeInput) -> str:
+        key = {
+            "metric": "metric_code", "term": "term", "join": "id",
+            "example": "id", "rule": "rule_code",
+        }[change.kind]
+        if change.kind in {"join", "example"} and change.action == "create":
+            return (
+                f"new:{change.payload.get('left_table')}:{change.payload.get('left_column')}:"
+                f"{change.payload.get('right_table')}:{change.payload.get('right_column')}"
+                if change.kind == "join"
+                else f"new:{change.payload.get('question')}"
+            )
+        value = change.payload.get(key)
+        if value is None:
+            raise ValueError(f"Candidate {change.kind} update requires {key}.")
+        return str(value)
+
+    def validate_candidate_change(self, connection: Any, change: MetadataChangeInput) -> None:
+        """Validate without writing to the active catalog."""
+        kind = change.kind
+        if kind == "metric":
+            payload = MetadataMetricInput.model_validate(change.payload)
+            self._validate_source_tables(connection, payload.source_tables)
+        elif kind == "term":
+            MetadataBusinessTermInput.model_validate(change.payload)
+        elif kind == "join":
+            payload = MetadataJoinInput.model_validate(change.payload)
+            self._validate_join_endpoint(
+                connection, payload.left_schema, payload.left_table, payload.left_column
+            )
+            self._validate_join_endpoint(
+                connection, payload.right_schema, payload.right_table, payload.right_column
+            )
+        elif kind == "example":
+            MetadataQuestionExampleInput.model_validate(change.payload)
+        else:
+            MetadataRuleConstraintInput.model_validate(change.payload)
+        table, column = self._CANDIDATE_TABLES[kind]
+        if change.action == "update":
+            self._assert_active(connection, table, column, self.candidate_key(change))
+        elif kind not in {"join", "example"}:
+            self._assert_absent(connection, table, column, self.candidate_key(change))
+
+    def apply_candidate_change(self, connection: Any, change: MetadataChangeInput) -> str:
+        """Only governance's post-regression promotion calls this mutating method."""
+        if change.kind == "metric":
+            item = self._write_metric(
+                connection, MetadataMetricInput.model_validate(change.payload),
+                create=change.action == "create",
+            )
+            return item.metric_code
+        if change.kind == "term":
+            item = self._write_term(
+                connection, MetadataBusinessTermInput.model_validate(change.payload),
+                create=change.action == "create",
+            )
+            return item.term
+        if change.kind == "join":
+            item = self._write_join(
+                connection, MetadataJoinInput.model_validate(change.payload),
+                join_id=int(change.payload["id"]) if change.action == "update" else None,
+            )
+            return str(item.id)
+        if change.kind == "example":
+            item = self._write_example(
+                connection, MetadataQuestionExampleInput.model_validate(change.payload),
+                example_id=int(change.payload["id"]) if change.action == "update" else None,
+            )
+            return str(item.id)
+        item = self._write_rule(
+            connection, MetadataRuleConstraintInput.model_validate(change.payload),
+            create=change.action == "create",
+        )
+        return item.rule_code
+
+    def candidate_previous_row(
+        self, connection: Any, kind: str, entity_id: str
+    ) -> dict[str, Any] | None:
+        table, column = self._CANDIDATE_TABLES[kind]
+        row = connection.execute(
+            text(f"select to_jsonb(t) as payload from metadata.{table} t "
+                 f"where {column}::text = :entity_id and is_active = true"),
+            {"entity_id": entity_id},
+        ).mappings().first()
+        return dict(row["payload"]) if row else None
+
+    def deactivate_candidate_created(
+        self, connection: Any, kind: str, entity_id: str
+    ) -> None:
+        table, column = self._CANDIDATE_TABLES[kind]
+        connection.execute(
+            text(f"update metadata.{table} set is_active = false, updated_at = now() "
+                 f"where {column}::text = :entity_id and is_active = true"),
+            {"entity_id": entity_id},
+        )
 
     def _write_metric(
         self, connection: Any, payload: MetadataMetricInput, create: bool

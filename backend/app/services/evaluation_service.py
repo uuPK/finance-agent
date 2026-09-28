@@ -41,10 +41,9 @@ from app.schemas.evaluation import (
     ReviewItemDetail,
 )
 from app.schemas.query import QueryRequest, QueryResponse
-from app.services.metadata_catalog_service import MetadataCatalogService
+from app.services.metadata_governance import MetadataGovernanceService
 from app.services.query_service import QueryService
 from app.services.run_repository import sanitize_event_payload
-from app.services.sql_executor import SQLExecutor
 
 
 def _jsonable(value: Any) -> Any:
@@ -155,8 +154,8 @@ def _same_result_rows(
 class EvaluationRepository:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or default_engine
-        self.metadata_catalog = MetadataCatalogService(self.engine)
         self.schema_context_provider = SchemaContextProvider(self.engine)
+        self.metadata_governance = MetadataGovernanceService(self.engine)
 
     def create_run(
         self,
@@ -166,6 +165,7 @@ class EvaluationRepository:
         ablation_variant: str | None = None,
         comparison_group: str | None = None,
         manifest: dict[str, Any] | None = None,
+        metadata_candidate_id: UUID | None = None,
     ) -> UUID:
         dataset_version = {
             "official_extension": "official-v1-extension",
@@ -209,10 +209,11 @@ class EvaluationRepository:
                     """
                     insert into evaluation.eval_runs
                         (run_name, model_name, status, dataset_version, metadata_version, prompt_version,
-                         evaluation_mode, ablation_variant, comparison_group, comparison_manifest)
+                         evaluation_mode, ablation_variant, comparison_group, comparison_manifest,
+                         metadata_candidate_id)
                     values (:run_name, :model_name, 'running', :dataset_version, 'official-metadata-v1',
                             'official-query-pipeline-v1', :mode, :ablation_variant,
-                            :comparison_group, cast(:manifest as jsonb))
+                            :comparison_group, cast(:manifest as jsonb), :candidate_id)
                     returning eval_run_id
                     """
                 ),
@@ -224,8 +225,30 @@ class EvaluationRepository:
                     "ablation_variant": ablation_variant,
                     "comparison_group": comparison_group,
                     "manifest": json.dumps(manifest) if manifest is not None else None,
+                    "candidate_id": str(metadata_candidate_id) if metadata_candidate_id else None,
                 },
             ).scalar_one()
+
+    def load_baseline_cases(
+        self, baseline_run_id: UUID
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        with self.engine.connect() as connection:
+            run = connection.execute(text("""
+                select eval_run_id, status, ablation_variant, comparison_manifest,
+                       metadata_candidate_id
+                from evaluation.eval_runs where eval_run_id = :run_id
+            """), {"run_id": str(baseline_run_id)}).mappings().first()
+            if run is None:
+                raise LookupError("Baseline evaluation run not found.")
+            cases = connection.execute(text("""
+                select ec.case_id, ec.case_code, ec.question, ec.difficulty,
+                       ec.expected_query_plan, ec.expected_sql, ec.expected_result,
+                       ec.expected_status, ec.scoring_config, ec.tags, ec.source_type
+                from evaluation.eval_results er
+                join evaluation.eval_cases ec on ec.case_id = er.case_id
+                where er.eval_run_id = :run_id order by ec.case_code
+            """), {"run_id": str(baseline_run_id)}).mappings().all()
+        return dict(run), [dict(case) for case in cases]
 
     def invalidate_comparison(self, eval_run_id: UUID, reason: str) -> None:
         with self.engine.begin() as connection:
@@ -878,7 +901,7 @@ class EvaluationRepository:
     def import_decisions(self, decisions: list[ReviewDecisionInput]) -> ReviewImportResult:
         accepted = 0
         rejected: list[str] = []
-        metadata_changes_applied = 0
+        metadata_candidates_created = 0
         with self.engine.begin() as connection:
             for decision in decisions:
                 item = (
@@ -886,6 +909,7 @@ class EvaluationRepository:
                         text(
                             """
                         select ri.review_item_id, ri.eval_result_id, ri.query_id, ri.status,
+                               coalesce(ri.query_id, er.query_id) as source_query_id,
                                ri.review_batch_id, ec.case_id,
                                coalesce(ec.question, qr.question) as question,
                                coalesce(ec.difficulty, 'medium') as difficulty
@@ -909,10 +933,10 @@ class EvaluationRepository:
                     continue
                 try:
                     with connection.begin_nested():
-                        applied_changes = self.metadata_catalog.apply_review_changes(
-                            connection, decision.metadata_changes
+                        staged = self.metadata_governance.stage_review_decision(
+                            connection, dict(item), decision
                         )
-                    metadata_changes_applied += applied_changes
+                    metadata_candidates_created += staged
                 except (LookupError, ValueError) as exc:
                     rejected.append(f"{decision.review_item_id}: metadata change rejected: {exc}")
                     continue
@@ -948,8 +972,6 @@ class EvaluationRepository:
                         "source_checksum": checksum,
                     },
                 )
-                if item["case_id"] is not None:
-                    self._promote_review_feedback(connection, item, decision)
                 connection.execute(
                     text(
                         "update evaluation.review_items set status = 'reviewed', updated_at = now() where review_item_id = :review_item_id"
@@ -992,89 +1014,8 @@ class EvaluationRepository:
         return ReviewImportResult(
             accepted=accepted,
             rejected=rejected,
-            metadata_changes_applied=metadata_changes_applied,
-        )
-
-    def _promote_review_feedback(
-        self, connection: Any, item: Any, decision: ReviewDecisionInput
-    ) -> None:
-        """Promote complete corrected facts into the retrieval and regression corpus.
-
-        A verdict on its own remains an audit record. Only a corrected, read-only SQL
-        example (or a confirmed clarification outcome) is used as reusable agent context.
-        """
-        if decision.verdict == "needs_clarification":
-            if not decision.corrected_query_plan:
-                return
-            fields = "expected_status = 'needs_clarification', expected_query_plan = cast(:plan as jsonb)"
-            params: dict[str, Any] = {
-                "case_id": str(item["case_id"]),
-                "plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
-            }
-            if decision.corrected_result:
-                fields += ", expected_result = cast(:result as jsonb)"
-                params["result"] = json.dumps(decision.corrected_result, ensure_ascii=False)
-            connection.execute(
-                text(
-                    f"update evaluation.eval_cases set {fields}, updated_at = now() "
-                    "where case_id = :case_id"
-                ),
-                params,
-            )
-            return
-        if decision.verdict != "incorrect" or not decision.corrected_sql:
-            return
-        guardrail = self._review_sql_guardrail()
-        if guardrail is None or not all(
-            finding.passed for finding in guardrail.validate(decision.corrected_sql)
-        ):
-            return
-        expected_result = decision.corrected_result
-        if not expected_result:
-            execution = SQLExecutor().execute(decision.corrected_sql)
-            if execution.status != "success":
-                return
-            expected_result = {
-                "columns": execution.columns,
-                "rows": execution.rows,
-                "row_count": execution.row_count,
-                "comparison": "unordered",
-            }
-        connection.execute(
-            text(
-                """
-                update evaluation.eval_cases
-                set expected_status = 'completed', expected_query_plan = cast(:plan as jsonb),
-                    expected_sql = :sql, expected_result = cast(:result as jsonb), updated_at = now()
-                where case_id = :case_id
-                """
-            ),
-            {
-                "case_id": str(item["case_id"]),
-                "plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
-                "sql": decision.corrected_sql,
-                "result": json.dumps(expected_result, ensure_ascii=False),
-            },
-        )
-
-        connection.execute(
-            text(
-                """
-                insert into metadata.question_examples
-                    (question, difficulty, scenario, expected_query_plan, expected_sql,
-                     expected_result, tags, is_active)
-                values (:question, :difficulty, 'customer_marketing', cast(:plan as jsonb), :sql,
-                        cast(:result as jsonb), cast(:tags as jsonb), true)
-                """
-            ),
-            {
-                "question": item["question"],
-                "difficulty": item["difficulty"],
-                "plan": json.dumps(decision.corrected_query_plan, ensure_ascii=False),
-                "sql": decision.corrected_sql,
-                "result": json.dumps(expected_result, ensure_ascii=False),
-                "tags": json.dumps(["human_review", "regression"], ensure_ascii=False),
-            },
+            metadata_changes_applied=0,
+            metadata_candidates_created=metadata_candidates_created,
         )
 
     def _review_sql_guardrail(self) -> SQLGuardrail | None:
@@ -1196,12 +1137,99 @@ class EvaluationManager:
         self._start_task(self._execute(eval_run_id, cases, profile, manifest))
         return eval_run_id
 
+    async def start_candidate_regression(
+        self, candidate_id: UUID, baseline_run_id: UUID
+    ) -> UUID:
+        """Run the approved candidate against a frozen full-arm baseline."""
+        candidate = await asyncio.to_thread(
+            self.repository.metadata_governance.get_candidate, candidate_id
+        )
+        if candidate is None:
+            raise LookupError("Metadata candidate not found.")
+        if candidate["status"] != "approved":
+            raise ValueError("Only an approved candidate can start regression.")
+        baseline, cases = await asyncio.to_thread(
+            self.repository.load_baseline_cases, baseline_run_id
+        )
+        if (
+            baseline["status"] != "completed"
+            or baseline["ablation_variant"] != "full"
+            or baseline["metadata_candidate_id"] is not None
+            or not baseline["comparison_manifest"]
+            or not cases
+        ):
+            raise ValueError("Regression requires a completed production full-arm baseline.")
+        settings = get_settings()
+        profile = get_profile("full")
+        await asyncio.to_thread(
+            validate_ablation_environment, self.repository.engine, settings, profile
+        )
+        snapshot = await asyncio.to_thread(database_fingerprint, self.repository.engine)
+        pinned = comparison_manifest(settings, cases, snapshot, 2)
+        if pinned != baseline["comparison_manifest"]:
+            raise ValueError("Baseline cases, metadata, model, or prompt configuration changed.")
+        override = self.repository.metadata_governance._case_override(candidate)
+        source_case_id = (
+            str(override["case_id"])
+            if override else candidate["payload"].get("_source_case_id")
+        )
+        if source_case_id and all(
+            str(case["case_id"]) != source_case_id for case in cases
+        ):
+            raise ValueError("Candidate source case is absent from the baseline.")
+        if override:
+            matched = False
+            for case in cases:
+                if str(case["case_id"]) == str(override["case_id"]):
+                    case.update({key: value for key, value in override.items() if key != "case_id"})
+                    matched = True
+                    break
+            if not matched:
+                raise ValueError("Candidate source case is absent from the baseline.")
+        run_manifest = {
+            **pinned,
+            "metadata_candidate_id": str(candidate_id),
+            "metadata_version": str(candidate["metadata_version"]),
+            "baseline_eval_run_id": str(baseline_run_id),
+        }
+        run_id = await asyncio.to_thread(
+            self.repository.create_run,
+            f"metadata-candidate-{candidate_id}",
+            "full",
+            None,
+            "full",
+            None,
+            run_manifest,
+            candidate_id,
+        )
+        try:
+            await asyncio.to_thread(
+                self.repository.metadata_governance.begin_regression,
+                candidate_id,
+                baseline_run_id,
+                run_id,
+            )
+        except Exception:
+            await asyncio.to_thread(self.repository.finish_run, run_id, "failed")
+            raise
+        candidate_settings = profile.settings(settings).model_copy(update={
+            "milvus_collection": f"{settings.milvus_collection}_candidate_{candidate_id.hex}",
+            "ablation_strict_retrieval": False,
+        })
+        self._start_task(self._execute(
+            run_id, cases, profile, run_manifest,
+            candidate=candidate, candidate_settings=candidate_settings,
+        ))
+        return run_id
+
     async def _execute(
         self,
         eval_run_id: UUID,
         cases: list[dict[str, Any]],
         profile: AblationProfile | None = None,
         manifest: dict[str, Any] | None = None,
+        candidate: dict[str, Any] | None = None,
+        candidate_settings: Any = None,
     ) -> None:
         status = "completed"
         try:
@@ -1215,6 +1243,17 @@ class EvaluationManager:
                 try:
                     service = (
                         QueryService(
+                            settings=candidate_settings,
+                            ablation_profile=profile,
+                            schema_context_provider=SchemaContextProvider(
+                                self.repository.engine,
+                                candidate_settings,
+                                strict_retrieval=True,
+                                candidate=candidate,
+                            ),
+                        )
+                        if candidate is not None
+                        else QueryService(
                             settings=profile.settings(get_settings()), ablation_profile=profile
                         )
                         if profile
@@ -1291,6 +1330,11 @@ class EvaluationManager:
             status = "failed"
         finally:
             await asyncio.to_thread(self.repository.finish_run, eval_run_id, status)
+            if candidate is not None:
+                await asyncio.to_thread(
+                    self.repository.metadata_governance.finish_regression,
+                    UUID(str(candidate["candidate_id"])),
+                )
 
     def _score(
         self,

@@ -83,6 +83,7 @@ def database_fingerprint(engine: Engine) -> str:
             text("""
             select table_schema, table_name from information_schema.tables
             where table_schema in ('mart', 'metadata') and table_type = 'BASE TABLE'
+              and not (table_schema = 'metadata' and table_name = 'metadata_candidates')
             order by table_schema, table_name
         """)
         ).all()

@@ -235,29 +235,34 @@ class _RecordingConnection:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
 
-    def execute(self, statement: object, params: dict[str, object]) -> None:
+    def execute(self, statement: object, params: dict[str, object]):
         self.calls.append((str(statement), params))
+        from types import SimpleNamespace
+
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
 
 
-def test_clarification_review_never_wipes_expected_result_without_a_complete_plan() -> None:
-    repository = EvaluationRepository()
+def test_clarification_review_stages_without_touching_active_gold() -> None:
+    from app.services.metadata_governance import MetadataGovernanceService
+
+    governance = MetadataGovernanceService()
     connection = _RecordingConnection()
-    item = {"case_id": uuid4()}
+    item = {"case_id": uuid4(), "review_item_id": uuid4(), "source_query_id": None}
     incomplete_decision = ReviewDecisionInput(
         review_item_id=uuid4(),
         reviewer_id="reviewer",
         verdict="needs_clarification",
     )
 
-    repository._promote_review_feedback(connection, item, incomplete_decision)
+    with pytest.raises(ValueError, match="reviewed QueryPlan"):
+        governance.stage_review_decision(connection, item, incomplete_decision)
 
     assert connection.calls == []
 
     complete_decision = incomplete_decision.model_copy(
         update={"corrected_query_plan": {"clarifications": [{"field": "date"}]}}
     )
-    repository._promote_review_feedback(connection, item, complete_decision)
+    assert governance.stage_review_decision(connection, item, complete_decision) == 1
 
-    statement, params = connection.calls[0]
-    assert "expected_result" not in statement
-    assert "result" not in params
+    assert any("insert into metadata.metadata_candidates" in sql for sql, _ in connection.calls)
+    assert all("update evaluation.eval_cases" not in sql for sql, _ in connection.calls)
